@@ -1,42 +1,31 @@
 cmake_minimum_required(VERSION 3.18)
-project(CNN_Project LANGUAGES CXX CUDA)
+project(JetsonMonorepo LANGUAGES CXX CUDA)
 
-# Enable C++17 and CUDA17
+# Standards
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-option(BUILD_DEBUG "Enable debug build" ON)
+# Xavier (Volta) SM_72 by default; override with -DCUDA_ARCH=87 for Orin
+set(CUDA_ARCH "72" CACHE STRING "CUDA SM arch (72=Xavier, 87=Orin)")
 
-# Include directories
-include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(/usr/include)           # cuDNN headers
+# Which projects to build
+option(BUILD_IMAGE_PIPELINE "Build image-pipeline-project" ON)
+option(BUILD_HAND_GESTURE   "Build hand-gesture-project"   OFF)
 
-# Source files
-set(SOURCES
-    src/main.cu
-    src/utils.cu
-)
+# Core library is always available
+add_subdirectory(cuda-framework)
 
-# Create executable
-add_executable(cnn_app ${SOURCES})
-
-# CUDA architecture for Jetson Orin (Ampere)
-set_target_properties(cnn_app PROPERTIES
-    CUDA_ARCHITECTURES "87"
-)
-
-# Link to CUDA, cuBLAS, cuBLAS Lt, cuDNN
-target_link_libraries(cnn_app
-    /usr/local/cuda/lib64/libcudart.so
-    /usr/local/cuda/lib64/libcublas.so
-    /usr/local/cuda/lib64/libcublasLt.so
-    /usr/lib/aarch64-linux-gnu/libcudnn.so
-)
-
-# Compiler flags for debug
-if(BUILD_DEBUG)
-    target_compile_options(cnn_app PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -O0 -g>
-        $<$<COMPILE_LANGUAGE:CUDA>:-G -lineinfo -Xcompiler=-Wall,-Wextra,-O0>
-    )
+# Selected projects
+if(BUILD_IMAGE_PIPELINE)
+  add_subdirectory(image-pipeline-project)
 endif()
+
+if(BUILD_HAND_GESTURE)
+  add_subdirectory(hand-gesture-project)
+endif()
+
+message(STATUS "CUDA_ARCH=${CUDA_ARCH}")
+message(STATUS "BUILD_IMAGE_PIPELINE=${BUILD_IMAGE_PIPELINE}")
+message(STATUS "BUILD_HAND_GESTURE=${BUILD_HAND_GESTURE}")
