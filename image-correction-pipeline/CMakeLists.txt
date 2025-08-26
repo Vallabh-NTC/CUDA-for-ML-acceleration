@@ -18,6 +18,7 @@ set_target_properties(image_correction_kernels PROPERTIES
 target_link_libraries(image_correction_kernels
   PUBLIC
     CUDA::cudart
+            
 )
 
 # ---- Libreria C++ con la pipeline GStreamer ----
@@ -34,4 +35,6 @@ target_include_directories(gstreamer_frontend
 target_link_libraries(gstreamer_frontend
   PUBLIC
     PkgConfig::GST
+    CUDA::cudart
+    CUDA::toolkit
 )
