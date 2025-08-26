@@ -1,39 +1,46 @@
-#include <gst/gst.h>
+#include "gstreamer_pipeline.hpp"
 #include <iostream>
 
-int main(int argc, char *argv[]) {
-    gst_init(&argc, &argv);
+GStreamerCamera::GStreamerCamera(std::string pipeline_desc)
+    : pipeline_desc_(std::move(pipeline_desc)) {
+    // Caller should ensure gst_init() was called before constructing.
+}
 
-    const char* pipeline_desc =
-        "nvarguscamerasrc sensor-id=0 ! "
-        "video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! "
-        "nvvidconv flip-method=0 ! "
-        "video/x-raw, format=I420 ! "
-        "xvimagesink sync=false";
+GStreamerCamera::~GStreamerCamera() {
+    if (pipeline_) {
+        gst_element_set_state(pipeline_, GST_STATE_NULL);
+        if (bus_) gst_object_unref(bus_);
+        gst_object_unref(pipeline_);
+    }
+}
 
+bool GStreamerCamera::run() {
     GError* err = nullptr;
-    GstElement* pipeline = gst_parse_launch(pipeline_desc, &err);
-    if (!pipeline) {
+    pipeline_ = gst_parse_launch(pipeline_desc_.c_str(), &err);
+    if (!pipeline_) {
         std::cerr << "Failed to create pipeline: "
                   << (err ? err->message : "unknown error") << std::endl;
         if (err) g_error_free(err);
-        return 1;
+        return false;
     }
 
-    GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING" << std::endl;
-        gst_object_unref(pipeline);
-        return 1;
+        gst_object_unref(pipeline_);
+        pipeline_ = nullptr;
+        return false;
     }
 
-    // Wait until error or EOS
-    GstBus* bus = gst_element_get_bus(pipeline);
+    bus_ = gst_element_get_bus(pipeline_);
     bool running = true;
+    bool ok = true;
+
     while (running) {
         GstMessage* msg = gst_bus_timed_pop_filtered(
-            bus, GST_CLOCK_TIME_NONE,
-            (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+            bus_, GST_CLOCK_TIME_NONE,
+            static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS)
+        );
 
         if (msg != nullptr) {
             switch (GST_MESSAGE_TYPE(msg)) {
@@ -49,6 +56,7 @@ int main(int argc, char *argv[]) {
                         g_free(dbg);
                     }
                     if (e) g_error_free(e);
+                    ok = false;
                     running = false;
                     break;
                 }
@@ -63,8 +71,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(bus);
-    gst_object_unref(pipeline);
-    return 0;
+    gst_element_set_state(pipeline_, GST_STATE_NULL);
+    return ok;
 }
