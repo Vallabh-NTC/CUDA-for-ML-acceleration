@@ -1,47 +1,49 @@
 #pragma once
 #include <gst/gst.h>
 #include <string>
+#include <vector>
 #include <cstdint>
 
-// Minimal, no prints. Returns bool for success/failure.
-class GStreamerCamera {
+// Manages ONE pipeline string that contains multiple parallel branches,
+// each ending in a unique appsink (e.g., mysink0, mysink1, ...).
+class GStreamerMultiCamera {
 public:
-    explicit GStreamerCamera(std::string pipeline_desc);
-    ~GStreamerCamera();
+    // pipeline_desc must define all branches + unique appsink names (size = num_cams).
+    GStreamerMultiCamera(std::string pipeline_desc,
+                         std::vector<std::string> sink_names);
+    ~GStreamerMultiCamera();
 
-    // Start the pipeline (expects an appsink named "mysink" producing RGBA frames).
-    bool start();
+    bool start();   // set pipeline to PLAYING and bind all sinks
+    void stop();    // teardown
 
-    // Pull one frame into pinned, host-mapped memory.
-    // On success:
-    //  - *device_ptr  -> device alias of pinned host buffer (valid while this object lives)
-    //  - *host_ptr    -> host pointer to the same pinned buffer
-    //  - *num_bytes   -> buffer size in bytes
-    //  - width/height -> optional; filled if non-null
-    bool grab_frame_to_pinned(uint8_t** device_ptr,
+    // Pull one frame from appsink[i] into pinned, host-mapped memory.
+    // Returns device alias (mapped) + host ptr + size + width/height.
+    bool grab_frame_to_pinned(int i,
+                              uint8_t** device_ptr,
                               uint8_t** host_ptr,
                               size_t*   num_bytes,
                               int*      width  = nullptr,
                               int*      height = nullptr,
                               guint64   timeout_ns = 2ULL * 1000 * 1000 * 1000); // 2s
 
-    // Stop/teardown.
-    void stop();
+    int num_cams() const { return static_cast<int>(sink_names_.size()); }
 
     // Non-copyable
-    GStreamerCamera(const GStreamerCamera&) = delete;
-    GStreamerCamera& operator=(const GStreamerCamera&) = delete;
+    GStreamerMultiCamera(const GStreamerMultiCamera&) = delete;
+    GStreamerMultiCamera& operator=(const GStreamerMultiCamera&) = delete;
 
 private:
-    bool ensure_pinned_capacity(size_t bytes);
+    bool ensure_pinned_capacity(int i, size_t bytes);
     void reset_pipeline();
 
     std::string pipeline_desc_;
-    GstElement* pipeline_{nullptr};
-    GstElement* sink_elem_{nullptr};   // appsink element
-    GstBus*     bus_{nullptr};
+    std::vector<std::string> sink_names_;
 
-    // Pinned host-mapped buffer we reuse/grow
-    uint8_t* pinned_host_{nullptr};
-    size_t   pinned_size_{0};
+    GstElement* pipeline_{nullptr};
+    GstBus*     bus_{nullptr};
+    std::vector<GstElement*> sink_elems_; // appsinks in same order as sink_names_
+
+    // per-camera pinned host buffers
+    std::vector<uint8_t*> pinned_host_;
+    std::vector<size_t>   pinned_size_;
 };
