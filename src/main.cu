@@ -1,5 +1,7 @@
+// src/main.cu
 #include <gst/gst.h>
 #include <cuda_runtime.h>
+
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -9,37 +11,21 @@
 #include <iomanip>
 #include <sstream>
 #include <chrono>
+#include <cmath>
+
 #include "gstreamer_pipeline.hpp"
+#include "image_correction.hpp"
 
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
   std::cerr << "CUDA error: " << cudaGetErrorString(e)                  \
             << " at " << __FILE__ << ":" << __LINE__ << "\n";           \
   std::exit(1);} } while(0)
 
-__global__ void brightenRGBA(uint8_t* rgba, int num_pixels, int add_val) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_pixels) return;
-    int base = idx * 4;
-    unsigned int r = rgba[base + 0];
-    unsigned int g = rgba[base + 1];
-    unsigned int b = rgba[base + 2];
-    r = min(r + (unsigned int)add_val, 255u);
-    g = min(g + (unsigned int)add_val, 255u);
-    b = min(b + (unsigned int)add_val, 255u);
-    rgba[base + 0] = static_cast<uint8_t>(r);
-    rgba[base + 1] = static_cast<uint8_t>(g);
-    rgba[base + 2] = static_cast<uint8_t>(b);
-}
+using icp::RectifyConfig;
+using icp::fisheye_rectify_rgba;
 
-struct CameraCfg {
-    int idx;        // 0..N-1
-    int brighten{125};
-    int frames_to_process{200}; // -1 for run forever
-};
-
+// -------- pipeline builder (RGBA appsinks) --------
 static std::string build_multi_pipeline(int w, int h, int num, int den, int cams) {
-    // Parallel branches in one description. Each branch ends in RGBA appsink.
-    // NVMM on source, system memory at appsink.
     std::ostringstream ss;
     for (int i = 0; i < cams; ++i) {
         ss << "nvarguscamerasrc sensor-id=" << i << " ! "
@@ -53,13 +39,14 @@ static std::string build_multi_pipeline(int w, int h, int num, int den, int cams
     return ss.str();
 }
 
+// -------- simple PPM writer (RGB from RGBA) --------
 static void write_ppm(const std::string& path, const uint8_t* rgba, int w, int h) {
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) { std::cerr << "open " << path << " failed\n"; return; }
     ofs << "P6\n" << w << " " << h << "\n255\n";
-    std::vector<uint8_t> row(3 * w);
+    std::vector<uint8_t> row(3 * (size_t)w);
     for (int y = 0; y < h; ++y) {
-        const uint8_t* src = rgba + static_cast<size_t>(y) * w * 4;
+        const uint8_t* src = rgba + (size_t)y * w * 4;
         for (int x = 0; x < w; ++x) {
             const uint8_t* p = &src[x * 4];
             row[x*3+0] = p[0]; row[x*3+1] = p[1]; row[x*3+2] = p[2];
@@ -68,43 +55,83 @@ static void write_ppm(const std::string& path, const uint8_t* rgba, int w, int h
     }
 }
 
+struct CameraJob {
+    int idx = 0;
+    int frames_to_process = 200; // -1 to run forever
+};
+
 static void cam_worker(GStreamerMultiCamera* multi,
-                       CameraCfg cfg,
+                       CameraJob job,
+                       const RectifyConfig& cfg,
                        std::atomic<bool>& running)
 {
     cudaStream_t stream{};
     CUDA_CHECK(cudaStreamCreate(&stream));
 
+    // Output pinned (host-mapped) buffer for rectified frames
+    uint8_t* h_out = nullptr;   // host pointer
+    uint8_t* d_out = nullptr;   // device alias
+    size_t   out_capacity = 0;  // bytes
+
+    auto ensure_out_buffer = [&](int dst_w, int dst_h) {
+        const size_t need = (size_t)dst_w * dst_h * 4;
+        if (need <= out_capacity) return true;
+        if (h_out) { cudaFreeHost(h_out); h_out = nullptr; d_out = nullptr; out_capacity = 0; }
+        if (cudaHostAlloc((void**)&h_out, need, cudaHostAllocMapped) != cudaSuccess) return false;
+        void* alias = nullptr;
+        if (cudaHostGetDevicePointer(&alias, h_out, 0) != cudaSuccess) return false;
+        d_out = static_cast<uint8_t*>(alias);
+        out_capacity = need;
+        return true;
+    };
+
     int frame_idx = 0;
     while (running.load(std::memory_order_relaxed)) {
-        if (cfg.frames_to_process >= 0 && frame_idx >= cfg.frames_to_process) break;
+        if (job.frames_to_process >= 0 && frame_idx >= job.frames_to_process) break;
 
-        uint8_t *d_ptr=nullptr, *h_ptr=nullptr;
+        uint8_t *d_src=nullptr, *h_src=nullptr;
         size_t nbytes=0; int w=0, h=0;
 
-        if (!multi->grab_frame_to_pinned(cfg.idx, &d_ptr, &h_ptr, &nbytes, &w, &h)) {
+        // Grab one RGBA frame into pinned memory (d_src is device alias)
+        if (!multi->grab_frame_to_pinned(job.idx, &d_src, &h_src, &nbytes, &w, &h)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
-
-        const size_t expected = static_cast<size_t>(w) * h * 4;
+        const size_t expected = (size_t)w * h * 4;
         if (nbytes < expected) continue;
 
-        int num_pixels = w * h;
-        int threads = 256;
-        int blocks  = (num_pixels + threads - 1) / threads;
-        brightenRGBA<<<blocks, threads, 0, stream>>>(d_ptr, num_pixels, cfg.brighten);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream)); // make writes visible to CPU
+        // Destination dims: fixed width (1920) with input aspect ratio
+        const int dst_w = cfg.out_width;
+        const int dst_h = (int)std::lround(dst_w * (double)h / (double)w);
+        if (!ensure_out_buffer(dst_w, dst_h)) {
+            std::cerr << "[cam " << job.idx << "] out buffer alloc failed\n";
+            break;
+        }
 
+        const size_t src_stride = (size_t)w     * 4;
+        const size_t dst_stride = (size_t)dst_w * 4;
+
+        // Undistort (equidistant -> perspective) to d_out
+        fisheye_rectify_rgba(
+            d_src,  w,     h,     src_stride,
+            d_out,  dst_w, dst_h, dst_stride,
+            cfg,
+            stream
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // make results visible in h_out
+
+        // Save the RECTIFIED image (no brightness/constant add)
         std::ostringstream name;
-        name << "cam" << cfg.idx << "_frame" << std::setw(6) << std::setfill('0') << frame_idx << ".ppm";
-        write_ppm(name.str(), h_ptr, w, h);
+        name << "cam" << job.idx << "_frame" << std::setw(6) << std::setfill('0') << frame_idx << ".ppm";
+        write_ppm(name.str(), h_out, dst_w, dst_h);
+
         ++frame_idx;
     }
 
+    if (h_out) cudaFreeHost(h_out);
     CUDA_CHECK(cudaStreamDestroy(stream));
-    std::cout << "[cam " << cfg.idx << "] worker done\n";
+    std::cout << "[cam " << job.idx << "] worker done\n";
 }
 
 int main(int argc, char** argv) {
@@ -112,27 +139,46 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
 
-    const int W=1920, H=1080, NUM=30, DEN=1, CAMS=3;
+    // Source camera setup
+    const int SRC_W = 1920;
+    const int SRC_H = 1080;
+    const int FPS_NUM = 30;
+    const int FPS_DEN = 1;
+    const int NUM_CAMS = 2;
 
-    // Build one pipeline containing all branches
-    std::string pipe = build_multi_pipeline(W, H, NUM, DEN, CAMS);
+    // Integrated rectification parameters (fixed)
+    const RectifyConfig rectify_cfg{
+        .fish_fov_deg = 195.1f,
+        .out_hfov_deg = 90.0f,
+        .cx_f = 959.50f, .cy_f = 539.50f, .r_f = 1100.77f,
+        .out_width = 1920
+    };
 
-    // appsink names in same order
+    // Build multi-camera pipeline and sinks
+    std::string pipeline = build_multi_pipeline(SRC_W, SRC_H, FPS_NUM, FPS_DEN, NUM_CAMS);
     std::vector<std::string> sinks;
-    for (int i=0; i<CAMS; ++i) sinks.emplace_back("mysink"+std::to_string(i));
+    sinks.reserve(NUM_CAMS);
+    for (int i = 0; i < NUM_CAMS; ++i) sinks.emplace_back("mysink" + std::to_string(i));
 
-    GStreamerMultiCamera multi(pipe, sinks);
+    GStreamerMultiCamera multi(pipeline, sinks);
     if (!multi.start()) {
         std::cerr << "Failed to start multi-camera pipeline\n";
         return 1;
     }
 
-    std::atomic<bool> running{true};
-    int frames = (argc >= 2) ? std::stoi(argv[1]) : 200;
+    // Frames to process (optional): argv[1], default 200
+    int frames = 200;
+    if (argc >= 2) { try { frames = std::stoi(argv[1]); } catch (...) {} }
 
+    std::atomic<bool> running{true};
     std::vector<std::thread> threads;
-    for (int i=0;i<CAMS;++i) {
-        threads.emplace_back(cam_worker, &multi, CameraCfg{.idx=i, .brighten=125, .frames_to_process=frames}, std::ref(running));
+    threads.reserve(NUM_CAMS);
+    for (int i = 0; i < NUM_CAMS; ++i) {
+        threads.emplace_back(cam_worker,
+                             &multi,
+                             CameraJob{ .idx = i, .frames_to_process = frames },
+                             std::cref(rectify_cfg),
+                             std::ref(running));
     }
     for (auto& t : threads) t.join();
 
