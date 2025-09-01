@@ -48,6 +48,60 @@ __device__ __forceinline__ void bilinearSampleRGBA(
     }
 }
 
+// -------------------- color helpers --------------------
+
+// Clamp helper for float -> uint8 conversion.
+__device__ __forceinline__ uint8_t clamp_u8(float v) {
+    v = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
+    return (uint8_t)(v + 0.5f);
+}
+
+// Luma according to Rec.709 coefficients (perceptual).
+__device__ __forceinline__ float luma709(float r, float g, float b) {
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+// Apply contrast & brightness & white balance in 8-bit linear space.
+// Then apply saturation around luma, and finally gamma on [0,1].
+__device__ __forceinline__ void applyColorControls(
+    float& r, float& g, float& b,
+    float contrast, float brightness,
+    float sat, float gammaInv,   // pass 1.0/gamma for speed
+    float wb_r, float wb_g, float wb_b)
+{
+    // 1) Contrast/brightness (linear 8-bit domain)
+    r = r * contrast + brightness;
+    g = g * contrast + brightness;
+    b = b * contrast + brightness;
+
+    // 2) White balance (linear multipliers)
+    r *= wb_r; g *= wb_g; b *= wb_b;
+
+    // 3) Saturation via luma separation (still linear 8-bit domain)
+    float y = luma709(r, g, b);
+    r = y + sat * (r - y);
+    g = y + sat * (g - y);
+    b = y + sat * (b - y);
+
+    // 4) Clamp to [0,255] before gamma
+    r = r < 0.f ? 0.f : (r > 255.f ? 255.f : r);
+    g = g < 0.f ? 0.f : (g > 255.f ? 255.f : g);
+    b = b < 0.f ? 0.f : (b > 255.f ? 255.f : b);
+
+    // 5) Gamma on normalized [0,1]; gammaInv = 1/gamma
+    float rn = r * (1.0f/255.0f);
+    float gn = g * (1.0f/255.0f);
+    float bn = b * (1.0f/255.0f);
+
+    rn = powf(fmaxf(rn, 0.0f), gammaInv);
+    gn = powf(fmaxf(gn, 0.0f), gammaInv);
+    bn = powf(fmaxf(bn, 0.0f), gammaInv);
+
+    r = rn * 255.0f;
+    g = gn * 255.0f;
+    b = bn * 255.0f;
+}
+
 // -------------------- kernel --------------------
 __global__ void rectifyKernel(
     const uint8_t* __restrict__ src, int src_w, int src_h, int src_stride,
@@ -55,7 +109,11 @@ __global__ void rectifyKernel(
     // precomputed scalars
     float cx_f, float cy_f, float r_f,
     float f_fish,                // r_f / (FOV_fish/2)
-    float fx, float cx_rect, float cy_rect)
+    float fx, float cx_rect, float cy_rect,
+    // color controls passed per launch ---
+    float brightness, float contrast,
+    float saturation, float gammaInv,
+    float wb_r, float wb_g, float wb_b)
 {
     int u = blockDim.x * blockIdx.x + threadIdx.x; // x in output
     int v = blockDim.y * blockIdx.y + threadIdx.y; // y in output
@@ -92,8 +150,23 @@ __global__ void rectifyKernel(
         rgba[0]=rgba[1]=rgba[2]=0; rgba[3]=255;
     }
 
+    // Convert to float for processing in linear 8-bit domain
+    float r8 = (float)rgba[0];
+    float g8 = (float)rgba[1];
+    float b8 = (float)rgba[2];
+
+    // --- apply color controls ---
+    applyColorControls(r8, g8, b8,
+                       contrast, brightness,
+                       saturation, gammaInv,
+                       wb_r, wb_g, wb_b);
+
+    // Write out (alpha preserved)
     uint8_t* out = dst + v * dst_stride + 4 * u;
-    out[0]=rgba[0]; out[1]=rgba[1]; out[2]=rgba[2]; out[3]=rgba[3];
+    out[0] = clamp_u8(r8);
+    out[1] = clamp_u8(g8);
+    out[2] = clamp_u8(b8);
+    out[3] = rgba[3];
 }
 
 // -------------------- host entry --------------------
@@ -113,6 +186,8 @@ void fisheye_rectify_rgba(
     const float fx       = (dst_w * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI / 360.f);
     const float cx_rect  = dst_w * 0.5f;
     const float cy_rect  = dst_h * 0.5f;
+    const float gammaInv = (cfg.gamma > 0.f) ? (1.0f / cfg.gamma) : 1.0f;
+
 
     dim3 block(16,16);
     dim3 grid( (dst_w + block.x - 1)/block.x,
@@ -122,7 +197,11 @@ void fisheye_rectify_rgba(
         d_src_rgba, src_w, src_h, (int)src_stride,
         d_dst_rgba, dst_w, dst_h, (int)dst_stride,
         cfg.cx_f, cfg.cy_f, cfg.r_f,
-        f_fish, fx, cx_rect, cy_rect
+        f_fish, fx, cx_rect, cy_rect,
+        // --- color controls forwarded to the kernel ---
+        cfg.brightness, cfg.contrast,
+        cfg.saturation, gammaInv,
+        cfg.wb_r, cfg.wb_g, cfg.wb_b
     );
 }
 

@@ -12,9 +12,11 @@
 #include <sstream>
 #include <chrono>
 #include <cmath>
+#include <cstdio>   // for std::rename (atomic replace on POSIX)
 
 #include "gstreamer_pipeline.hpp"
 #include "image_correction.hpp"
+#include "runtime_controls.hpp"  // runtime color controls + file watcher
 
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
   std::cerr << "CUDA error: " << cudaGetErrorString(e)                  \
@@ -55,14 +57,23 @@ static void write_ppm(const std::string& path, const uint8_t* rgba, int w, int h
     }
 }
 
+// Atomic replace: write to temporary file then rename to final path
+static void write_ppm_atomic(const std::string& final_path,
+                             const uint8_t* rgba, int w, int h) {
+    std::string tmp = final_path + ".tmp";
+    write_ppm(tmp, rgba, w, h);
+    std::rename(tmp.c_str(), final_path.c_str());
+}
+
 struct CameraJob {
     int idx = 0;
-    int frames_to_process = 200; // -1 to run forever
+    int frames_to_process = -1; // -1 = run forever
 };
 
 static void cam_worker(GStreamerMultiCamera* multi,
                        CameraJob job,
                        const RectifyConfig& cfg,
+                       RuntimeControls* runtime_ctrls,
                        std::atomic<bool>& running)
 {
     cudaStream_t stream{};
@@ -84,6 +95,11 @@ static void cam_worker(GStreamerMultiCamera* multi,
         out_capacity = need;
         return true;
     };
+
+    // --- throttled save config: one single file per camera ---
+    constexpr int SAVE_INTERVAL_MS = 50; // write at most every 50 ms
+    auto last_save = std::chrono::steady_clock::now() - std::chrono::milliseconds(SAVE_INTERVAL_MS);
+    const std::string out_filename = "cam" + std::to_string(job.idx) + "_latest.ppm";
 
     int frame_idx = 0;
     while (running.load(std::memory_order_relaxed)) {
@@ -110,21 +126,35 @@ static void cam_worker(GStreamerMultiCamera* multi,
 
         const size_t src_stride = (size_t)w     * 4;
         const size_t dst_stride = (size_t)dst_w * 4;
+        
+        // Take a per-frame snapshot of runtime color controls
+        float bri, con, sat, gam, wbr, wbg, wbb;
+        runtime_ctrls->snapshot(bri, con, sat, gam, wbr, wbg, wbb);
+
+        // Make a local copy of cfg and override color fields
+        RectifyConfig local_cfg = cfg;
+        local_cfg.brightness = bri;
+        local_cfg.contrast   = con;
+        local_cfg.saturation = sat;
+        local_cfg.gamma      = gam;
+        local_cfg.wb_r = wbr; local_cfg.wb_g = wbg; local_cfg.wb_b = wbb;
 
         // Undistort (equidistant -> perspective) to d_out
         fisheye_rectify_rgba(
             d_src,  w,     h,     src_stride,
             d_out,  dst_w, dst_h, dst_stride,
-            cfg,
+            local_cfg,
             stream
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(stream)); // make results visible in h_out
 
-        // Save the RECTIFIED image (no brightness/constant add)
-        std::ostringstream name;
-        name << "cam" << job.idx << "_frame" << std::setw(6) << std::setfill('0') << frame_idx << ".ppm";
-        write_ppm(name.str(), h_out, dst_w, dst_h);
+        // Throttled single-file save
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_save >= std::chrono::milliseconds(SAVE_INTERVAL_MS)) {
+            write_ppm_atomic(out_filename, h_out, dst_w, dst_h);
+            last_save = now;
+        }
 
         ++frame_idx;
     }
@@ -139,20 +169,43 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
 
+    // Runtime color controls (hot-adjustable, shared by all workers)
+    RuntimeControls runtime_ctrls;
+
+    // Optional: initialize from a controls.json if present
+    load_controls_from_file("controls.json", runtime_ctrls);
+
+    std::atomic<bool> running{true};
+
+    // Start a background watcher that reloads controls.json on change
+    std::thread ctrl_watcher([&]{
+        watch_controls_file("controls.json", runtime_ctrls, running);
+    });
+
     // Source camera setup
     const int SRC_W = 1920;
     const int SRC_H = 1080;
     const int FPS_NUM = 30;
     const int FPS_DEN = 1;
-    const int NUM_CAMS = 2;
+    const int NUM_CAMS = 1;
 
     // Integrated rectification parameters (fixed)
-    const RectifyConfig rectify_cfg{
-        .fish_fov_deg = 195.1f,
-        .out_hfov_deg = 90.0f,
-        .cx_f = 959.50f, .cy_f = 539.50f, .r_f = 1100.77f,
-        .out_width = 1920
-    };
+    RectifyConfig rectify_cfg{};
+    rectify_cfg.fish_fov_deg = 195.1f;
+    rectify_cfg.out_hfov_deg = 90.0f;
+    rectify_cfg.cx_f = 959.50f;
+    rectify_cfg.cy_f = 539.50f;
+    rectify_cfg.r_f  = 1100.77f;
+    rectify_cfg.out_width = 1920;
+
+    // --- Default color controls (can be overridden by controls.json) ---
+    rectify_cfg.brightness = 0.0f;
+    rectify_cfg.contrast   = 1.0f;
+    rectify_cfg.saturation = 1.0f;
+    rectify_cfg.gamma      = 1.0f;
+    rectify_cfg.wb_r = 1.0f;
+    rectify_cfg.wb_g = 1.0f;
+    rectify_cfg.wb_b = 1.0f;
 
     // Build multi-camera pipeline and sinks
     std::string pipeline = build_multi_pipeline(SRC_W, SRC_H, FPS_NUM, FPS_DEN, NUM_CAMS);
@@ -166,11 +219,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Frames to process (optional): argv[1], default 200
-    int frames = 200;
+    // Frames to process (optional): argv[1], default = run forever
+    int frames = -1;
     if (argc >= 2) { try { frames = std::stoi(argv[1]); } catch (...) {} }
 
-    std::atomic<bool> running{true};
     std::vector<std::thread> threads;
     threads.reserve(NUM_CAMS);
     for (int i = 0; i < NUM_CAMS; ++i) {
@@ -178,9 +230,13 @@ int main(int argc, char** argv) {
                              &multi,
                              CameraJob{ .idx = i, .frames_to_process = frames },
                              std::cref(rectify_cfg),
+                             &runtime_ctrls,
                              std::ref(running));
     }
     for (auto& t : threads) t.join();
+    
+    running.store(false, std::memory_order_relaxed);
+    if (ctrl_watcher.joinable()) ctrl_watcher.join();
 
     multi.stop();
     std::cout << "All done.\n";
