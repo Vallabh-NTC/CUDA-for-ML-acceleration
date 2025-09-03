@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
     const int FPS_DEN = 1;
 
     // Number of cameras you want to run (1..6). Each cam maps to UDP port 5000+i.
-    const int NUM_CAMS = 2;   // <-- set this to 1..6 as needed
+    const int NUM_CAMS = 3;   // <-- set this to 1..6 as needed
 
     // Sanity: limit to supported RTP port range (5000..5005)
     const int RTP_BASE_PORT = 5000;

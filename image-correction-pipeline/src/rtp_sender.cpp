@@ -23,14 +23,14 @@ std::string RtpSender::build_pipeline_str() const {
     // - rtph264pay config-interval=-1 (send SPS/PPS at each IDR)
     // - mtu=1200 and qos=false on udpsink
     std::ostringstream ss;
-   ss
-    << "appsrc name=rectsrc is-live=true format=time block=true do-timestamp=true caps=\"" << caps.str() << "\" ! "
-    << "queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
-    << "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
-    << "nvv4l2h264enc profile=2 insert-sps-pps=1 iframeinterval=30 control-rate=1 bitrate=9000000 preset-level=1 ! "
-    << "h264parse ! rtph264pay config-interval=-1 pt=96 mtu=1000 ! "
-    << "udpsink host=" << host_ << " port=" << port_
-    << " sync=false async=false qos=false buffer-size=2097152";
+    ss
+     << "appsrc name=rectsrc is-live=true format=time block=true do-timestamp=true caps=\"" << caps.str() << "\" ! "
+     << "queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
+     << "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+     << "nvv4l2h264enc insert-sps-pps=1 iframeinterval=30 control-rate=1 bitrate=8000000 preset-level=1 ! "
+     << "h264parse ! rtph264pay config-interval=1 pt=96 mtu=1000 ! "
+     << "udpsink host=" << host_ << " port=" << port_
+     << " sync=false async=false qos=false buffer-size=2097152";
 
     return ss.str();
 }
