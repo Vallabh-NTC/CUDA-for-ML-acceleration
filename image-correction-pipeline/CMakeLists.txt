@@ -24,6 +24,7 @@ target_link_libraries(image_correction_kernels
 # ---- Libreria C++ con la pipeline GStreamer ----
 add_library(gstreamer_frontend STATIC
   src/gstreamer_pipeline.cpp
+  src/rtp_sender.cpp  
 )
 
 target_include_directories(gstreamer_frontend
