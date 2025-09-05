@@ -1,0 +1,19 @@
+# Build directories
+/build/
+/build*/
+
+# IDE / Editor stuff
+.vscode/
+.idea/
+*.swp
+*.swo
+*.user
+*.userprefs
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+

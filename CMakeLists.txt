@@ -1,42 +1,42 @@
 cmake_minimum_required(VERSION 3.18)
-project(CNN_Project LANGUAGES CXX CUDA)
+project(ImageCorrectionPipeline LANGUAGES CXX CUDA)
 
-# Enable C++17 and CUDA17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-option(BUILD_DEBUG "Enable debug build" ON)
+find_package(CUDAToolkit REQUIRED)
+find_package(PkgConfig REQUIRED)
 
-# Include directories
-include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(/usr/include)           # cuDNN headers
-
-# Source files
-set(SOURCES
-    src/main.cu
-    src/utils.cu
+# GStreamer come target IMPORTED (propaga include + libs)
+pkg_check_modules(GST REQUIRED IMPORTED_TARGET
+  gstreamer-1.0
+  gstreamer-app-1.0
+  gstreamer-video-1.0
 )
 
-# Create executable
-add_executable(cnn_app ${SOURCES})
+# Sotto-progetto con le librerie
+add_subdirectory(image-correction-pipeline)
 
-# CUDA architecture for Jetson Orin (Ampere)
-set_target_properties(cnn_app PROPERTIES
-    CUDA_ARCHITECTURES "87"
+# ---- Executable principale (CUDA) ----
+add_executable(main_app
+  src/main.cu
 )
 
-# Link to CUDA, cuBLAS, cuBLAS Lt, cuDNN
-target_link_libraries(cnn_app
-    /usr/local/cuda/lib64/libcudart.so
-    /usr/local/cuda/lib64/libcublas.so
-    /usr/local/cuda/lib64/libcublasLt.so
-    /usr/lib/aarch64-linux-gnu/libcudnn.so
+target_include_directories(main_app
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Compiler flags for debug
-if(BUILD_DEBUG)
-    target_compile_options(cnn_app PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -O0 -g>
-        $<$<COMPILE_LANGUAGE:CUDA>:-G -lineinfo -Xcompiler=-Wall,-Wextra,-O0>
-    )
-endif()
+# Linka TUTTO ciò che serve a main.cu:
+target_link_libraries(main_app
+  PRIVATE
+    PkgConfig::GST            # <gst/gst.h> + libs
+    gstreamer_frontend        # implementazione della pipeline (cpp)
+    image_correction_kernels  # i tuoi kernel CUDA
+    CUDA::cudart
+)
+
+# Opzionale: se serve separable compilation
+set_target_properties(main_app PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
