@@ -6,8 +6,11 @@ set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "SM arch for CUDA") # Xavier/Xavier NX
 
-# Allow a sysroot for cross builds (e.g., /l4t/targetfs)
+# Detect SYSROOT from env or fallback to /l4t/targetfs
 set(SYSROOT "$ENV{SYSROOT}" CACHE PATH "Jetson target rootfs (sysroot) for cross-compiling")
+if(NOT SYSROOT)
+  set(SYSROOT "/l4t/targetfs")
+endif()
 
 # ---------- Helpers ----------
 function(_sysroot_hint out_var)
@@ -20,84 +23,51 @@ function(_sysroot_hint out_var)
 endfunction()
 
 # Candidate library dirs inside the target filesystem
-set(L4T_LIB_DIRS)
-if(SYSROOT)
-  list(APPEND L4T_LIB_DIRS
-    ${SYSROOT}/usr/lib/aarch64-linux-gnu
-    ${SYSROOT}/lib/aarch64-linux-gnu
-    ${SYSROOT}/usr/lib/aarch64-linux-gnu/tegra
-    ${SYSROOT}/usr/lib/tegra
-  )
-else()
-  list(APPEND L4T_LIB_DIRS
-    /usr/lib/aarch64-linux-gnu
-    /lib/aarch64-linux-gnu
-    /usr/lib/aarch64-linux-gnu/tegra
-    /usr/lib/tegra
-  )
-endif()
+set(L4T_LIB_DIRS
+  ${SYSROOT}/usr/lib/aarch64-linux-gnu
+  ${SYSROOT}/lib/aarch64-linux-gnu
+  ${SYSROOT}/usr/lib/aarch64-linux-gnu/tegra
+  ${SYSROOT}/usr/lib/tegra
+)
 
 # Jetson Multimedia API include dir (sysroot-aware)
 _sysroot_hint(JETSON_MMAPI_INC "/usr/src/jetson_multimedia_api/include")
 
-# ---------- CUDA Toolkit / cudart ----------
-set(_cuda_ok FALSE)
-find_package(CUDAToolkit QUIET)
+# ---------- CUDA Toolkit / cudart (sysroot-only, no host libs) ----------
+# We avoid find_package(CUDAToolkit) to prevent host contamination.
+# Import cudart directly from the sysroot and expose include dirs.
 
-if(CUDAToolkit_FOUND AND TARGET CUDA::cudart)
-  set(_cuda_ok TRUE)
-else()
-  set(_cudart_candidates)
-  if(SYSROOT)
-    list(APPEND _cudart_candidates
-      "${SYSROOT}/usr/local/cuda-11.4/targets/aarch64-linux/lib/libcudart.so"
-      "${SYSROOT}/usr/local/cuda/targets/aarch64-linux/lib/libcudart.so")
-  else()
-    list(APPEND _cudart_candidates
-      "/usr/local/cuda-11.4/targets/aarch64-linux/lib/libcudart.so"
-      "/usr/local/cuda/targets/aarch64-linux/lib/libcudart.so")
+# Locate sysroot CUDA root
+set(_SYS_CUDA_CANDIDATES
+  "${SYSROOT}/usr/local/cuda-11.4"
+  "${SYSROOT}/usr/local/cuda"
+)
+set(_SYS_CUDA_FOUND FALSE)
+foreach(_c IN LISTS _SYS_CUDA_CANDIDATES)
+  if(EXISTS "${_c}/targets/aarch64-linux/lib/libcudart.so")
+    set(JETSON_CUDA_ROOT "${_c}")
+    set(_SYS_CUDA_FOUND TRUE)
+    break()
   endif()
-  foreach(p IN LISTS _cudart_candidates)
-    if(EXISTS "${p}")
-      add_library(CUDA::cudart SHARED IMPORTED)
-      set_target_properties(CUDA::cudart PROPERTIES IMPORTED_LOCATION "${p}")
-      if(SYSROOT)
-        set_property(TARGET CUDA::cudart APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES
-          "${SYSROOT}/usr/local/cuda-11.4/targets/aarch64-linux/include"
-          "${SYSROOT}/usr/local/cuda/targets/aarch64-linux/include")
-      else()
-        set_property(TARGET CUDA::cudart APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES
-          "/usr/local/cuda-11.4/targets/aarch64-linux/include"
-          "/usr/local/cuda/targets/aarch64-linux/include")
-      endif()
-      set(_cuda_ok TRUE)
-      break()
-    endif()
-  endforeach()
+endforeach()
+
+if(NOT _SYS_CUDA_FOUND)
+  message(FATAL_ERROR "Could not find aarch64 CUDA in sysroot. Checked: ${_SYS_CUDA_CANDIDATES}")
 endif()
 
-if(NOT _cuda_ok)
-  message(FATAL_ERROR "Could not locate CUDA toolkit or aarch64 libcudart.so (set SYSROOT or install CUDA).")
-endif()
+# Import cudart from sysroot with an absolute path
+add_library(CUDA::cudart SHARED IMPORTED)
+set_target_properties(CUDA::cudart PROPERTIES
+  IMPORTED_LOCATION "${JETSON_CUDA_ROOT}/targets/aarch64-linux/lib/libcudart.so"
+  INTERFACE_INCLUDE_DIRECTORIES "${JETSON_CUDA_ROOT}/targets/aarch64-linux/include"
+)
 
-# ---------- EGL (host stub) ----------
-# EGL headers come dal sysroot
-if(SYSROOT)
-  include_directories(${SYSROOT}/usr/include ${SYSROOT}/usr/include/aarch64-linux-gnu)
-else()
-  include_directories(/usr/include /usr/include/aarch64-linux-gnu)
-endif()
-
-# EGL lib dal container host (Mesa stub, x86-64)
+# ---------- EGL / Driver API (from Jetson sysroot) ----------
 unset(EGL_LIB CACHE)
-find_library(EGL_LIB EGL HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
+find_library(EGL_LIB EGL HINTS ${L4T_LIB_DIRS} REQUIRED)
 
-# ---------- CUDA Driver stub (host x86-64) ----------
 unset(CUDA_DRIVER_LIB CACHE)
-find_library(CUDA_DRIVER_LIB cuda
-  HINTS /usr/local/cuda-11.4/targets/x86_64-linux/lib/stubs
-  REQUIRED)
-message(STATUS "Using CUDA driver stub: ${CUDA_DRIVER_LIB}")
+find_library(CUDA_DRIVER_LIB cuda HINTS ${L4T_LIB_DIRS} REQUIRED)
 
 # ---------- CUDA kernels ----------
 add_library(image_correction_kernels STATIC
@@ -106,13 +76,12 @@ add_library(image_correction_kernels STATIC
 target_include_directories(image_correction_kernels PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/include
+  "${JETSON_CUDA_ROOT}/targets/aarch64-linux/include"
 )
 set_target_properties(image_correction_kernels PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
-target_link_libraries(image_correction_kernels PUBLIC
-  CUDA::cudart
-)
+target_link_libraries(image_correction_kernels PUBLIC CUDA::cudart)
 
 # ---------- nvivafilter plugin (.so) ----------
 add_library(rectify_nvivafilter SHARED
@@ -123,6 +92,7 @@ target_include_directories(rectify_nvivafilter PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/include
   ${JETSON_MMAPI_INC}
+  "${JETSON_CUDA_ROOT}/targets/aarch64-linux/include"
 )
 
 set_target_properties(rectify_nvivafilter PROPERTIES
@@ -136,13 +106,13 @@ set_target_properties(rectify_nvivafilter PROPERTIES
 target_link_libraries(rectify_nvivafilter PRIVATE
   image_correction_kernels
   CUDA::cudart
-  ${CUDA_DRIVER_LIB}   # x86-64 stub
-  ${EGL_LIB}           # x86-64 stub
+  ${CUDA_DRIVER_LIB}
+  ${EGL_LIB}
 )
 
-# NB: nvbufsurface solo headers, non linkato in cross build
-# (si risolve a runtime sul Jetson)
-
+# nvbufsurface: headers only, resolves at runtime on Jetson
 install(TARGETS rectify_nvivafilter
   LIBRARY DESTINATION /opt/lib
 )
+
+
