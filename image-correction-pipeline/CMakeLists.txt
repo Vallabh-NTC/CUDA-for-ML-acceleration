@@ -4,8 +4,7 @@ project(camera_rectify LANGUAGES CXX CUDA)
 # --- Global settings ---
 set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-# Xavier / Xavier NX
-set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "SM arch for CUDA")
+set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "SM arch for CUDA") # Xavier/Xavier NX
 
 # Allow a sysroot for cross builds (e.g., /l4t/targetfs)
 set(SYSROOT "$ENV{SYSROOT}" CACHE PATH "Jetson target rootfs (sysroot) for cross-compiling")
@@ -42,9 +41,9 @@ endif()
 _sysroot_hint(JETSON_MMAPI_INC "/usr/src/jetson_multimedia_api/include")
 
 # ---------- CUDA Toolkit / cudart ----------
-# Prefer the official package if available; otherwise import cudart from target fs
 set(_cuda_ok FALSE)
 find_package(CUDAToolkit QUIET)
+
 if(CUDAToolkit_FOUND AND TARGET CUDA::cudart)
   set(_cuda_ok TRUE)
 else()
@@ -76,26 +75,29 @@ else()
     endif()
   endforeach()
 endif()
+
 if(NOT _cuda_ok)
   message(FATAL_ERROR "Could not locate CUDA toolkit or aarch64 libcudart.so (set SYSROOT or install CUDA).")
 endif()
 
-# ---------- EGL / cudaEGL (fallback to cuda) / nvbufsurface from target fs ----------
-# Header
+# ---------- EGL (host stub) ----------
+# EGL headers come dal sysroot
 if(SYSROOT)
-  find_path(OPENGL_EGL_INCLUDE_DIR EGL/egl.h
-    HINTS ${SYSROOT}/usr/include ${SYSROOT}/usr/include/aarch64-linux-gnu
-    NO_DEFAULT_PATH REQUIRED)
+  include_directories(${SYSROOT}/usr/include ${SYSROOT}/usr/include/aarch64-linux-gnu)
 else()
-  find_path(OPENGL_EGL_INCLUDE_DIR EGL/egl.h
-    HINTS /usr/include /usr/include/aarch64-linux-gnu REQUIRED)
+  include_directories(/usr/include /usr/include/aarch64-linux-gnu)
 endif()
 
-# Libs from target filesystem
-find_library(EGL_LIB          EGL           HINTS ${L4T_LIB_DIRS} NO_DEFAULT_PATH REQUIRED)
-# Try cudaEGL first; if missing, fall back to cuda (driver) which contains cuEGL* on newer L4T
-find_library(CUDAEGL_OR_CUDA  NAMES cudaEGL cuda HINTS ${L4T_LIB_DIRS} NO_DEFAULT_PATH REQUIRED)
-find_library(NVBUF_LIB        nvbufsurface  HINTS ${L4T_LIB_DIRS} NO_DEFAULT_PATH REQUIRED)
+# EGL lib dal container host (Mesa stub, x86-64)
+unset(EGL_LIB CACHE)
+find_library(EGL_LIB EGL HINTS /usr/lib/x86_64-linux-gnu REQUIRED)
+
+# ---------- CUDA Driver stub (host x86-64) ----------
+unset(CUDA_DRIVER_LIB CACHE)
+find_library(CUDA_DRIVER_LIB cuda
+  HINTS /usr/local/cuda-11.4/targets/x86_64-linux/lib/stubs
+  REQUIRED)
+message(STATUS "Using CUDA driver stub: ${CUDA_DRIVER_LIB}")
 
 # ---------- CUDA kernels ----------
 add_library(image_correction_kernels STATIC
@@ -121,39 +123,26 @@ target_include_directories(rectify_nvivafilter PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/include
   ${JETSON_MMAPI_INC}
-  ${OPENGL_EGL_INCLUDE_DIR}
 )
 
 set_target_properties(rectify_nvivafilter PROPERTIES
   OUTPUT_NAME rectify
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
   CUDA_SEPARABLE_COMPILATION ON
-  BUILD_RPATH "/usr/lib/aarch64-linux-gnu/tegra"
+  BUILD_RPATH "/usr/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu/tegra"
+  INSTALL_RPATH "/usr/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu/tegra"
 )
 
 target_link_libraries(rectify_nvivafilter PRIVATE
   image_correction_kernels
   CUDA::cudart
-  ${CUDAEGL_OR_CUDA}
-  ${EGL_LIB}
-  ${NVBUF_LIB}
+  ${CUDA_DRIVER_LIB}   # x86-64 stub
+  ${EGL_LIB}           # x86-64 stub
 )
+
+# NB: nvbufsurface solo headers, non linkato in cross build
+# (si risolve a runtime sul Jetson)
 
 install(TARGETS rectify_nvivafilter
   LIBRARY DESTINATION /opt/lib
 )
-
-# ---- (old frontend targets kept commented) ----
-# add_library(gstreamer_frontend STATIC
-#   src/gstreamer_pipeline.cpp
-#   src/rtp_sender.cpp
-# )
-# target_include_directories(gstreamer_frontend PUBLIC
-#   ${CMAKE_CURRENT_SOURCE_DIR}/include
-#   ${CMAKE_SOURCE_DIR}/include
-# )
-# target_link_libraries(gstreamer_frontend PUBLIC
-#   PkgConfig::GST
-#   CUDA::cudart
-#   CUDA::toolkit
-# )

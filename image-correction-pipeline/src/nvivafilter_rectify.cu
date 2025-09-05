@@ -1,5 +1,5 @@
 // image-correction-pipeline/src/nvivafilter_rectify.cu
-#include <cuda.h>
+#include <cuda.h>            // Driver API first (JP 35.1.1 / CUDA 11.4 needs this)
 #include <cuda_runtime.h>
 #include <cudaEGL.h>
 #include <EGL/egl.h>
@@ -9,12 +9,12 @@
 #include <cstdio>
 #include <cstring>
 
-#include "image_correction.hpp"   // <-- your RectifyConfig + fisheye_rectify_rgba()
+#include "image_correction.hpp"   // RectifyConfig + fisheye_rectify_rgba()
 
 // ---- NVMM <-> CUDA helpers ----
 static bool map_nvmm_to_cuda(NvBufSurface* surf, int idx,
                              CUeglFrame& outFrame,
-                             cudaGraphicsResource_t& outRes)
+                             CUgraphicsResource& outRes)   // <-- Driver API type
 {
     if (!surf || idx < 0 || idx >= surf->numFilled) return false;
 
@@ -22,12 +22,14 @@ static bool map_nvmm_to_cuda(NvBufSurface* surf, int idx,
     EGLImageKHR eglImage = surf->surfaceList[idx].mappedAddr.eglImage;
     if (!eglImage) { NvBufSurfaceUnMapEglImage(surf, idx); return false; }
 
-    if (cudaGraphicsEGLRegisterImage(&outRes, eglImage, cudaGraphicsRegisterFlagsNone) != cudaSuccess) {
+    // Driver API variant (no cuda* runtime symbol here on JP 35.1.1)
+    if (cuGraphicsEGLRegisterImage(&outRes, eglImage,
+                                   CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE) != CUDA_SUCCESS) {
         NvBufSurfaceUnMapEglImage(surf, idx);
         return false;
     }
     if (cuGraphicsResourceGetMappedEglFrame(&outFrame, outRes, 0, 0) != CUDA_SUCCESS) {
-        cudaGraphicsUnregisterResource(outRes);
+        cuGraphicsUnregisterResource(outRes);
         NvBufSurfaceUnMapEglImage(surf, idx);
         return false;
     }
@@ -35,15 +37,17 @@ static bool map_nvmm_to_cuda(NvBufSurface* surf, int idx,
 }
 
 static void unmap_nvmm_from_cuda(NvBufSurface* surf, int idx,
-                                 cudaGraphicsResource_t res)
+                                 CUgraphicsResource res)   // <-- Driver API type
 {
-    cudaGraphicsUnregisterResource(res);
+    cuGraphicsUnregisterResource(res);  // <-- Driver API unregister
     NvBufSurfaceUnMapEglImage(surf, idx);
 }
 
 // ---- nvivafilter entrypoints ----
-// (nvivafilter looks for these symbols)
-extern "C" void pre_process() { /* optional one-time init */ }
+extern "C" void pre_process() {
+    // Initialize CUDA Driver API (safe if called multiple times)
+    cuInit(0);
+}
 extern "C" void post_process() { /* optional cleanup */ }
 
 extern "C" void gpu_process(NvBufSurface* in_surf,
@@ -54,10 +58,13 @@ extern "C" void gpu_process(NvBufSurface* in_surf,
 
     // Map input + output NVMM surfaces to CUDA device pointers (via EGL)
     CUeglFrame inF{}, outF{};
-    cudaGraphicsResource_t inRes=nullptr, outRes=nullptr;
+    CUgraphicsResource inRes=nullptr, outRes=nullptr;  // <-- Driver API handles
 
     if (!map_nvmm_to_cuda(in_surf,  idx, inF,  inRes))  return;
-    if (!map_nvmm_to_cuda(out_surf, idx, outF, outRes)) { unmap_nvmm_from_cuda(in_surf, idx, inRes); return; }
+    if (!map_nvmm_to_cuda(out_surf, idx, outF, outRes)) {
+        unmap_nvmm_from_cuda(in_surf, idx, inRes);
+        return;
+    }
 
     // Expect RGBA pitch-linear frames on both sides.
     // On Jetson, CUDA reports RGBA as CU_EGL_COLOR_FORMAT_ABGR (byte order compatible).
@@ -93,7 +100,7 @@ extern "C" void gpu_process(NvBufSurface* in_surf,
     cfg.r_f  = 1100.77f;
     cfg.out_width = dst_w;
 
-    // Default color controls (you can wire runtime controls later)
+    // Default color controls (wire runtime controls later if needed)
     cfg.brightness = 0.0f;
     cfg.contrast   = 1.0f;
     cfg.saturation = 1.0f;
