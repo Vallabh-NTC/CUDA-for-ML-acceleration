@@ -1,118 +1,76 @@
+# =============================================================================
+# CMake build script for the "image-correction-pipeline" project
+#
+# Builds a GStreamer "nvivafilter" plugin with CUDA support
+# for NVIDIA Jetson (cross-compiled from x86 host).
+# =============================================================================
+
 cmake_minimum_required(VERSION 3.18)
-project(camera_rectify LANGUAGES CXX CUDA)
 
-# --- Global settings ---
-set(CMAKE_CUDA_STANDARD 14)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "SM arch for CUDA") # Xavier/Xavier NX
+project(image_correction_pipeline LANGUAGES CXX CUDA)
 
-# Detect SYSROOT from env or fallback to /l4t/targetfs
-set(SYSROOT "$ENV{SYSROOT}" CACHE PATH "Jetson target rootfs (sysroot) for cross-compiling")
-if(NOT SYSROOT)
-  set(SYSROOT "/l4t/targetfs")
+# Jetson Xavier/NX/Nano → GPU arch "72" (Volta, sm_72).
+# Explicitly set to avoid CMake error "CUDA_ARCHITECTURES is empty".
+set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "CUDA architectures")
+
+# Enforce C++17 and CUDA C++17 dialects.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+
+# CUDA source files (compiled with nvcc → kernels + host glue).
+set(CUDA_SOURCES
+    src/nvivafilter_rectify.cu
+    src/rectify_kernels.cu
+)
+
+# Host C++ sources (compiled with aarch64 g++).
+set(CPP_SOURCES
+    src/runtime_controls.cpp
+)
+
+# Build a shared library (GStreamer plugin).
+# Name must match GStreamer conventions → "libnvivafilter_rectify.so"
+add_library(nvivafilter_rectify SHARED
+    ${CUDA_SOURCES}
+    ${CPP_SOURCES}
+)
+
+# Tell CMake to treat CUDA sources as CUDA (not plain C++).
+set_source_files_properties(${CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
+
+# Include dirs for both host compiler and nvcc.
+# - Our own headers under include/
+# - CUDA Toolkit headers
+# - Sysroot headers (glibc, EGL, X11, Jetson Multimedia API)
+target_include_directories(nvivafilter_rectify PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CUDA_TOOLKIT_ROOT_DIR}/include
+    ${CMAKE_SYSROOT}/usr/include
+    ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu
+)
+
+# Find CUDA runtime library (cudart) inside sysroot/host toolkit.
+# Note: search order is important → first stubs, then real libs.
+find_library(CUDART_LIBRARY cudart
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+          ${CUDA_TOOLKIT_ROOT_DIR}/lib/stubs
+          ${CMAKE_SYSROOT}/usr/local/cuda/lib64
+)
+
+# Link cudart if found (avoids hardcoding -lcudart).
+if (CUDART_LIBRARY)
+    target_link_libraries(nvivafilter_rectify ${CUDART_LIBRARY})
 endif()
 
-# ---------- Helpers ----------
-function(_sysroot_hint out_var)
-  set(abs_path "${ARGV1}")
-  if(SYSROOT)
-    set(${out_var} "${SYSROOT}${abs_path}" PARENT_SCOPE)
-  else()
-    set(${out_var} "${abs_path}" PARENT_SCOPE)
-  endif()
-endfunction()
-
-# Candidate library dirs inside the target filesystem
-set(L4T_LIB_DIRS
-  ${SYSROOT}/usr/lib/aarch64-linux-gnu
-  ${SYSROOT}/lib/aarch64-linux-gnu
-  ${SYSROOT}/usr/lib/aarch64-linux-gnu/tegra
-  ${SYSROOT}/usr/lib/tegra
+# Add sysroot library search paths at link time.
+# Without this step, ld would try to resolve libc/ld-linux from host /lib64.
+target_link_options(nvivafilter_rectify PRIVATE
+    -L${CMAKE_SYSROOT}/lib/aarch64-linux-gnu
+    -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
 )
 
-# Jetson Multimedia API include dir (sysroot-aware)
-_sysroot_hint(JETSON_MMAPI_INC "/usr/src/jetson_multimedia_api/include")
-
-# ---------- CUDA Toolkit / cudart (sysroot-only, no host libs) ----------
-# We avoid find_package(CUDAToolkit) to prevent host contamination.
-# Import cudart directly from the sysroot and expose include dirs.
-
-# Locate sysroot CUDA root
-set(_SYS_CUDA_CANDIDATES
-  "${SYSROOT}/usr/local/cuda-11.4"
-  "${SYSROOT}/usr/local/cuda"
+# Install plugin into GStreamer standard directory inside sysroot.
+# On Jetson this resolves to: /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
+install(TARGETS nvivafilter_rectify
+    LIBRARY DESTINATION lib/aarch64-linux-gnu/gstreamer-1.0/
 )
-set(_SYS_CUDA_FOUND FALSE)
-foreach(_c IN LISTS _SYS_CUDA_CANDIDATES)
-  if(EXISTS "${_c}/targets/aarch64-linux/lib/libcudart.so")
-    set(JETSON_CUDA_ROOT "${_c}")
-    set(_SYS_CUDA_FOUND TRUE)
-    break()
-  endif()
-endforeach()
-
-if(NOT _SYS_CUDA_FOUND)
-  message(FATAL_ERROR "Could not find aarch64 CUDA in sysroot. Checked: ${_SYS_CUDA_CANDIDATES}")
-endif()
-
-# Import cudart from sysroot with an absolute path
-add_library(CUDA::cudart SHARED IMPORTED)
-set_target_properties(CUDA::cudart PROPERTIES
-  IMPORTED_LOCATION "${JETSON_CUDA_ROOT}/targets/aarch64-linux/lib/libcudart.so"
-  INTERFACE_INCLUDE_DIRECTORIES "${JETSON_CUDA_ROOT}/targets/aarch64-linux/include"
-)
-
-# ---------- EGL / Driver API (from Jetson sysroot) ----------
-unset(EGL_LIB CACHE)
-find_library(EGL_LIB EGL HINTS ${L4T_LIB_DIRS} REQUIRED)
-
-unset(CUDA_DRIVER_LIB CACHE)
-find_library(CUDA_DRIVER_LIB cuda HINTS ${L4T_LIB_DIRS} REQUIRED)
-
-# ---------- CUDA kernels ----------
-add_library(image_correction_kernels STATIC
-  src/image_correction.cu
-)
-target_include_directories(image_correction_kernels PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/include
-  "${JETSON_CUDA_ROOT}/targets/aarch64-linux/include"
-)
-set_target_properties(image_correction_kernels PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-)
-target_link_libraries(image_correction_kernels PUBLIC CUDA::cudart)
-
-# ---------- nvivafilter plugin (.so) ----------
-add_library(rectify_nvivafilter SHARED
-  src/nvivafilter_rectify.cu
-)
-
-target_include_directories(rectify_nvivafilter PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/include
-  ${JETSON_MMAPI_INC}
-  "${JETSON_CUDA_ROOT}/targets/aarch64-linux/include"
-)
-
-set_target_properties(rectify_nvivafilter PROPERTIES
-  OUTPUT_NAME rectify
-  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
-  CUDA_SEPARABLE_COMPILATION ON
-  BUILD_RPATH "/usr/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu/tegra"
-  INSTALL_RPATH "/usr/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu/tegra"
-)
-
-target_link_libraries(rectify_nvivafilter PRIVATE
-  image_correction_kernels
-  CUDA::cudart
-  ${CUDA_DRIVER_LIB}
-  ${EGL_LIB}
-)
-
-# nvbufsurface: headers only, resolves at runtime on Jetson
-install(TARGETS rectify_nvivafilter
-  LIBRARY DESTINATION /opt/lib
-)
-
-
