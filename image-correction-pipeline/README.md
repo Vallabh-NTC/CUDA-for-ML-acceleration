@@ -1,3 +1,8 @@
+Jetson Cross-Compilation Environment (JetPack 5.1.1 / L4T R35.3.1)
+
+Goal: build the nvivafilter CUDA plugin (libnvivafilter_rectify.so) on an x86 host, for Jetson (aarch64), the first time it runs.
+This guide gives you copy-pasteable commands and explains why each step matters, so you don’t get bitten by headers, sysroots, or nvcc quirks.
+
 # --- On x86 host --------------------------------------------------------------
 export WORKSPACE=$HOME/jetson_ws
 mkdir -p "$WORKSPACE"
