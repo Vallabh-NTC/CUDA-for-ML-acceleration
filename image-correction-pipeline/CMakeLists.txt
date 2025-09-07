@@ -9,68 +9,93 @@ cmake_minimum_required(VERSION 3.18)
 
 project(image_correction_pipeline LANGUAGES CXX CUDA)
 
-# Jetson Xavier/NX/Nano → GPU arch "72" (Volta, sm_72).
-# Explicitly set to avoid CMake error "CUDA_ARCHITECTURES is empty".
+# -----------------------------------------------------------------------------
+# Force CUDA toolkit root (fix cross-build autodetect issues)
+# -----------------------------------------------------------------------------
+if(NOT DEFINED CUDA_TOOLKIT_ROOT_DIR)
+    set(CUDA_TOOLKIT_ROOT_DIR /usr/local/cuda CACHE PATH "CUDA Toolkit root")
+endif()
+
+# Jetson Xavier/NX/Nano → Volta (sm_72)
 set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "CUDA architectures")
 
-# Enforce C++17 and CUDA C++17 dialects.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-# CUDA source files (compiled with nvcc → kernels + host glue).
+# -----------------------------------------------------------------------------
+# Sources
+# -----------------------------------------------------------------------------
 set(CUDA_SOURCES
-    src/nvivafilter_rectify.cu
     src/rectify_kernels.cu
 )
 
-# Host C++ sources (compiled with aarch64 g++).
 set(CPP_SOURCES
+    src/nvivafilter_rectify.cpp
     src/runtime_controls.cpp
 )
 
-# Build a shared library (GStreamer plugin).
-# Name must match GStreamer conventions → "libnvivafilter_rectify.so"
 add_library(nvivafilter_rectify SHARED
     ${CUDA_SOURCES}
     ${CPP_SOURCES}
 )
 
-# Tell CMake to treat CUDA sources as CUDA (not plain C++).
 set_source_files_properties(${CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
 
-# Include dirs for both host compiler and nvcc.
-# - Our own headers under include/
-# - CUDA Toolkit headers
-# - Sysroot headers (glibc, EGL, X11, Jetson Multimedia API)
+# -----------------------------------------------------------------------------
+# Include directories
+# -----------------------------------------------------------------------------
 target_include_directories(nvivafilter_rectify PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUDA_TOOLKIT_ROOT_DIR}/include
+    ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/include
     ${CMAKE_SYSROOT}/usr/include
     ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu
 )
 
-# Find CUDA runtime library (cudart) inside sysroot/host toolkit.
-# Note: search order is important → first stubs, then real libs.
+# -----------------------------------------------------------------------------
+# Libraries
+# -----------------------------------------------------------------------------
 find_library(CUDART_LIBRARY cudart
     HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64
-          ${CUDA_TOOLKIT_ROOT_DIR}/lib/stubs
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
           ${CMAKE_SYSROOT}/usr/local/cuda/lib64
 )
 
-# Link cudart if found (avoids hardcoding -lcudart).
-if (CUDART_LIBRARY)
-    target_link_libraries(nvivafilter_rectify ${CUDART_LIBRARY})
-endif()
+find_library(LIB_EGL EGL HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_X11 X11 HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_XEXT Xext HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_BSD bsd HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_RT rt HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_PTHREAD pthread HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_M m HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_DL dl HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
 
-# Add sysroot library search paths at link time.
-# Without this step, ld would try to resolve libc/ld-linux from host /lib64.
-target_link_options(nvivafilter_rectify PRIVATE
-    -L${CMAKE_SYSROOT}/lib/aarch64-linux-gnu
-    -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
+target_link_libraries(nvivafilter_rectify
+    ${CUDART_LIBRARY}
+    ${LIB_EGL}
+    ${LIB_X11}
+    ${LIB_XEXT}
+    ${LIB_BSD}
+    ${LIB_RT}
+    ${LIB_PTHREAD}
+    ${LIB_M}
+    ${LIB_DL}
 )
 
-# Install plugin into GStreamer standard directory inside sysroot.
-# On Jetson this resolves to: /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
+# -----------------------------------------------------------------------------
+# Sysroot library paths
+# -----------------------------------------------------------------------------
+target_link_options(nvivafilter_rectify PRIVATE
+    -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
+    -L${CMAKE_SYSROOT}/lib/aarch64-linux-gnu
+    -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
+    -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
+)
+
+# -----------------------------------------------------------------------------
+# Install
+# -----------------------------------------------------------------------------
 install(TARGETS nvivafilter_rectify
     LIBRARY DESTINATION lib/aarch64-linux-gnu/gstreamer-1.0/
 )
