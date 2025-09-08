@@ -1,6 +1,27 @@
-Jetson Cross-Compilation Environment (JetPack 5.1.1 / L4T R35.3.1)
+# Image Correction Pipeline (CUDA + GStreamer nvivafilter)
 
-Goal: build the nvivafilter CUDA plugin (libnvivafilter_rectify.so) on an x86 host, for Jetson (aarch64), the first time it runs.
+## 🎯 Goal
+
+This project implements a **full GPU-based image correction pipeline** for NVIDIA Jetson platforms using `nvivafilter`.  
+It provides real-time enhancement of NV12 video streams directly on the GPU, with **zero-copy** processing.  
+
+Main features:
+- Fisheye **rectification** (optional).
+- **Temporal denoise** (GPU, previous frame blending).
+- **Auto exposure (AE)** with anti-flicker smoothing.
+- **Auto white balance (AWB)** with gray-world adaptation.
+- **Histogram-based tone mapping** and **local CLAHE-like contrast boost**.
+- **In-place color grading** (exposure, contrast, saturation).
+- **Runtime JSON config** via `ICP_CONTROLS` env var.
+- Fully integrated with **GStreamer pipelines** for encoding/streaming.
+
+---
+
+# Jetson Cross-Compilation Environment (JetPack 5.1.1 / L4T R35.3.1)
+
+## 🎯 Goal
+
+Build the nvivafilter CUDA plugin (libnvivafilter_rectify.so) on an x86 host, for Jetson (aarch64), the first time it runs.
 This guide gives you copy-pasteable commands and explains why each step matters, so you don’t get bitten by headers, sysroots, or nvcc quirks.
 
 # --- On x86 host --------------------------------------------------------------
@@ -86,3 +107,62 @@ cmake --build build -j"$(nproc)" --verbose
 # Verify
 file build/image-correction-pipeline/libnvivafilter_rectify.so
 aarch64-linux-gnu-objdump -p build/image-correction-pipeline/lib
+
+# Deployment on Jetson Xavier
+
+Once the plugin is cross-compiled, copy the shared library to the Jetson Xavier:
+
+scp build/image-correction-pipeline/libnvivafilter_rectify.so jetson@<JETSON_IP>:/usr/local/lib/nvivafilter/
+
+# Transmission Pipeline (Jetson → Host)
+
+Run this on the Jetson Xavier to capture from the CSI camera, apply image correction, encode to H.264, and stream via UDP:
+
+gst-launch-1.0 -e -v \
+  nvarguscamerasrc \
+    exposuretimerange="40000 30000000" gainrange="1 8" ispdigitalgainrange="1 1" \
+    aelock=false awblock=false wbmode=0 ! \
+  'video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080,framerate=30/1' ! \
+  nvivafilter \
+    customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_rectify.so \
+    pre-process=false cuda-process=true post-process=false ! \
+  nvv4l2h264enc bitrate=12000000 insert-sps-pps=true idrinterval=30 preset-level=4 ! \
+  h264parse ! rtph264pay pt=96 config-interval=1 ! \
+  udpsink host=<CLIENT_IP> port=5000 sync=false async=false
+
+# Runtime JSON Controls
+
+The filter supports live configuration via a JSON file.
+Set the environment variable before launching the pipeline:
+
+export ICP_CONTROLS=/home/jetson/config/controls.json
+
+Example controls.json:
+
+{
+  "brightness": 0.0,
+  "contrast": 1.0,
+  "saturation": 1.0,
+  "gamma": 1.0,
+  "auto_tone": true,
+  "auto_wb": true,
+  "auto_roi_pct": 90,
+  "auto_hist_step": 2,
+  "auto_lo_pct": 1.0,
+  "auto_hi_pct": 99.0,
+  "auto_tone_alpha": 0.1,
+  "auto_wb_alpha": 0.05,
+  "auto_wb_clamp": 0.2,
+  "auto_gamma_min": 0.85,
+  "auto_gamma_max": 1.15,
+  "target_Y": 110.0
+}
+
+# Reception Pipeline (Host → Display)
+
+Run this on the receiving machine (Linux/Windows with GStreamer installed):
+
+gst-launch-1.0 -v \
+  udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! \
+  rtpjitterbuffer latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! \
+  videoconvert ! autovideosink sync=false
