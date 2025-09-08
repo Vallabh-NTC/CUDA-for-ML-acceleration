@@ -1,51 +1,51 @@
-// image-correction-pipeline/include/rectify_config.hpp
+/**
+ * @file rectify_config.hpp
+ * @brief Configuration struct for rectification and color processing.
+ *
+ * Holds all tunable parameters used in the pipeline:
+ *  - Geometry (fisheye → rectilinear projection).
+ *  - Manual color controls (brightness, contrast, WB, etc).
+ *  - Automatic controls (AE, AWB, tone mapping).
+ *
+ * Can be updated at runtime via JSON (RuntimeControls).
+ */
+
 #pragma once
+#include <cstdint>
 
-// ----------------------------------------------------------------------------
-// RectifyConfig
-// ----------------------------------------------------------------------------
-// Holds ALL parameters used by the CUDA kernel:
-//   1) Fisheye-to-perspective mapping parameters for an equidistant fisheye
-//      model (typical for wide FOV lenses).
-//   2) Color controls applied in linear 8-bit space (except gamma which is
-//      applied on normalized [0..1]) to allow runtime tuning without
-//      recompilation or pipeline restart.
-//
-// IMPORTANT FORMAT ASSUMPTIONS (handled by the plugin/pipeline):
-// - The CUDA kernel expects pitch-linear ABGR (which corresponds to RGBA byte
-//   order stored in an ABGR enum; this is how CU_EGL_COLOR_FORMAT_ABGR is
-//   reported by nvivafilter).
-// - The pipeline MUST convert from camera output (often UYVY/NV12) into RGBA
-//   in NVMM *before* nvivafilter (e.g., with `nvvidconv ! ... format=RGBA`).
-// ----------------------------------------------------------------------------
+namespace icp {
+
 struct RectifyConfig {
-    // --- Equidistant fisheye model parameters (all in pixels or degrees) ---
-    // Horizontal fisheye FOV (degrees). Controls how quickly rays diverge radially.
-    float fish_fov_deg = 195.1f;
+    // --- Geometry ---
+    float fish_fov_deg = 195.1f; // fisheye lens FOV (deg)
+    float out_hfov_deg = 90.0f;  // rectified horizontal FOV (deg)
+    float cx_f = 959.50f;        // fisheye circle center X
+    float cy_f = 539.50f;        // fisheye circle center Y
+    float r_f  = 1100.77f;       // fisheye circle radius
+    int   out_width = 1920;      // output width (rectified)
 
-    // Desired perspective horizontal FOV (degrees). Affects fx.
-    float out_hfov_deg = 90.0f;
+    // --- Manual color controls ---
+    float brightness = 0.0f;   // Y offset
+    float contrast   = 1.0f;   // scale around mid
+    float saturation = 1.0f;   // chroma multiplier
+    float gamma      = 1.0f;   // global gamma
+    float wb_r = 1.0f, wb_g = 1.0f, wb_b = 1.0f; // manual WB multipliers
 
-    // Fisheye circle optical center in source image (pixels).
-    float cx_f = 959.50f;
-    float cy_f = 539.50f;
+    // --- Automatic quality (Porsche preset) ---
+    bool  auto_tone   = true;     // enable auto tone-mapping (histogram → LUT)
+    bool  auto_wb     = true;     // enable auto white balance
+    int   auto_roi_pct= 90;       // ROI percentage (of min side), 100=full frame
+    int   auto_hist_step = 2;     // subsampling step for stats
+    float auto_ae_step   = 0.08f; // AE smoothing step (speed of adaptation)
 
-    // Fisheye circle radius (pixels). Anything beyond this is considered invalid.
-    float r_f  = 1100.77f;
-
-    // --- Color pipeline parameters (linear 8-bit domain unless noted) ---
-    // Brightness is an additive bias; Contrast is a multiplicative gain.
-    float brightness = 0.0f;   // add per channel in [0..255]
-    float contrast   = 1.0f;   // >1 increases contrast, <1 reduces
-
-    // Saturation is computed relative to luma (Rec.709). 0=grayscale, 1=neutral.
-    float saturation = 1.0f;
-
-    // Gamma is applied LAST on normalized [0..1]. gamma < 1 brightens mid-tones.
-    float gamma      = 1.0f;
-
-    // Simple per-channel white balance multipliers (pre-gamma).
-    float wb_r = 1.0f;
-    float wb_g = 1.0f;
-    float wb_b = 1.0f;
+    float auto_lo_pct = 1.0f;     // low percentile for tone-mapping
+    float auto_hi_pct = 99.0f;    // high percentile for tone-mapping
+    float auto_tone_alpha = 0.10f;// histogram smoothing
+    float auto_wb_alpha   = 0.05f;// WB smoothing
+    float auto_wb_clamp   = 0.20f;// max WB per-frame change
+    float auto_gamma_min  = 0.85f;// min gamma
+    float auto_gamma_max  = 1.15f;// max gamma
+    float target_Y        = 110.0f; // target luminance (mid-gray ~ pleasant)
 };
+
+} // namespace icp
