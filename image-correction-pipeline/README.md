@@ -119,7 +119,7 @@ scp build/image-correction-pipeline/libnvivafilter_rectify.so jetson@<JETSON_IP>
 Run this on the Jetson Xavier to capture from the CSI camera, apply image correction, encode to H.264, and stream via UDP:
 
 gst-launch-1.0 -e -v \
-  nvarguscamerasrc \
+  nvarguscamerasrc sensor-id=0 \
     exposuretimerange="40000 30000000" gainrange="1 8" ispdigitalgainrange="1 1" \
     aelock=false awblock=false wbmode=0 ! \
   'video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080,framerate=30/1' ! \
