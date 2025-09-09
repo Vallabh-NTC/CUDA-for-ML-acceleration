@@ -39,12 +39,10 @@ set(CMAKE_CUDA_STANDARD 17)
 # -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
-    src/kernel_color.cu
 )
 
 set(CPP_SOURCES
     src/nvivafilter_imagecorrection.cpp
-    src/runtime_controls.cpp
 )
 
 add_library(nvivafilter_imagecorrection SHARED
