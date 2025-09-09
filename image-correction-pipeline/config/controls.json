@@ -1,15 +1,8 @@
 {
-  "fish_fov_deg": 195.1,
-  "out_hfov_deg": 90.0,
-  "cx_f": 959.50,
-  "cy_f": 539.50,
-  "r_f": 1100.77,
-
-  "brightness": 0.0,
-  "contrast": 1.0,
-  "saturation": 1.0,
-  "gamma": 1.0,
-  "wb_r": 1.0,
-  "wb_g": 1.0,
-  "wb_b": 1.0
+  "image": {
+    "brightness": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "sharpness": 0.0
+  }
 }

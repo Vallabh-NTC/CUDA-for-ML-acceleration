@@ -6,12 +6,12 @@
  *   - launch_rectify_nv12(): warps fisheye NV12 input into perspective output.
  *
  * Parameters:
- *   - dY/dUV: destination pointers (NV12 frame in-place).
- *   - sY/sUV: scratch copy of the source frame (avoids overwrite).
+ *   - d_src_y / d_src_uv: source NV12 planes
+ *   - d_dst_y / d_dst_uv: destination NV12 planes
  *   - Calibration params: fisheye FOV, circle radius, optical center, output FOV.
  *
  * Notes:
- *   - Geometry math: equidistant fisheye projection.
+ *   - Uses equidistant fisheye projection model.
  *   - Output is NV12, same size as input.
  */
 
@@ -21,13 +21,15 @@
 
 namespace icp {
 
-// NV12 → NV12 (rettifica geometrica; nessun colore)
+/**
+ * @brief Launch CUDA kernel for fisheye rectification (NV12 → NV12).
+ */
 void launch_rectify_nv12(
     const uint8_t* d_src_y,  int src_w, int src_h, int src_pitch_y,
     const uint8_t* d_src_uv,                   int src_pitch_uv,
     uint8_t* d_dst_y,        int dst_w, int dst_h, int dst_pitch_y,
     uint8_t* d_dst_uv,                       int dst_pitch_uv,
-    // Geometria
+    // Geometry parameters
     float cx_f, float cy_f, float r_f,
     float f_fish, float fx, float cx_rect, float cy_rect,
     cudaStream_t stream);

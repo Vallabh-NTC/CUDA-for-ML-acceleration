@@ -39,6 +39,7 @@ set(CMAKE_CUDA_STANDARD 17)
 # -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
+    src/kernel_enhance.cu
 )
 
 set(CPP_SOURCES

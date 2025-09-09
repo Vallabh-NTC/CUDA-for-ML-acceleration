@@ -1,18 +1,32 @@
 /**
- * @file nvivafilter_rectify.cpp
- * @brief GStreamer nvivafilter plugin – low-latency version (solo rettifica, single CUDA primary context).
+ * @file nvivafilter_imagecorrection.cpp
+ * @brief GStreamer `nvivafilter` plugin: fisheye rectification + image enhancement.
+ *
+ * Pipeline:
+ *   1. nvivafilter gives us an EGLImageKHR (zero-copy GPU buffer).
+ *   2. We map it to CUDA memory via CUDA/EGL interop.
+ *   3. Copy input frame into scratch buffer to avoid overwrite.
+ *   4. Apply fisheye rectification (NV12 → NV12).
+ *   5. Apply adaptive exposure control (highlight guard).
+ *   6. Apply enhancement pipeline:
+ *        - gamma correction
+ *        - local tone mapping
+ *        - sharpening
+ *        - saturation adjustment
+ *   7. Apply highlight rolloff (mainly for sky regions).
+ *   8. Unmap EGL resource and return to GStreamer.
  */
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <string>
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <math.h>
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -21,16 +35,12 @@
 #include "nvivafilter_customer_api.hpp"
 #include "rectify_config.hpp"
 #include "kernel_rectify.cuh"
+#include "kernel_enhance.cuh"
+
+constexpr float M_PI_F = 3.14159265358979323846f;
 
 // ============================================================================
-// Helpers
-// ============================================================================
-static inline float clampf(float v, float a, float b){ return v<a?a:(v>b?b:v); }
-static inline int   i_min(int a,int b){ return a<b?a:b; }
-static inline int   i_max(int a,int b){ return a>b?a:b; }
-
-// ============================================================================
-// Global CUDA primary context (shared across all instances)
+// Global CUDA primary context
 // ============================================================================
 namespace {
     static std::once_flag g_ctx_once;
@@ -64,12 +74,9 @@ namespace {
 struct ICPState {
     CUcontext     ctx   = nullptr;
     cudaStream_t  stream= nullptr;
-
-    // Scratch per rettifica
-    CUdeviceptr sY = 0, sUV = 0; size_t pY = 0, pUV = 0; int sW = 0, sH = 0;
-
-    // Config (static)
+    CUdeviceptr sY=0, sUV=0; size_t pY=0, pUV=0; int sW=0,sH=0;
     icp::RectifyConfig cfg{};
+    float ae_gain = 1.0f;
 };
 
 static std::mutex              g_instances_mtx;
@@ -78,13 +85,6 @@ static std::vector<ICPState*>  g_instances;
 // ----------------------------------------------------------------------------
 // Instance allocation / destruction
 // ----------------------------------------------------------------------------
-static int read_stream_priority_from_env() {
-    if (const char* s = std::getenv("ICP_STREAM_PRIORITY")) {
-        return std::atoi(s);
-    }
-    return 0;
-}
-
 static ICPState* create_instance()
 {
     std::call_once(g_ctx_once, retain_primary_context_once);
@@ -93,11 +93,9 @@ static ICPState* create_instance()
     st->ctx = g_primary_ctx;
     cuCtxSetCurrent(st->ctx);
 
-    int prio = read_stream_priority_from_env();
 #if CUDART_VERSION >= 11000
-    cudaStreamCreateWithPriority(&st->stream, cudaStreamNonBlocking, prio);
+    cudaStreamCreateWithPriority(&st->stream, cudaStreamNonBlocking, 0);
 #else
-    (void)prio;
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
 
@@ -134,9 +132,6 @@ static void ensure_scratch(ICPState* st, int W, int H)
     cuMemAllocPitch(&st->sY,  &st->pY,  (size_t)W, (size_t)H,    4);
     cuMemAllocPitch(&st->sUV, &st->pUV, (size_t)W, (size_t)(H/2),4);
     st->sW = W; st->sH = H;
-
-    fprintf(stderr,"[ic] [%p] scratch allocated %dx%d pitchY=%zu pitchUV=%zu\n",
-            (void*)st, W, H, st->pY, st->pUV);
 }
 
 static void copy_to_scratch_async(ICPState* st,
@@ -169,22 +164,14 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     if (!st) {
         st = create_instance();
         *userPtr = st;
-        fprintf(stderr,"[ic] init() instance %p (rectify only)\n",(void*)st);
     }
     cuCtxSetCurrent(st->ctx);
 
     CUgraphicsResource res=nullptr;
-    if(cuGraphicsEGLRegisterImage(&res,image,CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE)!=CUDA_SUCCESS){
-        fprintf(stderr,"[ic] cuGraphicsEGLRegisterImage failed\n"); return;
-    }
+    if(cuGraphicsEGLRegisterImage(&res,image,CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE)!=CUDA_SUCCESS) return;
     CUeglFrame f{};
-    if(cuGraphicsResourceGetMappedEglFrame(&f,res,0,0)!=CUDA_SUCCESS){
-        fprintf(stderr,"[ic] GetMappedEglFrame failed\n"); cuGraphicsUnregisterResource(res); return;
-    }
-    if(f.frameType!=CU_EGL_FRAME_TYPE_PITCH || f.planeCount<2){
-        fprintf(stderr,"[ic] Unexpected frameType=%d planeCount=%d\n",f.frameType,f.planeCount);
-        cuGraphicsUnregisterResource(res); return;
-    }
+    if(cuGraphicsResourceGetMappedEglFrame(&f,res,0,0)!=CUDA_SUCCESS){ cuGraphicsUnregisterResource(res); return; }
+    if(f.frameType!=CU_EGL_FRAME_TYPE_PITCH || f.planeCount<2){ cuGraphicsUnregisterResource(res); return; }
 
     uint8_t* dY  = static_cast<uint8_t*>(f.frame.pPitch[0]);
     uint8_t* dUV = static_cast<uint8_t*>(f.frame.pPitch[1]);
@@ -197,29 +184,45 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     const float FOV_fish = cfg.fish_fov_deg * (float)M_PI / 180.f;
     const float f_fish   = cfg.r_f / (FOV_fish * 0.5f);
-    const float fx       = (W * 0.5f) / std::tan(cfg.out_hfov_deg * (float)M_PI / 360.f);
+    const float fx       = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI / 360.f);
     const float cx_rect  = W * 0.5f;
     const float cy_rect  = H * 0.5f;
 
     icp::launch_rectify_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
-        (const uint8_t*)(uintptr_t)st->sUV,     (int)st->pUV,
+        (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
         dY, W,H,pitch,
-        dUV,     pitch,
+        dUV, pitch,
         cfg.cx_f, cfg.cy_f, cfg.r_f,
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
+    icp::launch_highlight_guard(dY, W, H, pitch, &st->ae_gain, st->stream);
+
+    // Enhancement
+    icp::EnhanceParams ep;
+    ep.gamma          = 0.98f;
+    ep.local_tm       = 0.18f;
+    ep.tm_white       = 1.10f;
+    ep.sharpen_amount = 0.18f;
+    ep.sharpen_clip   = 8.0f;
+    ep.saturation     = 1.05f;
+
+    icp::launch_enhance_nv12(dY, W, H, pitch, dUV, pitch, ep, st->stream);
+
+    // Rolloff top-weighted
+    icp::launch_highlight_rolloff_top(dY, W, H, pitch, 0.80f, 0.95f, 6.0f, st->stream);
+
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
 }
+
 
 // ----------------------------------------------------------------------------
 // init / deinit
 // ----------------------------------------------------------------------------
 extern "C" void init(CustomerFunction* f)
 {
-    fprintf(stderr,"[ic] init() loaded (rectify only, single-context)\n");
     if(!f) return;
     f->fPreProcess  = pre_process;
     f->fGPUProcess  = gpu_process;
@@ -234,7 +237,5 @@ extern "C" void deinit(void)
         to_free.swap(g_instances);
     }
     for (auto* st : to_free) destroy_instance(st);
-
     release_primary_context();
-    fprintf(stderr,"[ic] deinit()\n");
 }

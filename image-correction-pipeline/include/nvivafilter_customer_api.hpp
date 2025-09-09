@@ -1,19 +1,18 @@
 /**
  * @file nvivafilter_customer_api.hpp
- * @brief Official NVIDIA "nvivafilter" customer API stub.
+ * @brief NVIDIA "nvivafilter" customer API definition.
  *
- * GStreamer’s `nvivafilter` plugin loads this library and expects a standard C API:
+ * GStreamer’s `nvivafilter` plugin loads this library and expects:
  *   - init(CustomerFunction*)
  *   - deinit()
  *
  * The CustomerFunction struct contains function pointers:
  *   - fPreProcess   → called before GPU mapping
- *   - fGPUProcess   → called with mapped CUDA/EGL frame
+ *   - fGPUProcess   → called with CUDA/EGL mapped frame
  *   - fPostProcess  → called after GPU processing
  *
- * Our implementation (`nvivafilter_imagecorrection.cpp`) fills these hooks with
- * our CUDA pipeline. This header is provided by NVIDIA’s Multimedia API and is
- * included here for completeness.
+ * Our implementation (`nvivafilter_imagecorrection.cpp`) fills these hooks
+ * with our CUDA rectification + enhancement pipeline.
  */
 
 #ifndef _CUSTOMER_FUNCTIONS_H_
@@ -33,26 +32,7 @@ typedef enum {
 } ColorFormat;
 
 typedef struct {
-  /**
-  * cuda-process API
-  *
-  * @param image   : EGL Image to process
-  * @param userPtr : point to user alloc data, should be free by user
-  */
   void (*fGPUProcess) (EGLImageKHR image, void ** userPtr);
-
-  /**
-  * pre-process API
-  *
-  * @param sBaseAddr  : Mapped Surfaces(YUV) pointers
-  * @param smemsize   : surfaces size array
-  * @param swidth     : surfaces width array
-  * @param sheight    : surfaces height array
-  * @param spitch     : surfaces pitch array
-  * @param sformat    : surfaces format array
-  * @param nsurfcount : surfaces count
-  * @param userPtr    : point to user alloc data, should be free by user
-  */
   void (*fPreProcess)(void **sBaseAddr,
                       unsigned int *smemsize,
                       unsigned int *swidth,
@@ -61,19 +41,6 @@ typedef struct {
                       ColorFormat *sformat,
                       unsigned int nsurfcount,
                       void ** userPtr);
-
-  /**
-  * post-process API
-  *
-  * @param sBaseAddr  : Mapped Surfaces(YUV) pointers
-  * @param smemsize   : surfaces size array
-  * @param swidth     : surfaces width array
-  * @param sheight    : surfaces height array
-  * @param spitch     : surfaces pitch array
-  * @param sformat    : surfaces format array
-  * @param nsurfcount : surfaces count
-  * @param userPtr    : point to user alloc data, should be free by user
-  */
   void (*fPostProcess)(void **sBaseAddr,
                       unsigned int *smemsize,
                       unsigned int *swidth,
