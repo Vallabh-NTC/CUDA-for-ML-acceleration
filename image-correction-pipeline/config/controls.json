@@ -1,8 +1,11 @@
 {
-  "image": {
-    "brightness": 0.0,
-    "contrast": 1.0,
-    "saturation": 1.0,
-    "sharpness": 0.0
-  }
+  "enable": true,
+  "exposure_ev": -0.35,
+  "contrast": 1.25,    
+  "highlights": -0.40,  
+  "shadows": 0.30,      
+  "whites": -0.30,      
+  "gamma": 1.00,        
+  "saturation": 1.15,   
+  "tv_range": true
 }

@@ -1,20 +1,14 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * @brief GStreamer `nvivafilter` plugin: fisheye rectification + image enhancement.
+ * @brief GStreamer `nvivafilter` plugin: fisheye rectification + manual tone/color.
  *
  * Pipeline:
  *   1. nvivafilter gives us an EGLImageKHR (zero-copy GPU buffer).
  *   2. We map it to CUDA memory via CUDA/EGL interop.
  *   3. Copy input frame into scratch buffer to avoid overwrite.
  *   4. Apply fisheye rectification (NV12 → NV12).
- *   5. Apply adaptive exposure control (highlight guard).
- *   6. Apply enhancement pipeline:
- *        - gamma correction
- *        - local tone mapping
- *        - sharpening
- *        - saturation adjustment
- *   7. Apply highlight rolloff (mainly for sky regions).
- *   8. Unmap EGL resource and return to GStreamer.
+ *   5. Apply manual tone/color stage (exposure EV, highlights/shadows/contrast, saturation).
+ *   6. Unmap EGL resource and return to GStreamer.
  */
 
 #include <cstdio>
@@ -35,6 +29,8 @@
 #include "nvivafilter_customer_api.hpp"
 #include "rectify_config.hpp"
 #include "kernel_rectify.cuh"
+#include "color_ops.cuh"
+#include "runtime_controls.hpp"
 
 constexpr float M_PI_F = 3.14159265358979323846f;
 
@@ -75,7 +71,7 @@ struct ICPState {
     cudaStream_t  stream= nullptr;
     CUdeviceptr sY=0, sUV=0; size_t pY=0, pUV=0; int sW=0,sH=0;
     icp::RectifyConfig cfg{};
-    float ae_gain = 1.0f;
+    icp::RuntimeControls controls{"/home/jetson_ntc/config.json"};
 };
 
 static std::mutex              g_instances_mtx;
@@ -187,6 +183,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     const float cx_rect  = W * 0.5f;
     const float cy_rect  = H * 0.5f;
 
+    // 1) Rectification (NV12 -> NV12) from scratch to in-place
     icp::launch_rectify_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
         (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
@@ -196,10 +193,17 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
+    // 2) Manual tone + saturation (in-place on rectified frame)
+    icp::ColorParams cp = st->controls.current();
+    icp::launch_tone_saturation_nv12(
+        dY, W, H, pitch,
+        dUV,     pitch,
+        cp,
+        st->stream);
+
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
 }
-
 
 // ----------------------------------------------------------------------------
 // init / deinit
