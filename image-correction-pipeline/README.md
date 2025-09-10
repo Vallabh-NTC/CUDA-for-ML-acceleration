@@ -120,39 +120,28 @@ Run this on the Jetson Xavier to capture from the CSI camera, apply image correc
 
  gst-launch-1.0 -e -v   nvarguscamerasrc ! 'video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080,framerate=30/1'   ! nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so pre-process=false cuda-process=true post-process=false   ! 'video/x-raw(memory:NVMM),format=NV12'   ! nvv4l2h264enc bitrate=12000000 insert-sps-pps=true idrinterval=30 preset-level=4   ! h264parse ! rtph264pay pt=96 config-interval=1   ! udpsink host=192.168.10.201 port=5000 sync=false async=false
 
+# Receiver pipeline Windows
+ 
+ gst-launch-1.0 -v `
+  udpsrc port=5000 caps='application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000' `
+  ! rtpjitterbuffer latency=10 do-lost=true `
+  ! rtph264depay ! h264parse disable-passthrough=true `
+  ! d3d11h264dec `
+  ! d3d11convert `
+  ! "video/x-raw(memory:D3D11Memory),format=RGBA,colorimetry=bt709,range=tv" `
+  ! d3d11videosink sync=false
+
 # Runtime JSON Controls
 
 The filter supports live configuration via a JSON file.
-Set the environment variable before launching the pipeline:
+ - Manual exposure in EV: exposure_ev in [-2.0 … +2.0] (negative = darker).
+ - Tone controls (clamped to safe ranges):
 
-export ICP_CONTROLS=/home/jetson/config/controls.json
+      - contrast [0.50 … 1.80]
+      - highlights [-1.0 … +1.0] (negative = earlier soft roll-off)
+      - shadows [-1.0 … +1.0] (positive = lift)
+      - whites [-1.0 … +1.0] (negative = lower white ceiling)
+      - gamma [0.70 … 1.30]
+      - saturation [0.50 … 1.50]
+      - tv_range (true = clamp Y to [16..235])
 
-Example controls.json:
-
-{
-  "brightness": 0.0,
-  "contrast": 1.0,
-  "saturation": 1.0,
-  "gamma": 1.0,
-  "auto_tone": true,
-  "auto_wb": true,
-  "auto_roi_pct": 90,
-  "auto_hist_step": 2,
-  "auto_lo_pct": 1.0,
-  "auto_hi_pct": 99.0,
-  "auto_tone_alpha": 0.1,
-  "auto_wb_alpha": 0.05,
-  "auto_wb_clamp": 0.2,
-  "auto_gamma_min": 0.85,
-  "auto_gamma_max": 1.15,
-  "target_Y": 110.0
-}
-
-# Reception Pipeline (Host → Display)
-
-Run this on the receiving machine (Linux/Windows with GStreamer installed):
-
-gst-launch-1.0 -v \
-  udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! \
-  rtpjitterbuffer latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! \
-  videoconvert ! autovideosink sync=false
