@@ -35,7 +35,6 @@
 #include "nvivafilter_customer_api.hpp"
 #include "rectify_config.hpp"
 #include "kernel_rectify.cuh"
-#include "kernel_enhance.cuh"
 
 constexpr float M_PI_F = 3.14159265358979323846f;
 
@@ -196,22 +195,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         cfg.cx_f, cfg.cy_f, cfg.r_f,
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
-
-    icp::launch_highlight_guard(dY, W, H, pitch, &st->ae_gain, st->stream);
-
-    // Enhancement
-    icp::EnhanceParams ep;
-    ep.gamma          = 0.98f;
-    ep.local_tm       = 0.18f;
-    ep.tm_white       = 1.10f;
-    ep.sharpen_amount = 0.18f;
-    ep.sharpen_clip   = 8.0f;
-    ep.saturation     = 1.05f;
-
-    icp::launch_enhance_nv12(dY, W, H, pitch, dUV, pitch, ep, st->stream);
-
-    // Rolloff top-weighted
-    icp::launch_highlight_rolloff_top(dY, W, H, pitch, 0.80f, 0.95f, 6.0f, st->stream);
 
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);

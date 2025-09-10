@@ -11,7 +11,6 @@
 #
 # Sources:
 #   - kernel_rectify.cu  : fisheye undistortion
-#   - kernel_color.cu    : color grading, tone mapping, denoise
 #   - nvivafilter_imagecorrection.cpp : plugin integration
 #   - runtime_controls.cpp : JSON config hot-reload
 # =============================================================================
@@ -39,7 +38,6 @@ set(CMAKE_CUDA_STANDARD 17)
 # -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
-    src/kernel_enhance.cu
 )
 
 set(CPP_SOURCES
