@@ -1,14 +1,6 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * @brief GStreamer `nvivafilter` plugin: fisheye rectification + manual tone/color.
- *
- * Pipeline:
- *   1. nvivafilter gives us an EGLImageKHR (zero-copy GPU buffer).
- *   2. We map it to CUDA memory via CUDA/EGL interop.
- *   3. Copy input frame into scratch buffer to avoid overwrite.
- *   4. Apply fisheye rectification (NV12 → NV12).
- *   5. Apply manual tone/color stage (exposure EV, highlights/shadows/contrast, saturation).
- *   6. Unmap EGL resource and return to GStreamer.
+ * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → tone/color.
  */
 
 #include <cstdio>
@@ -72,6 +64,7 @@ struct ICPState {
     CUdeviceptr sY=0, sUV=0; size_t pY=0, pUV=0; int sW=0,sH=0;
     icp::RectifyConfig cfg{};
     icp::RuntimeControls controls{"/home/jetson_ntc/config.json"};
+    float crop_frac = 0.5f; // crop 20% per side after rectification
 };
 
 static std::mutex              g_instances_mtx;
@@ -175,15 +168,17 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     icp::RectifyConfig cfg = st->cfg;
 
     ensure_scratch(st, W, H);
+
+    // Copy input fisheye to scratch (source for rectification)
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
 
-    const float FOV_fish = cfg.fish_fov_deg * (float)M_PI / 180.f;
+    const float FOV_fish = cfg.fish_fov_deg * (float)M_PI_F / 180.f;
     const float f_fish   = cfg.r_f / (FOV_fish * 0.5f);
-    const float fx       = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI / 360.f);
+    const float fx       = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI_F / 360.f);
     const float cx_rect  = W * 0.5f;
     const float cy_rect  = H * 0.5f;
 
-    // 1) Rectification (NV12 -> NV12) from scratch to in-place
+    // 1) Rectification (scratch fisheye -> in-place rectified)
     icp::launch_rectify_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
         (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
@@ -193,13 +188,23 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
-    // 2) Manual tone + saturation (in-place on rectified frame)
-    icp::ColorParams cp = st->controls.current();
-    icp::launch_tone_saturation_nv12(
-        dY, W, H, pitch,
-        dUV,     pitch,
-        cp,
-        st->stream);
+    // 2) Crop/zoom AFTER rectification:
+    //    Copy current rectified frame back into scratch, then resample to output.
+    copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
+    icp::launch_crop_center_nv12(
+        (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
+        (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
+        dY,                                   pitch,
+        dUV,                                  pitch,
+        st->crop_frac,                        st->stream);
+
+    // 3) Manual tone + saturation (in-place on cropped+rectified frame)
+    // icp::ColorParams cp = st->controls.current();
+    // icp::launch_tone_saturation_nv12(
+    //     dY, W, H, pitch,
+    //     dUV,     pitch,
+    //     cp,
+    //     st->stream);
 
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);

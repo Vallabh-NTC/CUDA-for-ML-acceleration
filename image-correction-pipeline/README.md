@@ -41,7 +41,6 @@ Copy code
 # --- Inside container ---------------------------------------------------------
 # 1) Unpack sysroot + toolchain
 cd /l4t
-cat targetfs.tbz2.* > targetfs.tbz2
 tar -I lbzip2 -xf targetfs.tbz2
 mkdir -p toolchain && tar -C toolchain -xf toolchain.tar.gz
 

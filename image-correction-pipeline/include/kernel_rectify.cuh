@@ -1,18 +1,12 @@
 /**
  * @file kernel_rectify.cuh
- * @brief CUDA interface for fisheye rectification (NV12 → NV12).
- *
- * Provides a single launcher:
- *   - launch_rectify_nv12(): warps fisheye NV12 input into perspective output.
- *
- * Parameters:
- *   - d_src_y / d_src_uv: source NV12 planes
- *   - d_dst_y / d_dst_uv: destination NV12 planes
- *   - Calibration params: fisheye FOV, circle radius, optical center, output FOV.
+ * @brief CUDA interfaces for:
+ *   1) fisheye rectification (NV12 → NV12)
+ *   2) post-rectification center-crop/zoom (NV12 → NV12, same size)
  *
  * Notes:
- *   - Uses equidistant fisheye projection model.
- *   - Output is NV12, same size as input.
+ *   - Equidistant fisheye projection model for rectification.
+ *   - Crop works in the rectified (perspective) domain and keeps output size.
  */
 
 #pragma once
@@ -32,6 +26,22 @@ void launch_rectify_nv12(
     // Geometry parameters
     float cx_f, float cy_f, float r_f,
     float f_fish, float fx, float cx_rect, float cy_rect,
+    cudaStream_t stream);
+
+/**
+ * @brief Center-crop/zoom an already-rectified NV12 frame to the same size.
+ * @param crop_frac fraction to remove on each side in rectified domain [0..0.45].
+ *                  Example: 0.20 → keep central 60% and scale it to full frame.
+ *
+ * Source and destination can be different buffers (recommended). If the same,
+ * the read/modify overlap would cause artifacts.
+ */
+void launch_crop_center_nv12(
+    const uint8_t* d_src_y,  int W, int H, int src_pitch_y,
+    const uint8_t* d_src_uv,             int src_pitch_uv,
+    uint8_t* d_dst_y,                    int dst_pitch_y,
+    uint8_t* d_dst_uv,                   int dst_pitch_uv,
+    float crop_frac,
     cudaStream_t stream);
 
 } // namespace icp
