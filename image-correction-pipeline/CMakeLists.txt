@@ -51,6 +51,7 @@ add_library(nvivafilter_imagecorrection SHARED
     ${CPP_SOURCES}
 )
 
+
 set_source_files_properties(${CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
 
 # ----------------------------------------------------------------------------- 

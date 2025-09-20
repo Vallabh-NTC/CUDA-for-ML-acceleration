@@ -1,6 +1,13 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
  * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → tone/color.
+ *
+ * Binding deterministico della sezione (cam0/cam1/cam2) in base al NOME della .so caricata:
+ *   libnvivafilter_imagecorrection_cam0.so → "cam0"
+ *   libnvivafilter_imagecorrection_cam1.so → "cam1"
+ *   libnvivafilter_imagecorrection_cam2.so → "cam2"
+ *
+ * Così possiamo usare UNA sola .so reale + 3 symlink, senza env/hint/round-robin.
  */
 
 #include <cstdio>
@@ -12,7 +19,10 @@
 #include <memory>
 #include <mutex>
 #include <vector>
-#include <math.h>
+#include <deque>
+#include <cmath>
+#include <dlfcn.h>     // dladdr
+#include <cctype>      // std::tolower
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -24,10 +34,13 @@
 #include "color_ops.cuh"
 #include "runtime_controls.hpp"
 
-constexpr float M_PI_F = 3.14159265358979323846f;
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+constexpr float M_PI_F = static_cast<float>(M_PI);
 
 // ============================================================================
-// Global CUDA primary context
+// Global CUDA primary context (shared across instances)
 // ============================================================================
 namespace {
     static std::once_flag g_ctx_once;
@@ -56,56 +69,61 @@ namespace {
 }
 
 // ============================================================================
+// Helpers
+// ============================================================================
+static std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return (char)std::tolower(c); });
+    return s;
+}
+
+// Determina "cam0|cam1|cam2" dal NOME con cui è stata caricata la .so
+static std::string section_from_loaded_name()
+{
+    Dl_info info{};
+    if (dladdr((void*)&init, &info) && info.dli_fname) {
+        std::string path(info.dli_fname);
+        std::string low  = to_lower(path);
+        // 1) prima prova dal basename (gestisce anche eventuali suffissi _camX)
+        std::string base = path.substr(path.find_last_of('/') + 1);
+        std::string base_low = to_lower(base);
+        if (base_low.find("_cam0") != std::string::npos) return "cam0";
+        if (base_low.find("_cam1") != std::string::npos) return "cam1";
+        if (base_low.find("_cam2") != std::string::npos) return "cam2";
+        // 2) poi guarda tutto il PATH (cartelle cam0/cam1/cam2)
+        if (low.find("/cam0/") != std::string::npos) return "cam0";
+        if (low.find("/cam1/") != std::string::npos) return "cam1";
+        if (low.find("/cam2/") != std::string::npos) return "cam2";
+    }
+    fprintf(stderr, "[ic] WARNING: cannot detect cam section from .so name/path, defaulting to cam0\n");
+    return "cam0";
+}
+
+
+// ============================================================================
 // Per-instance state
 // ============================================================================
 struct ICPState {
     CUcontext     ctx   = nullptr;
     cudaStream_t  stream= nullptr;
-    CUdeviceptr sY=0, sUV=0; size_t pY=0, pUV=0; int sW=0,sH=0;
+
+    // Scratch (NV12)
+    CUdeviceptr sY = 0, sUV = 0;
+    size_t      pY = 0, pUV = 0;
+    int         sW = 0, sH = 0;
+
+    // Geometry (fisheye rectification)
     icp::RectifyConfig cfg{};
-    icp::RuntimeControls controls{"/home/jetson_ntc/config.json"};
-    float crop_frac = 0.5f; // crop 20% per side after rectification
+
+    // Runtime controls (hot-reload) su sezione decisa a create_instance()
+    icp::RuntimeControls controls{"/home/jetson_ntc/config.json", "cam0"};
+
+    // Post-rectification center crop/zoom
+    float crop_frac = 0.20f;
 };
 
 static std::mutex              g_instances_mtx;
 static std::vector<ICPState*>  g_instances;
-
-// ----------------------------------------------------------------------------
-// Instance allocation / destruction
-// ----------------------------------------------------------------------------
-static ICPState* create_instance()
-{
-    std::call_once(g_ctx_once, retain_primary_context_once);
-
-    auto* st = new ICPState();
-    st->ctx = g_primary_ctx;
-    cuCtxSetCurrent(st->ctx);
-
-#if CUDART_VERSION >= 11000
-    cudaStreamCreateWithPriority(&st->stream, cudaStreamNonBlocking, 0);
-#else
-    cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
-#endif
-
-    {
-        std::lock_guard<std::mutex> lk(g_instances_mtx);
-        g_instances.push_back(st);
-    }
-    return st;
-}
-
-static void destroy_instance(ICPState* st)
-{
-    if (!st) return;
-    cuCtxSetCurrent(st->ctx);
-
-    if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
-    if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
-
-    if (st->stream) { cudaStreamDestroy(st->stream); st->stream = nullptr; }
-    st->ctx = nullptr;
-    delete st;
-}
 
 // ----------------------------------------------------------------------------
 // Alloc helpers
@@ -117,6 +135,7 @@ static void ensure_scratch(ICPState* st, int W, int H)
     if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
     if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
 
+    // pitched alloc per NV12
     cuMemAllocPitch(&st->sY,  &st->pY,  (size_t)W, (size_t)H,    4);
     cuMemAllocPitch(&st->sUV, &st->pUV, (size_t)W, (size_t)(H/2),4);
     st->sW = W; st->sH = H;
@@ -141,6 +160,50 @@ static void copy_to_scratch_async(ICPState* st,
 }
 
 // ----------------------------------------------------------------------------
+// Instance allocation / destruction
+// ----------------------------------------------------------------------------
+static ICPState* create_instance()
+{
+    std::call_once(g_ctx_once, retain_primary_context_once);
+
+    auto* st = new ICPState();
+    st->ctx = g_primary_ctx;
+    cuCtxSetCurrent(st->ctx);
+
+#if CUDART_VERSION >= 11000
+    cudaStreamCreateWithPriority(&st->stream, cudaStreamNonBlocking, 0);
+#else
+    cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
+#endif
+
+    // === Bind deterministico in base al nome della .so (symlink _camX) ===
+    {
+        std::string sec = section_from_loaded_name();
+        st->controls.set_section(sec);
+        fprintf(stderr, "[ic] Instance bound to section (soname) '%s'\n", sec.c_str());
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_instances_mtx);
+        g_instances.push_back(st);
+    }
+    return st;
+}
+
+static void destroy_instance(ICPState* st)
+{
+    if (!st) return;
+    cuCtxSetCurrent(st->ctx);
+
+    if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
+    if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
+
+    if (st->stream) { cudaStreamDestroy(st->stream); st->stream = nullptr; }
+    st->ctx = nullptr;
+    delete st;
+}
+
+// ----------------------------------------------------------------------------
 // nvivafilter hooks
 // ----------------------------------------------------------------------------
 static void pre_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*, ColorFormat*, unsigned int, void **){}
@@ -148,6 +211,7 @@ static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, u
 
 static void gpu_process(EGLImageKHR image, void **userPtr)
 {
+    // Lazily create per-instance state
     ICPState* st = static_cast<ICPState*>(*userPtr);
     if (!st) {
         st = create_instance();
@@ -155,6 +219,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     }
     cuCtxSetCurrent(st->ctx);
 
+    // Map EGLImage → CUDA
     CUgraphicsResource res=nullptr;
     if(cuGraphicsEGLRegisterImage(&res,image,CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE)!=CUDA_SUCCESS) return;
     CUeglFrame f{};
@@ -165,12 +230,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     uint8_t* dUV = static_cast<uint8_t*>(f.frame.pPitch[1]);
     const int W = (int)f.width, H=(int)f.height, pitch=(int)f.pitch;
 
-    icp::RectifyConfig cfg = st->cfg;
-
+    // Scratch
     ensure_scratch(st, W, H);
 
-    // Copy input fisheye to scratch (source for rectification)
-    copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
+    // Geometry
+    icp::RectifyConfig cfg = st->cfg;
 
     const float FOV_fish = cfg.fish_fov_deg * (float)M_PI_F / 180.f;
     const float f_fish   = cfg.r_f / (FOV_fish * 0.5f);
@@ -178,7 +242,8 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     const float cx_rect  = W * 0.5f;
     const float cy_rect  = H * 0.5f;
 
-    // 1) Rectification (scratch fisheye -> in-place rectified)
+    // 1) Rectification
+    copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
     icp::launch_rectify_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
         (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
@@ -188,8 +253,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
-    // 2) Crop/zoom AFTER rectification:
-    //    Copy current rectified frame back into scratch, then resample to output.
+    // 2) Crop/zoom centrale
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
     icp::launch_crop_center_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
@@ -198,13 +262,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         dUV,                                  pitch,
         st->crop_frac,                        st->stream);
 
-    // 3) Manual tone + saturation (in-place on cropped+rectified frame)
-    // icp::ColorParams cp = st->controls.current();
-    // icp::launch_tone_saturation_nv12(
-    //     dY, W, H, pitch,
-    //     dUV,     pitch,
-    //     cp,
-    //     st->stream);
+    // 3) Tone + color (hot-reload)
+    icp::ColorParams cp = st->controls.current();
+    icp::launch_tone_saturation_nv12(
+        dY, W, H, pitch,
+        dUV,     pitch,
+        cp,
+        st->stream);
 
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);

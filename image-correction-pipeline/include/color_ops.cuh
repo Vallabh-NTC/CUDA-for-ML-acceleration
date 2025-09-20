@@ -11,12 +11,17 @@ struct ColorParams {
     // Manual exposure in EV (negative = darker). Range: [-2.0 .. +2.0]
     float exposure_ev = 0.0f;
 
-    // Tone
+    // Tone (iPhone-like)
     float contrast    = 1.10f;  // [0.50 .. 1.80] S-curve around mid-gray
     float highlights  = -0.30f; // [-1.0 .. +1.0] <0 = earlier soft-knee
     float shadows     = 0.25f;  // [-1.0 .. +1.0] >0 = lift shadows
     float whites      = -0.20f; // [-1.0 .. +1.0] <0 = lower white ceiling
     float gamma       = 1.00f;  // [0.70 .. 1.30]
+
+    // Added controls
+    float brightness  = 0.0f;   // [-1.0 .. +1.0] mid-shift
+    float brilliance  = 0.0f;   // [-1.0 .. +1.0] mid-boost with edge-protection
+    float sharpness   = 0.0f;   // [0.0 .. 1.0] unsharp mask amount
 
     // Color
     float saturation  = 1.15f;  // [0.50 .. 1.50]

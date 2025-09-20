@@ -17,12 +17,30 @@ __device__ __forceinline__ float smoothstepf(float e0, float e1, float x)
     return t * t * (3.f - 2.f * t);
 }
 
-// Tone map + saturation (manual-only)
+// 3x3 unsharp (fast, separable-ish): simple Laplacian on Y then add amount
+__device__ __forceinline__ float laplacian3x3(const uint8_t* Y, int W, int H, int pitch, int x, int y)
+{
+    // Clamp sampling at borders
+    int xm1 = x>0 ? x-1 : 0, xp1 = x+1<W?x+1:W-1;
+    int ym1 = y>0 ? y-1 : 0, yp1 = y+1<H?y+1:H-1;
+
+    float c  = (float)Y[y*pitch + x];
+    float n  = (float)Y[ym1*pitch + x];
+    float s  = (float)Y[yp1*pitch + x];
+    float w  = (float)Y[y*pitch + xm1];
+    float e  = (float)Y[y*pitch + xp1];
+
+    // 4-neighborhood Laplacian
+    return (n + s + w + e - 4.f * c);
+}
+
+// Tone map + saturation + brightness/brilliance + optional unsharp
 __global__ void toneSat_kernel(
     uint8_t* __restrict__ Y, int W, int H, int pitchY,
     uint8_t* __restrict__ UV,            int pitchUV,
     float gain, float contrast, float highlights, float shadows, float whites,
-    float gamma, float sat, int tv_range)
+    float gamma, float sat, int tv_range,
+    float brightness, float brilliance, float sharp_amt)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -44,6 +62,9 @@ __global__ void toneSat_kernel(
     float t = (yf - (float)Ymin) / (float)(Ymax - Ymin);
     t = clamp(t, 0.0f, 1.0f);
 
+    // Brightness: small linear mid-shift
+    t = clamp(t + 0.15f * brightness, 0.0f, 1.0f);
+
     // Shadows: gamma near blacks only
     float gamma_sh = 1.0f - 0.5f * shadows;  // in [0.5 .. 1.5]
     float w_sh     = 1.0f - smoothstepf(0.35f, 0.75f, t);
@@ -59,16 +80,30 @@ __global__ void toneSat_kernel(
         t = knee + c * (1.0f - knee);
     }
 
+    // Brilliance: mid-boost with roll-off near 0/1
+    // weight peaks at mid-gray, fades to 0 near extremes
+    float w_mid = smoothstepf(0.15f, 0.5f, t) * (1.0f - smoothstepf(0.5f, 0.85f, t));
+    t = clamp(t + 0.25f * brilliance * (w_mid - 0.33f), 0.0f, 1.0f);
+
     // Contrast (S-curve around mid)
     t = clamp(0.5f + (t - 0.5f) * contrast, 0.0f, 1.0f);
 
     // Optional global gamma
     t = powf(t, 1.0f / gamma);
 
-    // Back to luma
-    yf = (float)Ymin + t * (float)(Ymax - Ymin);
-    yf = clamp(yf, (float)Ymin, (float)Ymax);
-    Y[y * pitchY + x] = (uint8_t)(yf + 0.5f);
+    // Back to luma (pre-sharpen)
+    float y_pre = (float)Ymin + t * (float)(Ymax - Ymin);
+    y_pre = clamp(y_pre, (float)Ymin, (float)Ymax);
+
+    // Optional unsharp on Y (small, safe range)
+    if (sharp_amt > 1e-6f) {
+        float lap = laplacian3x3(Y, W, H, pitchY, x, y);
+        // scale Laplacian to ~[-255..255], normalize and apply amount
+        float y_sharp = y_pre + sharp_amt * lap * 0.25f;
+        y_pre = clamp(y_sharp, (float)Ymin, (float)Ymax);
+    }
+
+    Y[y * pitchY + x] = (uint8_t)(y_pre + 0.5f);
 
     // --- Chroma (once per 2x2) ---
     if ((x % 2 == 0) && (y % 2 == 0)) {
@@ -76,7 +111,8 @@ __global__ void toneSat_kernel(
         float U = UV[idx + 0], V = UV[idx + 1];
 
         // Reduce saturation near whites (avoid pink skies)
-        float hi = clamp((t - 0.80f) / 0.20f, 0.0f, 1.0f);
+        float t_hi = (y_pre - (float)Ymin) / (float)(Ymax - Ymin);
+        float hi = clamp((t_hi - 0.80f) / 0.20f, 0.0f, 1.0f);
         float s  = sat * (1.0f - 0.6f * hi);
 
         U = 128.f + s * (U - 128.f);
@@ -104,6 +140,9 @@ void launch_tone_saturation_nv12(
     p.whites      = clamp(p.whites,     -1.0f, 1.0f);
     p.gamma       = clamp(p.gamma,       0.70f, 1.30f);
     p.saturation  = clamp(p.saturation,  0.50f, 1.50f);
+    p.brightness  = clamp(p.brightness, -1.0f, 1.0f);
+    p.brilliance  = clamp(p.brilliance, -1.0f, 1.0f);
+    p.sharpness   = clamp(p.sharpness,   0.0f, 1.0f);
 
     // Manual exposure → linear gain
     const float gain = powf(2.0f, p.exposure_ev);
@@ -113,7 +152,8 @@ void launch_tone_saturation_nv12(
         dY, W, H, pitchY,
         dUV,      pitchUV,
         gain, p.contrast, p.highlights, p.shadows, p.whites,
-        p.gamma, p.saturation, p.tv_range ? 1 : 0);
+        p.gamma, p.saturation, p.tv_range ? 1 : 0,
+        p.brightness, p.brilliance, p.sharpness);
 }
 
 } // namespace icp
