@@ -1,318 +1,326 @@
 #!/usr/bin/env python3
-import argparse
-import socket
-import struct
-import sys
-import numpy as np
-import cv2
+import argparse, socket, struct, sys, math
+import numpy as np, cv2
 
-# ---- protocol helpers --------------------------------------------------------
+# ---- Protocol ---------------------------------------------------------
 def fourcc_u32(tag: str) -> int:
-    assert len(tag) == 4
     return struct.unpack("<I", tag.encode("ascii"))[0]
 
 FRAME_MAGIC = fourcc_u32("FRAM")
-MASK_MAGIC  = fourcc_u32("MASK")
-MCNT_MAGIC  = fourcc_u32("MCNT")  # multi-mask count header
+FRAME_HDR_FMT = "<6I"; FRAME_HDR_SZ = struct.calcsize(FRAME_HDR_FMT)
 
-# FrameHeader: uint32 magic,width,height,stride,channels,size
-FRAME_HDR_FMT = "<6I"
-FRAME_HDR_SZ  = struct.calcsize(FRAME_HDR_FMT)
+SCNT_MAGIC = fourcc_u32("SCNT")
+STMP_MAGIC = fourcc_u32("STMP")
+SCNT_HDR_FMT = "<2I"
+STMP_FMT = "<I4f2I"
 
-# MaskHeader: uint32 magic,width,height,size
-MASK_HDR_FMT = "<4I"
-MASK_HDR_SZ  = struct.calcsize(MASK_HDR_FMT)
-
-# MasksCountHeader: uint32 magic,count
-MCNT_HDR_FMT = "<2I"
-MCNT_HDR_SZ  = struct.calcsize(MCNT_HDR_FMT)
-
-def recv_all(sock: socket.socket, n: int) -> bytes:
-    chunks = []
+def recv_all(s, n):
+    buf = bytearray(n)
+    view = memoryview(buf)
     got = 0
     while got < n:
-        chunk = sock.recv(n - got)
-        if not chunk:
+        r = s.recv_into(view[got:])
+        if r == 0:
             raise RuntimeError("socket closed while receiving")
-        chunks.append(chunk)
-        got += len(chunk)
-    return b"".join(chunks)
+        got += r
+    return bytes(buf)
 
-def send_all(sock: socket.socket, data: bytes) -> None:
+def send_all(s, data):
     view = memoryview(data)
     sent = 0
     while sent < len(view):
-        n = sock.send(view[sent:])
+        n = s.send(view[sent:])
         if n <= 0:
             raise RuntimeError("socket send failed")
         sent += n
 
-# ---- UI: simple polyline multi-mask (press 'n' to start a new mask) ----------
-class PolylineMaskPainter:
+def clamp(v, a, b): return a if v < a else (b if v > b else v)
+def odd(n): return int(n) | 1
+
+# ---- Designer ---------------------------------------------------------
+class StampDesigner:
     """
-    Click-to-draw polylines (no freehand):
-      - First click anchors; each next click draws a straight segment from previous→current.
-      - Press 'n' to finish the current mask and start a new one.
+    Click-to-polyline authoring (no drag):
 
-    Size entry:
-      - Type digits to enter a size (e.g., '12'), Enter to apply, Backspace to edit, Esc to cancel.
-      - While editing size, Enter won't finish the session; it applies the size.
+      Left-click: add a point.
+        - 1st click: starts a wire (no paint yet)
+        - 2nd click: paint segment p1->p2 by dropping stamps along the line
+        - 3rd click: paint p2->p3, etc.
+      Right-click / Backspace: undo last segment (removes its stamps and last point)
 
-    Other keys:
-      n: new mask  |  u: undo last segment
-      [ ] or - + : brush size -/+
-      r: reset current  |  i: invert current  |  p: preview toggle
-      Enter/Space: accept (when NOT editing size)
-      q/Esc: cancel (when NOT editing size)
+    Hotkeys:
+      a/d: rotate donor axis (−/+ 3°)
+      w/s: donor separation ( +/− 2 px )
+      [ / ]: block (kernel) size −/+
+      h: toggle HARD PASTE vs. alpha blend (preview text only; does not affect server)
+      , / .: alpha −/+  (preview text only)
+      m: toggle magnifier   z/x: magnifier scale −/+
+      n: next wire (start a fresh wire, keep params)
+      f: next frame
+      q/ESC: quit session
     """
-    def __init__(self, bgr_img: np.ndarray, brush: int = 9):
-        self.img = bgr_img
-        self.h, self.w = bgr_img.shape[:2]
+    def __init__(self, bgr_img, frame_idx=1, total_frames=1,
+                 init_angle=90.0, init_sep=14, init_block=21, alpha=0.65,
+                 mag_pad=50, mag_scale=6, mag_max=480,
+                 step_px=None):
+        self.frame=bgr_img; self.h,self.w=bgr_img.shape[:2]
+        self.cursor=(self.w//2,self.h//2)
+        self.angle=float(init_angle); self.sep=float(init_sep)
+        self.block=odd(int(init_block)); self.alpha=float(alpha)
+        self.hard_paste=False
+        self.preview_on=True
 
-        self.current_mask = np.zeros((self.h, self.w), dtype=np.uint8)
-        self.segments = []   # list[(p0, p1, brush)]
-        self.anchor_pt = None
-        self.brush = max(1, int(brush))
-        self.preview = True
+        # polyline + wires
+        self.step_px = float(step_px) if step_px is not None else max(1.0, odd(int(init_block)) * 0.5)
+        self.wires=[]   # each wire: dict(points=[(x,y),...], seg_stack=[(start_idx,end_idx)], stamps=[...])
+        self._start_new_wire()
 
-        self.masks = []  # committed masks (list of np.uint8 HxW)
+        # Magnifier
+        self.mag_on=True; self.mag_pad=int(mag_pad)
+        self.mag_scale=int(mag_scale); self.mag_max=int(mag_max)
 
-        self.done = False
-        self.cancel = False
+        self.action="next_frame"   # or "quit"
+        self.frame_idx=frame_idx; self.total_frames=total_frames
 
-        # numeric size entry state
-        self.size_editing = False
-        self.size_buffer = ""  # digits being typed
+        self.win="Stamp Designer"
+        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.win, min(self.w,1280), min(self.h,720))
+        cv2.setMouseCallback(self.win, self._on_mouse)
 
-    def _rebuild_current(self):
-        self.current_mask.fill(0)
-        for p0, p1, b in self.segments:
-            cv2.line(self.current_mask, p0, p1, 255, b, cv2.LINE_AA)
+    # ---- wire utilities ----
+    def _start_new_wire(self):
+        self.wires.append(dict(points=[], seg_stack=[], stamps=[]))
+        self.cur = self.wires[-1]
 
-    def _commit_current(self):
-        if np.any(self.current_mask):
-            self.masks.append(self.current_mask.copy())
-            self.segments.clear()
-            self.current_mask.fill(0)
-            self.anchor_pt = None
-            return True
-        return False
+    def _all_stamps(self):
+        # flatten all wires' stamps
+        out=[]
+        for w in self.wires:
+            out.extend(w["stamps"])
+        return out
 
-    # mouse
-    def on_mouse(self, event, x, y, flags, param):
-        x = int(np.clip(x, 0, self.w - 1)); y = int(np.clip(y, 0, self.h - 1))
-        pt = (x, y)
-        if event == cv2.EVENT_LBUTTONDOWN:
-            if self.anchor_pt is None:
-                self.anchor_pt = pt
-            else:
-                p0, p1 = self.anchor_pt, pt
-                cv2.line(self.current_mask, p0, p1, 255, self.brush, cv2.LINE_AA)
-                self.segments.append((p0, p1, int(self.brush)))
-                self.anchor_pt = pt
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            self.anchor_pt = None
-        elif event == cv2.EVENT_MOUSEWHEEL:
-            # mouse wheel sizing (if supported by your OpenCV build)
-            delta = 1 if (flags >> 16) > 0 else -1
-            self.brush = int(np.clip(self.brush + delta, 1, 1024))
-            print(f"[ui] brush = {self.brush}")
+    # ---- mouse ----
+    def _on_mouse(self, event,x,y,flags,ud=None):
+        x=int(clamp(x,0,self.w-1)); y=int(clamp(y,0,self.h-1))
+        self.cursor=(x,y)
 
-    def make_preview(self) -> np.ndarray:
-        vis = self.img.copy()
+        if event==cv2.EVENT_LBUTTONDOWN:
+            self._add_point_and_maybe_segment(x,y)
 
-        # committed masks in blue
-        if self.masks:
-            stacked = np.any(np.stack([(m > 0) for m in self.masks], axis=0), axis=0)
-            blue = np.full_like(vis, (255, 0, 0))
-            blended_b = cv2.addWeighted(vis, 1.0, blue, 0.30, 0)
-            vis[stacked] = blended_b[stacked]
+        elif event==cv2.EVENT_RBUTTONDOWN:
+            self._undo_last_segment()
 
-        # current mask in green
-        if self.preview and np.any(self.current_mask):
-            green = np.full_like(vis, (0, 255, 0))
-            blended_g = cv2.addWeighted(vis, 1.0, green, 0.35, 0)
-            m = self.current_mask > 0
-            vis[m] = blended_g[m]
+    # ---- stamping primitives ----
+    def _commit_stamp(self,x,y):
+        self.cur["stamps"].append(dict(cx=float(x), cy=float(y),
+                                       angle_deg=float(self.angle),
+                                       sep_px=float(self.sep),
+                                       bw=int(self.block), bh=int(self.block)))
 
-        if self.size_editing:
-            hud = (f"Brush[{self.brush}]  Masks:{len(self.masks)}  "
-                   f"[SIZE: {self.size_buffer or '_'}  (Enter apply • Backspace edit • Esc cancel)]")
+    def _stamps_along_segment(self, x0,y0, x1,y1):
+        # drop stamps every self.step_px along the segment (including endpoint)
+        dx=x1-x0; dy=y1-y0
+        L=math.hypot(dx,dy)
+        if L<=1e-6: return 0
+        step=max(1.0, float(self.step_px))
+        n=max(1, int(math.floor(L/step)))
+        # remember where this segment’s stamps start/end (for undo)
+        start=len(self.cur["stamps"])
+        for i in range(n+1):
+            t = i / float(n)
+            xs = x0 + dx * t
+            ys = y0 + dy * t
+            self._commit_stamp(xs, ys)
+        end=len(self.cur["stamps"])
+        self.cur["seg_stack"].append((start,end))
+        return (end-start)
+
+    def _add_point_and_maybe_segment(self,x,y):
+        pts=self.cur["points"]
+        if not pts:
+            pts.append((x,y))
         else:
-            hud = (f"Brush[{self.brush}]  Masks:{len(self.masks)}  "
-                   "[Click=segment | R-click clear anchor | "
-                   "n new mask | u undo | [ / ] / - / + size | type digits to set size | "
-                   "r reset | i invert | p prev | Enter=OK | q/Esc=cancel]")
+            x0,y0=pts[-1]
+            pts.append((x,y))
+            self._stamps_along_segment(x0,y0,x,y)
 
-        cv2.putText(vis, hud, (10, max(20, self.h - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),
-                    1, cv2.LINE_AA)
-        return vis
+    def _undo_last_segment(self):
+        if not self.cur["seg_stack"]:
+            # if no segments in this wire, try removing last point to restart
+            if self.cur["points"]:
+                self.cur["points"].pop()
+            return
+        start,end=self.cur["seg_stack"].pop()
+        # drop stamps
+        del self.cur["stamps"][start:end]
+        # drop last point (keeps the previous point as new tail)
+        if self.cur["points"]:
+            self.cur["points"].pop()
 
-    def _handle_size_key(self, key: int) -> bool:
-        """
-        Returns True if the key was handled in size-editing mode.
-        """
-        # digits
-        if ord('0') <= key <= ord('9'):
-            # avoid leading zeros unless zero is the only digit
-            if key == ord('0') and self.size_buffer == "":
-                self.size_buffer = "0"
-            else:
-                self.size_buffer += chr(key)
-            return True
+    # ---- drawing ----
+    def _draw_preview(self, img):
+        out=img.copy()
 
-        # Backspace (8 in some builds, 127 in others)
-        if key in (8, 127):
-            self.size_buffer = self.size_buffer[:-1]
-            return True
+        # draw existing wires (rects + polylines)
+        for wi,w in enumerate(self.wires):
+            col = (0,200,255) if (w is self.cur) else (120,120,120)
+            # rectangles for stamps (thin boxes)
+            for st in w["stamps"]:
+                scx,scy=int(round(st["cx"])),int(round(st["cy"]))
+                bw2,bh2=int(st["bw"]),int(st["bh"])
+                x0=clamp(scx-bw2//2,0,self.w-1); y0=clamp(scy-bh2//2,0,self.h-1)
+                x1=clamp(scx+bw2//2+1,1,self.w); y1=clamp(scy+bh2//2+1,1,self.h)
+                cv2.rectangle(out,(x0,y0),(x1-1,y1-1),col,1)
 
-        # Enter: apply size and exit size-editing
-        if key in (13, 10):
-            if self.size_buffer:
-                try:
-                    val = int(self.size_buffer)
-                    self.brush = int(np.clip(val, 1, 1024))
-                    print(f"[ui] brush = {self.brush}")
-                except ValueError:
-                    pass
-            self.size_editing = False
-            self.size_buffer = ""
-            return True
+            # polyline points/segments
+            pts=w["points"]
+            for i,p in enumerate(pts):
+                cv2.circle(out,(int(p[0]),int(p[1])),3,(0,255,0),-1)
+                if i>0:
+                    cv2.line(out,(int(pts[i-1][0]),int(pts[i-1][1])),(int(p[0]),int(p[1])),(0,255,0),1,cv2.LINE_AA)
 
-        # Esc: cancel size-editing
-        if key == 27:
-            self.size_editing = False
-            self.size_buffer = ""
-            return True
+        # --- live donor-axis preview (2 green dots) + kernel box at cursor ---
+        cx, cy = self.cursor
+        ang = math.radians(self.angle)
+        vx, vy = math.cos(ang), math.sin(ang)
+        half = self.sep / 2.0
+        xt = cx - vx*half; yt = cy - vy*half
+        xb = cx + vx*half; yb = cy + vy*half
 
-        return False
+        # draw the two donor dots
+        cv2.circle(out,(int(round(xt)),int(round(yt))),5,(0,255,0),2,cv2.LINE_AA)
+        cv2.circle(out,(int(round(xb)),int(round(yb))),5,(0,255,0),2,cv2.LINE_AA)
 
-    def run(self, win_name="Mask Painter"):
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(win_name, self.on_mouse)
+        # draw the kernel rectangle centered at the cursor
+        bw=odd(self.block); bh=odd(self.block)
+        x0=int(round(cx-bw//2)); y0=int(round(cy-bh//2))
+        x1=clamp(x0+bw,1,self.w); y1=clamp(y0+bh,1,self.h)
+        x0=clamp(x0,0,self.w-1);  y0=clamp(y0,0,self.h-1)
+        cv2.rectangle(out,(x0,y0),(x1-1,y1-1),(60,255,60),1,cv2.LINE_AA)
 
+        # preview the next segment tail -> cursor for current wire
+        pts=self.cur["points"]
+        if pts:
+            tail=pts[-1]
+            cv2.line(out,(int(tail[0]),int(tail[1])),(int(self.cursor[0]),int(self.cursor[1])),(60,255,60),1,cv2.LINE_AA)
+
+        # HUD
+        total_stamps = sum(len(w["stamps"]) for w in self.wires)
+        cur_stamps = len(self.cur["stamps"])
+        hud=f"[F {self.frame_idx}/{self.total_frames}] [W {len(self.wires)}] angle:{self.angle:.1f}° sep:{self.sep:.1f}px block:{self.block} " \
+            f"{'HARD' if self.hard_paste or self.alpha>=0.999 else f'alpha:{int(self.alpha*100)}%'} " \
+            f"wire_stamps:{cur_stamps} total:{total_stamps} step:{self.step_px:.1f}px"
+        cv2.putText(out,hud,(10,max(20,self.h-10)),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2)
+
+        # magnifier around the kernel box
+        self._add_magnifier(out,out,(x0,y0,x1,y1))
+        return out
+
+    def _add_magnifier(self, canvas, preview_img, rect):
+        if not self.mag_on: return
+        x0,y0,x1,y1=rect
+        x0=clamp(x0-self.mag_pad,0,self.w-1); y0=clamp(y0-self.mag_pad,0,self.h-1)
+        x1=clamp(x1+self.mag_pad,1,self.w);   y1=clamp(y1+self.mag_pad,1,self.h)
+        if x1<=x0 or y1<=y0: return
+        crop=preview_img[int(y0):int(y1), int(x0):int(x1)]
+        ch,cw=crop.shape[:2]
+        scale=int(clamp(self.mag_scale,2,16))
+        up_w=cw*scale; up_h=ch*scale
+        if up_w>self.mag_max or up_h>self.mag_max:
+            k=min(self.mag_max/up_w, self.mag_max/up_h)
+            up_w=max(1,int(round(up_w*k))); up_h=max(1,int(round(up_h*k)))
+        mag=cv2.resize(crop,(up_w,up_h),interpolation=cv2.INTER_NEAREST)
+        margin=10; xa=canvas.shape[1]-up_w-margin; ya=margin
+        bg=canvas.copy()
+        cv2.rectangle(bg,(xa-4,ya-24),(xa+up_w+4,ya+up_h+4),(0,0,0),-1)
+        cv2.addWeighted(bg,0.45,canvas,0.55,0,canvas)
+        canvas[ya:ya+up_h, xa:xa+up_w]=mag
+        cv2.rectangle(canvas,(xa-1,ya-1),(xa+up_w,ya+up_h),(255,255,255),1)
+        cv2.putText(canvas,"magnifier",(xa,ya-6),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
+
+    # ---- main loop ----
+    def run(self):
         while True:
-            cv2.imshow(win_name, self.make_preview())
-            key = cv2.waitKey(16) & 0xFF
-            if key == 255:
-                continue
+            cv2.imshow(self.win,self._draw_preview(self.frame))
+            k=cv2.waitKey(16)&0xFF
+            if k==255: continue
+            if k in (ord('q'),27): self.action="quit"; break
+            elif k==ord('f'): self.action="next_frame"; break  # advance frame
+            elif k==ord('n'):
+                # next wire (finalize current; start a new empty wire)
+                if self.cur["points"] or self.cur["stamps"]:
+                    self._start_new_wire()
+            elif k==8 or k==ord('\b'):
+                self._undo_last_segment()
+            elif k==ord('h'):
+                self.hard_paste = not self.hard_paste
+            elif k==ord('a'): self.angle-=3.0
+            elif k==ord('d'): self.angle+=3.0
+            elif k==ord('w'): self.sep=clamp(self.sep+2,2,1000)
+            elif k==ord('s'): self.sep=clamp(self.sep-2,2,1000)
+            elif k==ord('['): self.block=clamp(odd(self.block-2),5,999)
+            elif k==ord(']'): self.block=clamp(odd(self.block+2),5,999)
+            elif k==ord('m'): self.mag_on = not self.mag_on
+            elif k==ord('z'): self.mag_scale=int(clamp(self.mag_scale-1,2,16))
+            elif k==ord('x'): self.mag_scale=int(clamp(self.mag_scale+1,2,16))
+            elif k==ord(','): self.alpha=max(0.0, self.alpha-0.05)
+            elif k==ord('.'): self.alpha=min(1.0, self.alpha+0.05)
+            if self.angle<0: self.angle+=360.0
+            if self.angle>=360.0: self.angle-=360.0
+        cv2.destroyWindow(self.win)
+        return self._all_stamps(), (self.action=="quit")
 
-            # If we are editing size, capture keys for that first.
-            if self.size_editing:
-                if self._handle_size_key(key):
-                    continue  # processed inside size editor
-                # if not handled, fall through (but Enter/Esc are already handled above)
-
-            # Start size entry if a digit is typed (and we weren't already editing)
-            if not self.size_editing and (ord('0') <= key <= ord('9')):
-                self.size_editing = True
-                self.size_buffer = chr(key)
-                continue
-
-            # Global keys (when not in size-edit mode)
-            if not self.size_editing:
-                if key in (ord('q'), 27):  # q or Esc
-                    self.cancel = True
-                    break
-                if key in (13, 10, 32):    # Enter/Return/Space
-                    self.done = True
-                    break
-
-            # Drawing/session controls (work in both modes except Enter/Esc are intercepted)
-            if key == ord('n'):
-                committed = self._commit_current()
-                if committed:
-                    print(f"[ui] new mask started (total committed: {len(self.masks)})")
-                else:
-                    print("[ui] current mask empty; nothing committed")
-
-            elif key == ord('u'):
-                if self.segments:
-                    self.segments.pop()
-                    self._rebuild_current()
-                else:
-                    print("[ui] nothing to undo")
-
-            elif key in (ord('['), ord('-'), ord('_')):
-                self.brush = max(1, self.brush - 1)
-                print(f"[ui] brush = {self.brush}")
-
-            elif key in (ord(']'), ord('='), ord('+')):
-                self.brush = min(1024, self.brush + 1)
-                print(f"[ui] brush = {self.brush}")
-
-            elif key == ord('r'):
-                self.segments.clear()
-                self.current_mask.fill(0)
-                self.anchor_pt = None
-
-            elif key == ord('i'):
-                cv2.bitwise_not(self.current_mask, self.current_mask)
-
-            elif key == ord('p'):
-                self.preview = not self.preview
-
-        cv2.destroyWindow(win_name)
-        # auto-commit on accept
-        if self.done and np.any(self.current_mask):
-            self.masks.append(self.current_mask.copy())
-        return (not self.cancel) and self.done, self.masks
-
-# ---- main -------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(description="Client: receive frame, draw multiple masks ('n' = new mask), send them.")
-    ap.add_argument("host", help="server host/IP")
-    ap.add_argument("port", type=int, help="server port")
-    ap.add_argument("--brush", type=int, default=9, help="initial brush size in pixels")
-    args = ap.parse_args()
-
-    addr = (args.host, args.port)
+# ---- Frame loop -------------------------------------------------------
+def author_one_frame(host, port, frame_idx, total_frames, args):
+    addr=(host,port)
     with socket.create_connection(addr) as s:
-        # 1) receive FrameHeader
-        hdr_bytes = recv_all(s, FRAME_HDR_SZ)
-        magic, w, h, stride, channels, size = struct.unpack(FRAME_HDR_FMT, hdr_bytes)
-        if magic != FRAME_MAGIC:
-            raise RuntimeError(f"Bad frame magic: got {magic:#x}")
+        hdr=recv_all(s, FRAME_HDR_SZ)
+        magic,w,h,stride,channels,size=struct.unpack(FRAME_HDR_FMT,hdr)
+        if magic!=FRAME_MAGIC or channels!=4 or stride!=w*4 or size!=h*stride:
+            raise RuntimeError("Bad frame header")
+        rgba=np.frombuffer(recv_all(s,size),dtype=np.uint8)
+        rgba=rgba.reshape((h,stride))[:,:w*4].reshape((h,w,4))
+        bgr=cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
 
-        expected_stride = w * 4
-        if channels != 4:
-            raise RuntimeError(f"Expected 4 channels (RGBA), got {channels}")
-        if stride != expected_stride:
-            raise RuntimeError(f"Unexpected stride {stride}, expected {expected_stride}")
-        if size != h * stride:
-            raise RuntimeError(f"Unexpected frame size {size}, expected {h*stride}")
+        designer=StampDesigner(
+            bgr, frame_idx, total_frames,
+            args.angle,args.sep,args.block,args.alpha,
+            args.magpad,args.magscale,args.magmax,
+            step_px=args.step
+        )
+        stamps,quit_all=designer.run()
 
-        # 2) RGBA payload → BGR
-        rgba = np.frombuffer(recv_all(s, size), dtype=np.uint8)
-        rgba = rgba.reshape((h, stride))[:, :w*4].reshape((h, w, 4))
-        bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+        # send stamps
+        send_all(s, struct.pack(SCNT_HDR_FMT, SCNT_MAGIC, len(stamps)))
+        for st in stamps:
+            pkt=struct.pack(STMP_FMT,STMP_MAGIC,
+                            float(st["cx"]),float(st["cy"]),
+                            float(st["angle_deg"]),float(st["sep_px"]),
+                            int(st["bw"]),int(st["bh"]))
+            send_all(s, pkt)
+        print(f"[client] sent {len(stamps)} stamp(s) for frame {frame_idx}")
+        return quit_all
 
-        # 3) UI
-        painter = PolylineMaskPainter(bgr, brush=args.brush)
-        ok, masks = painter.run()
+def main():
+    ap=argparse.ArgumentParser(description="Interactive polyline stamp authoring client.")
+    ap.add_argument("host"); ap.add_argument("port",type=int)
+    ap.add_argument("--frames",type=int,default=1,help="number of frames to author")
+    ap.add_argument("--angle",type=float,default=90.0)
+    ap.add_argument("--sep",type=float,default=14.0)
+    ap.add_argument("--block",type=int,default=21)
+    ap.add_argument("--alpha",type=float,default=0.65)
+    ap.add_argument("--magpad",type=int,default=50)
+    ap.add_argument("--magscale",type=int,default=6)
+    ap.add_argument("--magmax",type=int,default=480)
+    ap.add_argument("--step",type=float,default=None,help="stamp spacing along segment in pixels (default: block/2)")
+    args=ap.parse_args()
 
-        if not ok:
-            print("Canceled by user; sending one empty mask.", file=sys.stderr)
-            masks = [np.zeros((w*h,), dtype=np.uint8).reshape((h, w))]
-
-        # 4) send output (ALWAYS multi-mask)
-        count = len(masks)
-        send_all(s, struct.pack(MCNT_HDR_FMT, MCNT_MAGIC, count))
-        for idx, m in enumerate(masks, 1):
-            mbytes = ((m > 0).astype(np.uint8) * 255).tobytes(order="C")
-            mask_size = w * h
-            mhdr = struct.pack(MASK_HDR_FMT, MASK_MAGIC, w, h, mask_size)
-            send_all(s, mhdr)
-            send_all(s, mbytes)
-            print(f"[client] sent mask {idx}/{count}")
-        print(f"[client] sent {count} masks")
-
+    for i in range(args.frames):
+        quit_all=author_one_frame(args.host,args.port,i+1,args.frames,args)
+        if quit_all: break
     print("[client] done")
 
-if __name__ == "__main__":
-    try:
-        main()
+if __name__=="__main__":
+    try: main()
     except Exception as e:
-        print(f"[client] ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[client] ERROR: {e}", file=sys.stderr); sys.exit(1)

@@ -25,15 +25,13 @@ struct State {
     struct MaskEntry {
         CUdeviceptr dMask = 0;
         size_t      pMask = 0;
+        float       dx = 0.f;
+        float       dy = 0.f;
     };
     std::vector<MaskEntry> masks;
     bool masks_loaded = false;
 
-    // fisheye center + radial offsets (pixels)
-    float cx = -1.f, cy = -1.f;
-    float offIn = 20.f, offOut = 20.f;
-
-    // debug colors (optional)
+    // optional debug overlay (if you call overlay helpers)
     uint8_t y_mask = 235, u_mask = 128, v_mask = 128;
 };
 
@@ -49,14 +47,23 @@ static void retain_primary_once() {
 }
 
 // ---------- Host I/O ----------
-static bool read_global_meta(const char* metaPath, int& W, int& H, int& count)
+static bool read_mask_meta(const char* metaPath, int& W, int& H, int& count,
+                           std::vector<std::pair<float,float>>& shifts)
 {
     std::ifstream m(metaPath);
     if (!m) return false;
-    W = H = 0; count = -1;
-    m >> W >> H;
-    if (!m.fail()) { int tmp; if (m >> tmp) count = tmp; }
-    return (W > 0 && H > 0);
+    W = H = 0; count = 0;
+    if (!(m >> W >> H >> count)) return false;
+    if (W <= 0 || H <= 0 || count < 0) return false;
+    shifts.clear(); shifts.reserve((size_t)count);
+    for (int i=0;i<count;i++){
+        float dx=0.f, dy=0.f;
+        if (!(m >> dx >> dy)) { // tolerate short files
+            dx = dy = 0.f;
+        }
+        shifts.emplace_back(dx, dy);
+    }
+    return true;
 }
 
 static bool file_exists(const std::string& path) {
@@ -102,49 +109,51 @@ static void ensure_masks(State* st, int frameW, int frameH)
 
     free_masks(st);
 
-    int metaW=0, metaH=0, metaCount=-1;
     const char* META = "/dev/shm/wire_mask.meta";
-    bool haveMeta = read_global_meta(META, metaW, metaH, metaCount);
+    int metaW=0, metaH=0, metaCount=0;
+    std::vector<std::pair<float,float>> shifts;
+    bool haveMeta = read_mask_meta(META, metaW, metaH, metaCount, shifts);
 
-    int W = frameW, H = frameH;
-    if (haveMeta && (metaW!=frameW || metaH!=frameH)) {
-        fprintf(stderr, "[wire] WARNING: meta WxH (%d x %d) != frame WxH (%d x %d). Using frame WxH.\n",
+    if (!haveMeta) {
+        fprintf(stderr, "[wire] no meta at %s; no masks will be applied\n", META);
+        return;
+    }
+
+    if (metaW!=frameW || metaH!=frameH) {
+        fprintf(stderr, "[wire] WARNING: meta WxH (%d x %d) != frame WxH (%d x %d). Using frame WxH; masks must match frame.\n",
                 metaW, metaH, frameW, frameH);
     }
 
-    const int MAX_MASKS = 256;
-    int idxEnd = (metaCount > 0) ? metaCount : 999;
     int loaded = 0;
-
-    for (int idx = 1; idx <= idxEnd && loaded < MAX_MASKS; ++idx) {
+    for (int idx = 1; idx <= metaCount; ++idx) {
         char base[64];
         snprintf(base, sizeof(base), "/dev/shm/wire_mask_%03d", idx);
         std::string raw = std::string(base) + ".raw";
         if (!file_exists(raw)) {
-            if (metaCount > 0) fprintf(stderr, "[wire] expected %s not found; skip\n", raw.c_str());
+            fprintf(stderr, "[wire] expected %s not found; skipping\n", raw.c_str());
             continue;
         }
 
         std::vector<uint8_t> hostMask;
-        if (!load_mask_raw_only(raw.c_str(), W, H, hostMask)) {
+        if (!load_mask_raw_only(raw.c_str(), frameW, frameH, hostMask)) {
             fprintf(stderr, "[wire] skip %s (size/read error)\n", raw.c_str());
             continue;
         }
 
         State::MaskEntry me{};
         size_t pitchBytes = 0;
-        CUresult rc = cuMemAllocPitch(&me.dMask, &pitchBytes, (size_t)W, (size_t)H, 4);
+        CUresult rc = cuMemAllocPitch(&me.dMask, &pitchBytes, (size_t)frameW, (size_t)frameH, 4);
         if (rc != CUDA_SUCCESS) { fprintf(stderr, "[wire] cuMemAllocPitch failed for %s\n", raw.c_str()); continue; }
 
         CUDA_MEMCPY2D c{};
         c.srcMemoryType = CU_MEMORYTYPE_HOST;
         c.dstMemoryType = CU_MEMORYTYPE_DEVICE;
         c.srcHost       = hostMask.data();
-        c.srcPitch      = W;
+        c.srcPitch      = frameW;     // mask is tightly packed (1 byte per pixel)
         c.dstDevice     = me.dMask;
-        c.dstPitch      = pitchBytes;
-        c.WidthInBytes  = W;
-        c.Height        = H;
+        c.dstPitch      = pitchBytes; // device pitch
+        c.WidthInBytes  = frameW;     // copy one byte per pixel
+        c.Height        = frameH;
         rc = cuMemcpy2D(&c);
         if (rc != CUDA_SUCCESS) {
             fprintf(stderr, "[wire] cuMemcpy2D(%s) failed\n", raw.c_str());
@@ -153,20 +162,24 @@ static void ensure_masks(State* st, int frameW, int frameH)
         }
 
         me.pMask = pitchBytes;
+        // meta lines are 1-indexed in file order
+        if (idx-1 < (int)shifts.size()) { me.dx = shifts[idx-1].first; me.dy = shifts[idx-1].second; }
+        else { me.dx = 0.f; me.dy = 0.f; }
+
         st->masks.push_back(me);
         ++loaded;
-        fprintf(stderr, "[wire] loaded mask %s (pitch=%zu)\n", raw.c_str(), me.pMask);
+        fprintf(stderr, "[wire] loaded mask %s (pitch=%zu, dx=%.3f, dy=%.3f)\n", raw.c_str(), me.pMask, me.dx, me.dy);
     }
 
     if (loaded == 0) {
-        fprintf(stderr, "[wire] no masks found; frames will pass through.\n");
+        fprintf(stderr, "[wire] no masks loaded; frames will pass through.\n");
         st->masks_loaded = false;
         return;
     }
 
-    st->W = W; st->H = H;
+    st->W = frameW; st->H = frameH;
     st->masks_loaded = true;
-    fprintf(stderr, "[wire] loaded %d mask(s) @ %dx%d\n", loaded, W, H);
+    fprintf(stderr, "[wire] loaded %d mask(s) @ %dx%d\n", loaded, frameW, frameH);
 }
 
 // ---------- Lifecycle ----------
@@ -185,16 +198,6 @@ static State* create_state(){
     if (const char* v = std::getenv("WIRE_MASK_U")) s->u_mask = (uint8_t)atoi(v);
     if (const char* v = std::getenv("WIRE_MASK_V")) s->v_mask = (uint8_t)atoi(v);
 
-    if (const char* v = std::getenv("WIRE_RAD_IN"))  s->offIn  = std::max(1, atoi(v));
-    if (const char* v = std::getenv("WIRE_RAD_OUT")) s->offOut = std::max(1, atoi(v));
-
-    // Center defaults to image center; can override via env in pixels
-    s->cx = -1.f; s->cy = -1.f;
-    if (const char* v = std::getenv("WIRE_CX")) s->cx = (float)atof(v);
-    if (const char* v = std::getenv("WIRE_CY")) s->cy = (float)atof(v);
-
-    fprintf(stderr, "[wire] radial (fisheye-aligned) disappearance. offIn=%.1f offOut=%.1f\n",
-            s->offIn, s->offOut);
     return s;
 }
 
@@ -220,6 +223,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     if (cuGraphicsResourceGetMappedEglFrame(&f, res, 0, 0) != CUDA_SUCCESS) {
         cuGraphicsUnregisterResource(res); return;
     }
+    // Expect NV12 (2 planes) from nvvidconv (NVMM)
     if (f.frameType != CU_EGL_FRAME_TYPE_PITCH || f.planeCount < 2) {
         cuGraphicsUnregisterResource(res); return;
     }
@@ -233,19 +237,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     ensure_masks(st, W, H);
     if (!st->masks_loaded) { cuGraphicsUnregisterResource(res); return; }
 
-    // Fisheye center defaults to image center if not set
-    float cx = (st->cx >= 0.f) ? st->cx : 0.5f * (float)W;
-    float cy = (st->cy >= 0.f) ? st->cy : 0.5f * (float)H;
-
-    // Per-mask radial disappearance
     for (auto& me : st->masks) {
-        wire::disappear_mask_radial_nv12(
+        wire::apply_mask_shift_nv12(
             dY,  pitch,
             dUV, pitch,
             W, H,
             (const uint8_t*)(uintptr_t)me.dMask, (int)me.pMask,
-            cx, cy,
-            st->offIn, st->offOut,
+            me.dx, me.dy,
             st->stream);
     }
 
