@@ -1,41 +1,39 @@
 #pragma once
-
 #include <cuda_runtime.h>
 #include <stdint.h>
 
 namespace wire {
 
-// ---------- One-time: derive per-column [top..bot] from the binary mask -----
-void top_bottom_from_mask(
-    const uint8_t* dMask, int maskPitch,
-    int W, int H,
-    int* dTop, int* dBot,
-    cudaStream_t stream);
+// ------------------- Optional: overlay helpers -------------------
 
-// ---------- Per-frame: make masked band disappear by copying neighbors -------
-void disappear_band_nv12(
-    uint8_t* dY,  int pitchY,
-    uint8_t* dUV, int pitchUV,
-    int W, int H,
-    const int* dTop, const int* dBot,
-    int offTop, int offBot,       // number of rows above/below to copy
-    float sigmaY, float sigmaUV,  // ignored, ABI compatibility
-    cudaStream_t stream);
-
-// ---------- Optional debug overlays -----------------------------------------
 void overlay_mask_nv12(
-    uint8_t* dY,  int W, int H, int pitchY,
+    uint8_t* dY, int W, int H, int pitchY,
     uint8_t* dUV, int pitchUV,
     const uint8_t* dMask, int maskPitch,
     uint8_t y_on, uint8_t u_on, uint8_t v_on,
     cudaStream_t stream);
 
 void overlay_polyline_nv12(
-    uint8_t* dY,  int pY,
+    uint8_t* dY, int pY,
     uint8_t* dUV, int pUV,
     int W, int H,
-    const int* dTop,
+    const int* dTop,          // kept for ABI; unused by radial path
     uint8_t y_on, uint8_t u_on, uint8_t v_on,
+    cudaStream_t stream);
+
+// ------------------- Radial (fisheye-aligned) disappearance -----
+
+// Per ogni pixel con mask!=0, calcola n = normalize([x-cx, y-cy]).
+// Campiona i donor: p_in = p - offIn*n, p_out = p + offOut*n.
+// Y = interpolazione lineare tra Y(p_in) e Y(p_out).
+// UV = copia dal donor più vicino (no blending).
+void disappear_mask_radial_nv12(
+    uint8_t* dY, int pitchY,
+    uint8_t* dUV, int pitchUV,
+    int W, int H,
+    const uint8_t* dMask, int maskPitch,
+    float cx, float cy,          // fisheye center (pixels)
+    float offIn, float offOut,   // donor offsets (pixels)
     cudaStream_t stream);
 
 } // namespace wire

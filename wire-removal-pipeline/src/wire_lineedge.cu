@@ -1,46 +1,24 @@
 #include "wire_lineedge.cuh"
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <math.h>
 
 namespace {
-__device__ __forceinline__ int clampi(int v,int a,int b){ return v<a?a : (v>b?b:v); }
+
+// clamp helpers
+__device__ __forceinline__ int clampi(int v,int a,int b){
+    return v<a ? a : (v>b ? b : v);
+}
+__device__ __forceinline__ float clampf(float v,float a,float b){
+    return v<a ? a : (v>b ? b : v);
+}
+
 } // anon
 
 namespace wire {
 
-// --------------------- band from mask --------------------
-__global__ void k_top_bottom_from_mask(
-    const uint8_t* __restrict__ mask, int mPitch,
-    int W, int H,
-    int* __restrict__ top,
-    int* __restrict__ bot)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x >= W) return;
+// ========================= overlays (unchanged) =========================
 
-    int t = -1, b = -1;
-    for (int y = 0; y < H; ++y) {
-        if (mask[y * mPitch + x]) {
-            if (t < 0) t = y;
-            b = y;
-        }
-    }
-    top[x] = t;
-    bot[x] = b;
-}
-
-void top_bottom_from_mask(
-    const uint8_t* dMask, int maskPitch,
-    int W, int H,
-    int* dTop, int* dBot,
-    cudaStream_t stream)
-{
-    dim3 blk(256);
-    dim3 grd((W + blk.x - 1)/blk.x);
-    k_top_bottom_from_mask<<<grd, blk, 0, stream>>>(dMask, maskPitch, W, H, dTop, dBot);
-}
-
-// ------------------------ overlays (unchanged) -----------------------
 __global__ void k_overlay_mask_Y(
     const uint8_t* __restrict__ mask, int mPitch,
     uint8_t* __restrict__ Y, int pY,
@@ -49,9 +27,7 @@ __global__ void k_overlay_mask_Y(
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
-    if (mask[y * mPitch + x]) {
-        Y[y * pY + x] = y_on;
-    }
+    if (mask[y * mPitch + x]) Y[y * pY + x] = y_on;
 }
 
 __global__ void k_overlay_mask_UV(
@@ -61,28 +37,27 @@ __global__ void k_overlay_mask_UV(
 {
     int cu = blockIdx.x * blockDim.x + threadIdx.x;
     int cv = blockIdx.y * blockDim.y + threadIdx.y;
-    int CW = (W + 1) >> 1;
-    int CH = (H + 1) >> 1;
+    int CW = (W + 1) >> 1, CH = (H + 1) >> 1;
     if (cu >= CW || cv >= CH) return;
 
     int x0 = cu * 2, y0 = cv * 2;
     uint8_t any = 0;
     if (y0 < H) {
-        if (x0 < W)     any |= mask[y0 * mPitch + x0];
-        if (x0+1 < W)   any |= mask[y0 * mPitch + x0+1];
+        if (x0   < W) any |= mask[y0 * mPitch + x0];
+        if (x0+1 < W) any |= mask[y0 * mPitch + x0+1];
     }
     if (y0+1 < H) {
-        if (x0 < W)     any |= mask[(y0+1) * mPitch + x0];
-        if (x0+1 < W)   any |= mask[(y0+1) * mPitch + x0+1];
+        if (x0   < W) any |= mask[(y0+1) * mPitch + x0];
+        if (x0+1 < W) any |= mask[(y0+1) * mPitch + x0+1];
     }
     if (any) {
         uint8_t* p = UV + cv * pUV + cu*2;
-        p[0] = u_on; p[1] = v_on;
+        p[0]=u_on; p[1]=v_on;
     }
 }
 
 void overlay_mask_nv12(
-    uint8_t* dY,  int W, int H, int pitchY,
+    uint8_t* dY, int W, int H, int pitchY,
     uint8_t* dUV, int pitchUV,
     const uint8_t* dMask, int maskPitch,
     uint8_t y_on, uint8_t u_on, uint8_t v_on,
@@ -96,160 +71,118 @@ void overlay_mask_nv12(
     k_overlay_mask_UV<<<grdUV, blkUV, 0, stream>>>(dMask, maskPitch, dUV, pitchUV, W, H, u_on, v_on);
 }
 
-__global__ void k_overlay_polylineY(
-    uint8_t* __restrict__ Y, int pY,
-    const int* __restrict__ top,
-    int W, int H, uint8_t y_on)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x>=W) return;
-    int y = top[x];
-    if (y>=0 && y<H) Y[y*pY+x]=y_on;
-}
-
-__global__ void k_overlay_polylineUV(
-    uint8_t* __restrict__ UV, int pUV,
-    const int* __restrict__ top,
-    int W, int H, uint8_t u_on, uint8_t v_on)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x>=W) return;
-    int y = top[x];
-    if (y<0 || y>=H) return;
-    int cu=x>>1, cv=y>>1;
-    int CW=(W+1)>>1, CH=(H+1)>>1;
-    if (cu>=CW || cv>=CH) return;
-    uint8_t* p=UV+cv*pUV+cu*2; p[0]=u_on; p[1]=v_on;
-}
+// kept for ABI, unused by radial path (no-op kernels)
+__global__ void k_overlay_polylineY(uint8_t*,int,const int*,int,int,uint8_t) {}
+__global__ void k_overlay_polylineUV(uint8_t*,int,const int*,int,int,uint8_t,uint8_t) {}
 
 void overlay_polyline_nv12(
-    uint8_t* dY,  int pY,
-    uint8_t* dUV, int pUV,
-    int W, int H,
-    const int* dTop,
+    uint8_t* dY, int pY, uint8_t* dUV, int pUV,
+    int W, int H, const int* dTop,
     uint8_t y_on, uint8_t u_on, uint8_t v_on,
     cudaStream_t stream)
 {
-    dim3 blk(256), grd((W+255)/256);
-    k_overlay_polylineY<<<grd,blk,0,stream>>>(dY,pY,dTop,W,H,y_on);
-    k_overlay_polylineUV<<<grd,blk,0,stream>>>(dUV,pUV,dTop,W,H,u_on,v_on);
+    (void)dY;(void)pY;(void)dUV;(void)pUV;(void)W;(void)H;(void)dTop;
+    (void)y_on;(void)u_on;(void)v_on;(void)stream;
 }
 
-// Y (luma): interpolate between donor rows above/below across the band.
-__global__ void k_disappear_Y(
-    uint8_t* __restrict__ Y, int pY,
-    int W, int H,
-    const int* __restrict__ top,
-    const int* __restrict__ bot,
-    int offTop, int offBot)
+// =================== helpers: bilinear fetch (pitched) ===================
+
+__device__ __forceinline__ float bilinear_Y(
+    const uint8_t* Y, int pY, int W, int H,
+    float xf, float yf)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x >= W) return;
+    xf = clampf(xf, 0.0f, (float)(W-1));
+    yf = clampf(yf, 0.0f, (float)(H-1));
+    int x0 = (int)floorf(xf), y0 = (int)floorf(yf);
+    int x1 = min(W-1, x0+1), y1 = min(H-1, y0+1);
+    float ax = xf - x0, ay = yf - y0;
 
-    int yt = top[x], yb = bot[x];
-    if (yt < 0 || yb < 0 || yt > yb) return;
+    int i00 = Y[y0 * pY + x0];
+    int i10 = Y[y0 * pY + x1];
+    int i01 = Y[y1 * pY + x0];
+    int i11 = Y[y1 * pY + x1];
 
-    offTop = max(1, offTop);
-    offBot = max(1, offBot);
-
-    // donor rows (robust fallbacks)
-    int srcTop = (yt - offTop >= 0) ? (yt - offTop)
-               : (yb + offBot < H)  ? (yb + offBot)
-                                    : max(0, yt - 1);
-
-    int srcBot = (yb + offBot < H)  ? (yb + offBot)
-               : (yt - offTop >= 0) ? (yt - offTop)
-                                    : min(H - 1, yb + 1);
-
-    const float yAbove = (float)Y[srcTop * pY + x];
-    const float yBelow = (float)Y[srcBot * pY + x];
-
-    const int bandH = yb - yt + 1;
-    if (bandH <= 1) {
-        // single row: mid of donors
-        float yMid = 0.5f * (yAbove + yBelow);
-        Y[yt * pY + x] = (uint8_t)(__saturatef(yMid / 255.f) * 255.0f);
-        return;
-    }
-
-    const float denom = (float)(bandH - 1);
-    for (int y = yt; y <= yb; ++y) {
-        float t = (float)(y - yt) / denom;           // 0..1 top→bottom
-        float yOut = (1.0f - t) * yAbove + t * yBelow;
-        Y[y * pY + x] = (uint8_t)(__saturatef(yOut / 255.f) * 255.0f);
-    }
+    float v0 = i00*(1.0f-ax) + i10*ax;
+    float v1 = i01*(1.0f-ax) + i11*ax;
+    return v0*(1.0f-ay) + v1*ay;
 }
 
-// UV (chroma, NV12): copy from the nearest donor (no interpolation).
-__global__ void k_disappear_UV(
+__device__ __forceinline__ void fetch_UV_nearest(
+    const uint8_t* UV, int pUV, int W, int H,
+    float xf, float yf, uint8_t& U, uint8_t& V)
+{
+    // NV12 chroma half-res; nearest per evitare smear
+    float cxf = 0.5f * xf, cyf = 0.5f * yf;
+    int CW = (W + 1) >> 1, CH = (H + 1) >> 1;
+    int cu = clampi((int)floorf(cxf + 0.5f), 0, CW-1);
+    int cv = clampi((int)floorf(cyf + 0.5f), 0, CH-1);
+    const uint8_t* p = UV + cv * pUV + cu * 2;
+    U = p[0];
+    V = p[1];
+}
+
+// ============ radial (fisheye-aligned) disappearance =================
+
+__global__ void k_disappear_mask_radial_YUV(
+    uint8_t* __restrict__ Y, int pY,
     uint8_t* __restrict__ UV, int pUV,
     int W, int H,
-    const int* __restrict__ top,
-    const int* __restrict__ bot,
-    int offTop, int offBot)
+    const uint8_t* __restrict__ mask, int pMask,
+    float cx, float cy, float offIn, float offOut)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
-    if (x >= W) return;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    if (mask[y * pMask + x] == 0) return; // process only inside mask
 
-    int yt = top[x], yb = bot[x];
-    if (yt < 0 || yb < 0 || yt > yb) return;
+    // unit radial direction
+    float vx = (float)x - cx;
+    float vy = (float)y - cy;
+    float len = sqrtf(vx*vx + vy*vy);
+    if (len < 1e-6f) { vx = 0.0f; vy = 1.0f; len = 1.0f; }
+    float nx = vx / len, ny = vy / len;
 
-    const int CW = (W + 1) >> 1;
-    const int CH = (H + 1) >> 1;
-    int cu = x >> 1;
-    if (cu >= CW) return;
+    // donor positions
+    float xin = (float)x - offIn * nx;
+    float yin = (float)y - offIn * ny;
+    float xout= (float)x + offOut * nx;
+    float yout= (float)y + offOut * ny;
 
-    // chroma rows covered by the band
-    int cvTop = max(0,        yt >> 1);
-    int cvBot = min((H - 1) >> 1, yb >> 1);
-    if (cvTop > cvBot) return;
+    // --- Luma: bilinear blend
+    float Yin = bilinear_Y(Y, pY, W, H, xin, yin);
+    float Yout = bilinear_Y(Y, pY, W, H, xout, yout);
+    float t = 0.5f; // proxy semplice
+    float Ymix = (1.0f - t) * Yin + t * Yout;
+    Y[y * pY + x] = (uint8_t)clampi((int)(Ymix + 0.5f), 0, 255);
 
-    // luma offsets → chroma offsets
-    int cvOffTop = max(1, offTop >> 1);
-    int cvOffBot = max(1, offBot >> 1);
+    // --- Chroma: nearest donor
+    float din = (x - xin)*(x - xin) + (y - yin)*(y - yin);
+    float dout = (x - xout)*(x - xout) + (y - yout)*(y - yout);
+    uint8_t U,V;
+    if (din <= dout) fetch_UV_nearest(UV, pUV, W, H, xin, yin, U, V);
+    else             fetch_UV_nearest(UV, pUV, W, H, xout, yout, U, V);
 
-    // donor chroma rows (robust fallbacks)
-    int srcTop = (cvTop - cvOffTop >= 0) ? (cvTop - cvOffTop)
-               : (cvBot + cvOffBot < CH) ? (cvBot + cvOffBot)
-                                         : max(0, cvTop - 1);
-
-    int srcBot = (cvBot + cvOffBot < CH) ? (cvBot + cvOffBot)
-               : (cvTop - cvOffTop >= 0) ? (cvTop - cvOffTop)
-                                         : min(CH - 1, cvBot + 1);
-
-    const uint8_t* pT = UV + srcTop * pUV + cu * 2;
-    const uint8_t* pB = UV + srcBot * pUV + cu * 2;
-    uint8_t Ut = pT[0], Vt = pT[1];
-    uint8_t Ub = pB[0], Vb = pB[1];
-
-    // For each chroma row inside the band, choose nearest donor and copy
-    int bandRows = cvBot - cvTop + 1;
-    int mid = cvTop + (bandRows - 1) / 2;  // nearest top up to mid, bottom after
-
-    for (int cv = cvTop; cv <= cvBot; ++cv) {
+    // scrivi UV sulla cella che copre (x,y)
+    int cu = x >> 1, cv = y >> 1;
+    int CW = (W + 1) >> 1, CH = (H + 1) >> 1;
+    if (cu < CW && cv < CH) {
         uint8_t* p = UV + cv * pUV + cu * 2;
-        if (abs(cv - cvTop) <= abs(cvBot - cv)) {
-            // nearer to top donor
-            p[0] = Ut; p[1] = Vt;
-        } else {
-            // nearer to bottom donor
-            p[0] = Ub; p[1] = Vb;
-        }
+        p[0] = U; p[1] = V;
     }
 }
 
-void disappear_band_nv12(
-    uint8_t* dY,  int pitchY,
+void disappear_mask_radial_nv12(
+    uint8_t* dY, int pitchY,
     uint8_t* dUV, int pitchUV,
     int W, int H,
-    const int* dTop, const int* dBot,
-    int offTop, int offBot,
-    float, float,
+    const uint8_t* dMask, int maskPitch,
+    float cx, float cy, float offIn, float offOut,
     cudaStream_t stream)
 {
-    dim3 blk(256), grd((W+255)/256);
-    k_disappear_Y <<<grd,blk,0,stream>>>(dY,pitchY,W,H,dTop,dBot,offTop,offBot);
-    k_disappear_UV<<<grd,blk,0,stream>>>(dUV,pitchUV,W,H,dTop,dBot,offTop,offBot);
+    dim3 blk(32,8), grd((W+31)/32, (H+7)/8);
+    k_disappear_mask_radial_YUV<<<grd, blk, 0, stream>>>(
+        dY, pitchY, dUV, pitchUV, W, H,
+        dMask, maskPitch, cx, cy, offIn, offOut);
 }
 
 } // namespace wire

@@ -1,4 +1,3 @@
-// nvivafilter_wireline.cpp
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cudaEGL.h>
@@ -13,40 +12,31 @@
 #include <algorithm>
 
 #include "nvivafilter_customer_api.hpp"
-#include "wire_lineedge.cuh"   // declarations: top_bottom_from_mask, disappear_band_nv12, overlays
+#include "wire_lineedge.cuh"
 
 namespace {
 
 struct State {
-    // CUDA context & stream
     CUcontext    ctx    = nullptr;
     cudaStream_t stream = nullptr;
 
-    // Frame geometry we were prepared for
     int W = 0, H = 0;
 
-    // === Multiple masks ===
     struct MaskEntry {
-        CUdeviceptr dMask = 0;  // device mask (pitched)
-        size_t      pMask = 0;  // mask pitch in bytes
-        int*        dTop  = nullptr; // per-column top row
-        int*        dBot  = nullptr; // per-column bottom row
-        bool        band_ready = false;
+        CUdeviceptr dMask = 0;
+        size_t      pMask = 0;
     };
-    std::vector<MaskEntry> masks;  // all loaded masks for this WxH
-    bool        masks_loaded = false;
+    std::vector<MaskEntry> masks;
+    bool masks_loaded = false;
 
-    // NV12 overlay colors (debug)
-    uint8_t y_mask = 235, u_mask = 128, v_mask = 128; // mask band (white)
-    uint8_t y_top  = 80,  u_top  = 16,  v_top  = 146; // top polyline
-    uint8_t y_bot  = 210, u_bot  = 16,  v_bot  = 16;  // bottom polyline
+    // fisheye center + radial offsets (pixels)
+    float cx = -1.f, cy = -1.f;
+    float offIn = 20.f, offOut = 20.f;
 
-    // Disappear offsets (can be overridden via env)
-    int offTop = 3; // rows above mask to copy from
-    int offBot = 3; // rows below mask to copy from
+    // debug colors (optional)
+    uint8_t y_mask = 235, u_mask = 128, v_mask = 128;
 };
 
-// One-time retention of primary context (Jetson-style)
 static std::once_flag g_once;
 static CUcontext g_primary = nullptr;
 static CUdevice  g_dev = 0;
@@ -58,60 +48,42 @@ static void retain_primary_once() {
     cuCtxSetCurrent(g_primary);
 }
 
-// ---------- Host I/O helpers ----------
-
-// read one global meta: "W H N"  (N optional)
+// ---------- Host I/O ----------
 static bool read_global_meta(const char* metaPath, int& W, int& H, int& count)
 {
     std::ifstream m(metaPath);
     if (!m) return false;
     W = H = 0; count = -1;
     m >> W >> H;
-    if (!m.fail()) {
-        int tmp;
-        if (m >> tmp) count = tmp;
-    }
+    if (!m.fail()) { int tmp; if (m >> tmp) count = tmp; }
     return (W > 0 && H > 0);
 }
 
 static bool file_exists(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    return (bool)f;
+    std::ifstream f(path, std::ios::binary); return (bool)f;
 }
 
-// raw-only loader, validates size == W*H
 static bool load_mask_raw_only(const char* rawPath, int W, int H, std::vector<uint8_t>& buf)
 {
     std::ifstream r(rawPath, std::ios::binary);
     if (!r) { fprintf(stderr, "[wire] cannot open %s\n", rawPath); return false; }
-
     r.seekg(0, std::ios::end);
     std::streamsize sz = r.tellg();
     r.seekg(0, std::ios::beg);
     const std::streamsize need = (std::streamsize)W * (std::streamsize)H;
     if (sz != need) {
-        fprintf(stderr, "[wire] %s size mismatch: got %lld, need %lld (W*H)\n",
+        fprintf(stderr, "[wire] %s size mismatch: got %lld, need %lld\n",
                 rawPath, (long long)sz, (long long)need);
         return false;
     }
-
     buf.resize((size_t)need);
     r.read(reinterpret_cast<char*>(buf.data()), need);
-    if (r.gcount() != need) {
-        fprintf(stderr, "[wire] %s read short: %lld/%lld\n",
-                rawPath, (long long)r.gcount(), (long long)need);
-        return false;
-    }
-    return true;
+    return (r.gcount() == need);
 }
 
-// ---------- Resource cleanup ----------
+// ---------- Clean up ----------
 static void free_masks(State* s){
-    for (auto& m : s->masks) {
-        if (m.dMask) cuMemFree(m.dMask);
-        if (m.dTop)  cudaFree(m.dTop);
-        if (m.dBot)  cudaFree(m.dBot);
-    }
+    for (auto& m : s->masks) if (m.dMask) cuMemFree(m.dMask);
     s->masks.clear();
     s->masks_loaded = false;
 }
@@ -123,13 +95,11 @@ static void free_all(State* s){
     if (s->stream) cudaStreamDestroy(s->stream);
 }
 
-// ---------- Mask loader: one global .meta + many .raw ----------
+// ---------- Load masks for current WxH ----------
 static void ensure_masks(State* st, int frameW, int frameH)
 {
-    // If already loaded for this WxH, keep them
-    if (st->masks_loaded && st->W == frameW && st->H == frameH) return;
+    if (st->masks_loaded && st->W==frameW && st->H==frameH) return;
 
-    // (Re)load all masks referenced by /dev/shm/wire_mask.meta
     free_masks(st);
 
     int metaW=0, metaH=0, metaCount=-1;
@@ -137,73 +107,52 @@ static void ensure_masks(State* st, int frameW, int frameH)
     bool haveMeta = read_global_meta(META, metaW, metaH, metaCount);
 
     int W = frameW, H = frameH;
-    if (haveMeta) {
-        if (metaW != frameW || metaH != frameH) {
-            fprintf(stderr, "[wire] WARNING: meta WxH (%d x %d) != frame WxH (%d x %d). Using frame WxH; raw must still be W*H.\n",
-                    metaW, metaH, frameW, frameH);
-        }
-    } else {
-        fprintf(stderr, "[wire] NOTE: %s not found/invalid; scanning raws and validating sizes against frame WxH.\n", META);
+    if (haveMeta && (metaW!=frameW || metaH!=frameH)) {
+        fprintf(stderr, "[wire] WARNING: meta WxH (%d x %d) != frame WxH (%d x %d). Using frame WxH.\n",
+                metaW, metaH, frameW, frameH);
     }
 
     const int MAX_MASKS = 256;
+    int idxEnd = (metaCount > 0) ? metaCount : 999;
     int loaded = 0;
 
-    // If metaCount is known, enumerate exactly that many indices; else scan range.
-    int idxStart = 1;
-    int idxEnd   = (metaCount > 0) ? metaCount : 999;
-
-    for (int idx = idxStart; idx <= idxEnd && loaded < MAX_MASKS; ++idx) {
+    for (int idx = 1; idx <= idxEnd && loaded < MAX_MASKS; ++idx) {
         char base[64];
         snprintf(base, sizeof(base), "/dev/shm/wire_mask_%03d", idx);
         std::string raw = std::string(base) + ".raw";
-
         if (!file_exists(raw)) {
-            if (metaCount > 0) {
-                fprintf(stderr, "[wire] expected %s but not found; skipping\n", raw.c_str());
-            }
+            if (metaCount > 0) fprintf(stderr, "[wire] expected %s not found; skip\n", raw.c_str());
             continue;
         }
 
-        // Read host data (raw-only; expect W*H bytes)
         std::vector<uint8_t> hostMask;
         if (!load_mask_raw_only(raw.c_str(), W, H, hostMask)) {
-            fprintf(stderr, "[wire] skip %s: raw load failed\n", raw.c_str());
+            fprintf(stderr, "[wire] skip %s (size/read error)\n", raw.c_str());
             continue;
         }
 
-        // Upload pitched device mask (elemSize=4 for cuMemAllocPitch)
         State::MaskEntry me{};
         size_t pitchBytes = 0;
         CUresult rc = cuMemAllocPitch(&me.dMask, &pitchBytes, (size_t)W, (size_t)H, 4);
-        if (rc != CUDA_SUCCESS) {
-            fprintf(stderr, "[wire] cuMemAllocPitch failed for %s (%d)\n", raw.c_str(), (int)rc);
-            continue;
-        }
+        if (rc != CUDA_SUCCESS) { fprintf(stderr, "[wire] cuMemAllocPitch failed for %s\n", raw.c_str()); continue; }
 
         CUDA_MEMCPY2D c{};
         c.srcMemoryType = CU_MEMORYTYPE_HOST;
         c.dstMemoryType = CU_MEMORYTYPE_DEVICE;
         c.srcHost       = hostMask.data();
-        c.srcPitch      = W;          // tightly packed host
+        c.srcPitch      = W;
         c.dstDevice     = me.dMask;
-        c.dstPitch      = pitchBytes; // pitched device
+        c.dstPitch      = pitchBytes;
         c.WidthInBytes  = W;
         c.Height        = H;
         rc = cuMemcpy2D(&c);
         if (rc != CUDA_SUCCESS) {
-            fprintf(stderr, "[wire] cuMemcpy2D(mask %s) failed (%d)\n", raw.c_str(), (int)rc);
+            fprintf(stderr, "[wire] cuMemcpy2D(%s) failed\n", raw.c_str());
             cuMemFree(me.dMask);
             continue;
         }
 
-        // Per-mask top/bottom buffers
-        cudaMalloc(&me.dTop, W * sizeof(int));
-        cudaMalloc(&me.dBot, W * sizeof(int));
-
-        me.pMask      = pitchBytes;
-        me.band_ready = false;
-
+        me.pMask = pitchBytes;
         st->masks.push_back(me);
         ++loaded;
         fprintf(stderr, "[wire] loaded mask %s (pitch=%zu)\n", raw.c_str(), me.pMask);
@@ -220,7 +169,7 @@ static void ensure_masks(State* st, int frameW, int frameH)
     fprintf(stderr, "[wire] loaded %d mask(s) @ %dx%d\n", loaded, W, H);
 }
 
-// ---------- Boilerplate init/destroy ----------
+// ---------- Lifecycle ----------
 static State* create_state(){
     std::call_once(g_once, retain_primary_once);
     auto* s = new State();
@@ -232,24 +181,20 @@ static State* create_state(){
     cudaStreamCreateWithFlags(&s->stream, cudaStreamNonBlocking);
 #endif
 
-    // Optional env overrides
     if (const char* v = std::getenv("WIRE_MASK_Y")) s->y_mask = (uint8_t)atoi(v);
     if (const char* v = std::getenv("WIRE_MASK_U")) s->u_mask = (uint8_t)atoi(v);
     if (const char* v = std::getenv("WIRE_MASK_V")) s->v_mask = (uint8_t)atoi(v);
 
-    if (const char* v = std::getenv("WIRE_TOP_Y")) s->y_top  = (uint8_t)atoi(v);
-    if (const char* v = std::getenv("WIRE_TOP_U")) s->u_top  = (uint8_t)atoi(v);
-    if (const char* v = std::getenv("WIRE_TOP_V")) s->v_top  = (uint8_t)atoi(v);
+    if (const char* v = std::getenv("WIRE_RAD_IN"))  s->offIn  = std::max(1, atoi(v));
+    if (const char* v = std::getenv("WIRE_RAD_OUT")) s->offOut = std::max(1, atoi(v));
 
-    if (const char* v = std::getenv("WIRE_BOT_Y")) s->y_bot  = (uint8_t)atoi(v);
-    if (const char* v = std::getenv("WIRE_BOT_U")) s->u_bot  = (uint8_t)atoi(v);
-    if (const char* v = std::getenv("WIRE_BOT_V")) s->v_bot  = (uint8_t)atoi(v);
+    // Center defaults to image center; can override via env in pixels
+    s->cx = -1.f; s->cy = -1.f;
+    if (const char* v = std::getenv("WIRE_CX")) s->cx = (float)atof(v);
+    if (const char* v = std::getenv("WIRE_CY")) s->cy = (float)atof(v);
 
-    if (const char* v = std::getenv("WIRE_OFF_TOP")) s->offTop = std::max(1, atoi(v));
-    if (const char* v = std::getenv("WIRE_OFF_BOT")) s->offBot = std::max(1, atoi(v));
-
-    fprintf(stderr, "[wire] copy-from-neighbors mode (multi-mask). offTop=%d offBot=%d\n",
-            s->offTop, s->offBot);
+    fprintf(stderr, "[wire] radial (fisheye-aligned) disappearance. offIn=%.1f offOut=%.1f\n",
+            s->offIn, s->offOut);
     return s;
 }
 
@@ -261,7 +206,7 @@ static void destroy_state(State* s){
 static void pre_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*, ColorFormat*, unsigned int, void **){}
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*, ColorFormat*, unsigned int, void **){}
 
-// ---------- Main GPU process ----------
+// ---------- Main GPU path ----------
 static void gpu_process(EGLImageKHR image, void **userPtr)
 {
     State* st = static_cast<State*>(*userPtr);
@@ -283,56 +228,28 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     uint8_t* dUV = static_cast<uint8_t*>(f.frame.pPitch[1]);
     const int W  = (int)f.width;
     const int H  = (int)f.height;
-    const int pitch = (int)f.pitch;  // bytes/row (Y; UV shares this on Jetson)
+    const int pitch = (int)f.pitch;
 
-    // Load all masks that match this resolution (if not already)
     ensure_masks(st, W, H);
+    if (!st->masks_loaded) { cuGraphicsUnregisterResource(res); return; }
 
-    if (st->masks_loaded) {
-        // Compute bands (top/bottom) once per mask
-        bool need_sync = false;
-        for (auto& me : st->masks) {
-            if (!me.band_ready) {
-                wire::top_bottom_from_mask(
-                    (const uint8_t*)(uintptr_t)me.dMask, (int)me.pMask,
-                    W, H, me.dTop, me.dBot, st->stream);
-                me.band_ready = true;
-                need_sync = true;
-            }
-        }
-        if (need_sync) {
-            cudaStreamSynchronize(st->stream);
-            fprintf(stderr, "[wire] bands computed for %zu mask(s).\n", st->masks.size());
-        }
+    // Fisheye center defaults to image center if not set
+    float cx = (st->cx >= 0.f) ? st->cx : 0.5f * (float)W;
+    float cy = (st->cy >= 0.f) ? st->cy : 0.5f * (float)H;
 
-        // Apply disappearance sequentially for each mask
-        for (auto& me : st->masks) {
-            wire::disappear_band_nv12(
-                dY,  pitch,
-                dUV, pitch,
-                W, H,
-                me.dTop, me.dBot,
-                st->offTop, st->offBot, // configurable donor offsets
-                0.f, 0.f,
-                st->stream);
-        }
-
-        // Keep output deterministic for encoder
-        cudaStreamSynchronize(st->stream);
-
-        // --- Optional debug overlays (comment out for production) ---
-        // for (auto& me : st->masks) {
-        //     wire::overlay_polyline_nv12(dY, pitch, dUV, pitch, W, H,
-        //                                 me.dTop, st->y_top, st->u_top, st->v_top, st->stream);
-        //     wire::overlay_polyline_nv12(dY, pitch, dUV, pitch, W, H,
-        //                                 me.dBot, st->y_bot, st->u_bot, st->v_bot, st->stream);
-        //     wire::overlay_mask_nv12(dY, W, H, pitch, dUV, pitch,
-        //         (const uint8_t*)(uintptr_t)me.dMask, (int)me.pMask,
-        //         st->y_mask, st->u_mask, st->v_mask, st->stream);
-        // }
-        // cudaStreamSynchronize(st->stream);
+    // Per-mask radial disappearance
+    for (auto& me : st->masks) {
+        wire::disappear_mask_radial_nv12(
+            dY,  pitch,
+            dUV, pitch,
+            W, H,
+            (const uint8_t*)(uintptr_t)me.dMask, (int)me.pMask,
+            cx, cy,
+            st->offIn, st->offOut,
+            st->stream);
     }
 
+    cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
 }
 
@@ -346,5 +263,5 @@ extern "C" void init(CustomerFunction* f){
 }
 
 extern "C" void deinit(void){
-    // Freed on pipeline teardown via nvivafilter; nothing to do here.
+    // Nothing: resources are freed when pipeline tears down.
 }
