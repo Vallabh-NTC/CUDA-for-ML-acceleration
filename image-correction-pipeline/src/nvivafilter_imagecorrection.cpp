@@ -2,12 +2,9 @@
  * @file nvivafilter_imagecorrection.cpp
  * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → tone/color.
  *
- * Binding deterministico della sezione (cam0/cam1/cam2) in base al NOME della .so caricata:
- *   libnvivafilter_imagecorrection_cam0.so → "cam0"
- *   libnvivafilter_imagecorrection_cam1.so → "cam1"
- *   libnvivafilter_imagecorrection_cam2.so → "cam2"
- *
- * Così possiamo usare UNA sola .so reale + 3 symlink, senza env/hint/round-robin.
+ * We add a tiny TCP helper that sends one snapshot to a Python client and receives
+ * a binary packet of "stamps", which we rasterize and upload as a device mask.
+ * No runtime kernel consumes that mask yet (prints only).
  */
 
 #include <cstdio>
@@ -33,6 +30,9 @@
 #include "kernel_rectify.cuh"
 #include "color_ops.cuh"
 #include "runtime_controls.hpp"
+
+// NEW: authoring server (snapshot + device upload). No disappearance kernel is touched.
+#include "wire_author_server.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -77,20 +77,18 @@ static std::string to_lower(std::string s) {
     return s;
 }
 
-// Determina "cam0|cam1|cam2" dal NOME con cui è stata caricata la .so
+// Determine "cam0|cam1|cam2" from the loaded .so name
 static std::string section_from_loaded_name()
 {
     Dl_info info{};
     if (dladdr((void*)&init, &info) && info.dli_fname) {
         std::string path(info.dli_fname);
         std::string low  = to_lower(path);
-        // 1) prima prova dal basename (gestisce anche eventuali suffissi _camX)
         std::string base = path.substr(path.find_last_of('/') + 1);
         std::string base_low = to_lower(base);
         if (base_low.find("_cam0") != std::string::npos) return "cam0";
         if (base_low.find("_cam1") != std::string::npos) return "cam1";
         if (base_low.find("_cam2") != std::string::npos) return "cam2";
-        // 2) poi guarda tutto il PATH (cartelle cam0/cam1/cam2)
         if (low.find("/cam0/") != std::string::npos) return "cam0";
         if (low.find("/cam1/") != std::string::npos) return "cam1";
         if (low.find("/cam2/") != std::string::npos) return "cam2";
@@ -98,7 +96,6 @@ static std::string section_from_loaded_name()
     fprintf(stderr, "[ic] WARNING: cannot detect cam section from .so name/path, defaulting to cam0\n");
     return "cam0";
 }
-
 
 // ============================================================================
 // Per-instance state
@@ -115,7 +112,7 @@ struct ICPState {
     // Geometry (fisheye rectification)
     icp::RectifyConfig cfg{};
 
-    // Runtime controls (hot-reload) su sezione decisa a create_instance()
+    // Runtime controls (hot-reload) bound to section decided at create_instance()
     icp::RuntimeControls controls{"/home/jetson_ntc/config.json", "cam0"};
 
     // Post-rectification center crop/zoom
@@ -135,7 +132,6 @@ static void ensure_scratch(ICPState* st, int W, int H)
     if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
     if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
 
-    // pitched alloc per NV12
     cuMemAllocPitch(&st->sY,  &st->pY,  (size_t)W, (size_t)H,    4);
     cuMemAllocPitch(&st->sUV, &st->pUV, (size_t)W, (size_t)(H/2),4);
     st->sW = W; st->sH = H;
@@ -176,7 +172,7 @@ static ICPState* create_instance()
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
 
-    // === Bind deterministico in base al nome della .so (symlink _camX) ===
+    // Bind section (cam0/cam1/cam2) from soname/symlink
     {
         std::string sec = section_from_loaded_name();
         st->controls.set_section(sec);
@@ -253,7 +249,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
-    // 2) Crop/zoom centrale
+    // 2) Center crop/zoom
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
     icp::launch_crop_center_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
@@ -270,6 +266,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         cp,
         st->stream);
 
+    // ---- NEW: offer a snapshot for the server (one-shot, when client connects) ----
+    wire_author_snapshot_nv12_if_needed(
+        dY,  pitch,
+        dUV, pitch,
+        W, H, st->stream);
+
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
 }
@@ -283,10 +285,25 @@ extern "C" void init(CustomerFunction* f)
     f->fPreProcess  = pre_process;
     f->fGPUProcess  = gpu_process;
     f->fPostProcess = post_process;
+
+    // Ensure we have the primary CUDA context retained at least once
+    std::call_once(g_ctx_once, retain_primary_context_once);
+
+    // Start the authoring server. If WIRE_PORT is set, use it; else default 5555.
+    uint16_t port = 5555;
+    if (const char* p = std::getenv("WIRE_PORT")) {
+        int v = atoi(p); if (v>0 && v<65536) port = (uint16_t)v;
+    }
+    wire_author_start(g_primary_ctx /* may be null if retention failed */, port);
+    fprintf(stderr, "[ic] wire author server started (port %u)\n", port);
 }
 
 extern "C" void deinit(void)
 {
+    // Stop server and free its resources (device mask + snapshot buffers)
+    wire_author_stop();
+    fprintf(stderr, "[ic] wire author server stopped\n");
+
     std::vector<ICPState*> to_free;
     {
         std::lock_guard<std::mutex> lk(g_instances_mtx);
