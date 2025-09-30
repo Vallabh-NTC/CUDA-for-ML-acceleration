@@ -14,6 +14,10 @@
 #include "nvivafilter_customer_api.hpp"
 #include "wire_lineedge.cuh"
 
+#include "wire_author_server.cuh"   
+#include "wire_lineedge.cuh"        
+
+
 namespace {
 
 struct State {

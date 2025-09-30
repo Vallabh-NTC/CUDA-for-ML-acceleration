@@ -16,6 +16,7 @@
 
 static void die(const char* msg){ perror(msg); std::exit(1); }
 
+// ---------------- net helpers ----------------
 static int listen_on(uint16_t port){
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if(s<0) die("socket");
@@ -39,6 +40,7 @@ static void recv_all(int fd, void* buf, size_t n){
     while(got<n){ ssize_t k=recv(fd,p+got,n-got,0); if(k<=0) die("recv"); got+=k; }
 }
 
+// ---------------- protocol ----------------
 static constexpr uint32_t fourcc_u32(const char (&tag)[5]) noexcept {
     return  (uint32_t)(unsigned char)tag[0]
           | ((uint32_t)(unsigned char)tag[1] << 8)
@@ -59,7 +61,7 @@ struct Stamp {
     float    cx, cy;
     float    angle_deg;
     float    sep_px;
-    uint32_t bw, bh;
+    uint32_t bw, bh;    // assume bw==bh
 };
 #pragma pack(pop)
 
@@ -67,9 +69,9 @@ static const uint32_t FRAM_MAGIC = fourcc_u32("FRAM");
 static const uint32_t SCNT_MAGIC = fourcc_u32("SCNT");
 static const uint32_t STMP_MAGIC = fourcc_u32("STMP");
 
-// config key (angle, sep, bw, bh) for grouping
+// ---------------- grouping key ----------------
 struct CfgKey {
-    int angle_mdeg;   // angle in milli-deg for stable hashing
+    int angle_mdeg;   // angle in milli-deg
     int sep_mpx;      // sep*1000
     uint32_t bw, bh;
     bool operator==(const CfgKey& o) const {
@@ -88,10 +90,81 @@ struct CfgKeyHash {
 
 static inline int clampi(int v,int a,int b){ return v<a?a:(v>b?b:v); }
 
+// ---------------- rotated square (with pad) ----------------
+// Fills mask with 255 where a square of side 'side', centered at (cx,cy),
+// rotated by angle_deg, covers the pixel center. 'pad_px' inflates the half-side
+// to create tiny overlap between neighboring tiles to avoid seam lines.
+static inline void draw_rotated_square(std::vector<uint8_t>& mask,
+                                       int w, int h,
+                                       float cx, float cy,
+                                       int side, float angle_deg,
+                                       float pad_px)
+{
+    const float S = (float)side;
+    const float half = 0.5f * S + pad_px;
+
+    // world -> local (R(-θ))
+    const float th = angle_deg * (float)M_PI / 180.0f;
+    const float c = std::cos(th), s = std::sin(th);
+    const float r00 =  c, r01 =  s;
+    const float r10 = -s, r11 =  c;
+
+    // AABB half-extent of rotated half-side: (half)*(|cosθ|+|sinθ|)
+    const float ext = half * (std::fabs(c) + std::fabs(s));
+    int x0 = clampi((int)std::floor(cx - ext), 0, w-1);
+    int x1 = clampi((int)std::ceil (cx + ext)+1, 1, w);
+    int y0 = clampi((int)std::floor(cy - ext), 0, h-1);
+    int y1 = clampi((int)std::ceil (cy + ext)+1, 1, h);
+
+    for (int y = y0; y < y1; ++y) {
+        uint8_t* row = mask.data() + (size_t)y * (size_t)w;
+        for (int x = x0; x < x1; ++x) {
+            float dx = (float)x + 0.5f - cx;
+            float dy = (float)y + 0.5f - cy;
+            float lx = r00*dx + r01*dy;
+            float ly = r10*dx + r11*dy;
+            if (std::fabs(lx) <= half && std::fabs(ly) <= half) {
+                row[x] = 255;
+            }
+        }
+    }
+}
+
+// ---------------- optional dilation (3x3 max filter) ----------------
+static inline void dilate3x3(std::vector<uint8_t>& mask, int w, int h, int iters)
+{
+    if (iters <= 0) return;
+    std::vector<uint8_t> tmp(mask.size());
+    for (int t=0; t<iters; ++t) {
+        std::fill(tmp.begin(), tmp.end(), 0);
+        for (int y=0; y<h; ++y){
+            for (int x=0; x<w; ++x){
+                uint8_t v=0;
+                for (int dy=-1; dy<=1; ++dy){
+                    int yy = y+dy; if (yy<0||yy>=h) continue;
+                    const uint8_t* row = mask.data() + (size_t)yy*w;
+                    for (int dx=-1; dx<=1; ++dx){
+                        int xx = x+dx; if (xx<0||xx>=w) continue;
+                        v = std::max(v, row[xx]);
+                    }
+                }
+                tmp[(size_t)y*w + x] = v;
+            }
+        }
+        mask.swap(tmp);
+    }
+}
+
 int main(int argc, char** argv){
     if(argc<3){ std::cerr<<"usage: "<<argv[0]<<" <video.mp4> <port>\n"; return 1; }
     const char* mp4 = argv[1];
     uint16_t port = (uint16_t)std::stoi(argv[2]);
+
+    // seam padding (px) and optional dilation iterations via env
+    float PAD = 0.75f;                       // slight overlap ~1px
+    if (const char* v = std::getenv("WIRE_MASK_PAD")) PAD = std::max(0.0f, (float)atof(v));
+    int DIL = 0;
+    if (const char* v = std::getenv("WIRE_MASK_DILATE")) DIL = std::max(0, atoi(v));
 
     gst_init(&argc,&argv);
 
@@ -109,7 +182,7 @@ int main(int argc, char** argv){
     if(!sink_el){ std::cerr<<"appsink not found\n"; return 2; }
     gst_element_set_state(p, GST_STATE_PLAYING);
 
-    // Pull a later frame
+    // pull a later frame (for the authoring preview)
     GstAppSink* sink = GST_APP_SINK(sink_el);
     GstSample* samp = nullptr;
     const gint64 TIMEOUT = 5 * GST_SECOND;
@@ -121,8 +194,8 @@ int main(int argc, char** argv){
     }
 
     GstCaps* caps = gst_sample_get_caps(samp);
-    GstStructure* s = gst_caps_get_structure(caps,0);
-    int w=0,h=0; gst_structure_get_int(s,"width",&w); gst_structure_get_int(s,"height",&h);
+    GstStructure* stc = gst_caps_get_structure(caps,0);
+    int w=0,h=0; gst_structure_get_int(stc,"width",&w); gst_structure_get_int(stc,"height",&h);
 
     GstBuffer* buf = gst_sample_get_buffer(samp);
     GstMapInfo mi;
@@ -134,7 +207,7 @@ int main(int argc, char** argv){
     // TCP to client
     int cfd = listen_on(port);
 
-    // Send frame header + payload (LE)
+    // Send frame header + payload
     FrameHeader fh{};
     fh.magic=FRAM_MAGIC; fh.width=(uint32_t)w; fh.height=(uint32_t)h; fh.stride=stride; fh.channels=4; fh.size=size;
     send_all(cfd,&fh,sizeof(fh));
@@ -144,7 +217,8 @@ int main(int argc, char** argv){
     StampsCountHeader scnt{};
     recv_all(cfd, &scnt, sizeof(scnt));
     if(scnt.magic != SCNT_MAGIC){
-        std::cerr << "[server] protocol error: expected SCNT magic, got " << std::hex << scnt.magic << std::dec << "\n";
+        std::cerr << "[server] protocol error: expected SCNT magic, got 0x"
+                  << std::hex << scnt.magic << std::dec << "\n";
         close(cfd);
         return 4;
     }
@@ -152,26 +226,21 @@ int main(int argc, char** argv){
 
     std::vector<Stamp> stamps;
     stamps.reserve(scnt.count);
-
     for(uint32_t i=0;i<scnt.count;i++){
         Stamp st{};
         recv_all(cfd, &st, sizeof(st));
         if(st.magic != STMP_MAGIC){
-            std::cerr << "[server] bad STMP at index " << i << " (magic="<< std::hex << st.magic << std::dec << ")\n";
+            std::cerr << "[server] bad STMP at index " << i << " (magic=0x"
+                      << std::hex << st.magic << std::dec << ")\n";
             close(cfd);
             return 5;
         }
-        // Light sanity checks (bounds are clamped later anyway)
-        if (st.bw==0 || st.bh==0){
-            std::cerr << "[server] warning: zero-sized block at " << i << " -> forcing to 1\n";
-            st.bw = st.bw? st.bw : 1;
-            st.bh = st.bh? st.bh : 1;
-        }
+        if (st.bw==0 || st.bh==0){ st.bw = st.bw? st.bw : 1; st.bh = st.bh? st.bh : 1; }
         stamps.push_back(st);
     }
     close(cfd);
 
-    // ---- dump exact received stamps (for debugging/traceability) --------
+    // ---- optional dump --------------------------------------------------
     {
         std::ofstream csv("/dev/shm/wire_stamps.csv");
         csv << "index,cx,cy,angle_deg,sep_px,bw,bh\n";
@@ -184,7 +253,7 @@ int main(int argc, char** argv){
         std::cout << "[server] wrote /dev/shm/wire_stamps.csv ("<<stamps.size()<<" rows)\n";
     }
 
-    // ---- group stamps by config & rasterize masks -----------------------
+    // ---- group stamps & rasterize rotated-square masks (with pad) -------
     using MaskBuf = std::vector<uint8_t>;
     std::unordered_map<CfgKey, MaskBuf, CfgKeyHash> groups;
     groups.reserve(stamps.size() ? stamps.size() : 1);
@@ -198,26 +267,21 @@ int main(int argc, char** argv){
         auto& mask = groups[key];
         if(mask.empty()) mask.assign((size_t)w*(size_t)h, 0);
 
-        int cx = (int)std::lround(st.cx);
-        int cy = (int)std::lround(st.cy);
-        int bw = (int)st.bw;
-        int bh = (int)st.bh;
+        float cx = std::max(0.f, std::min((float)(w-1), st.cx));
+        float cy = std::max(0.f, std::min((float)(h-1), st.cy));
+        int   side = (int)st.bw;                    // assume bw==bh
+        float ang  = (float)st.angle_deg;
 
-        // Destination rectangle centered at (cx,cy)
-        int x0 = clampi(cx - bw/2, 0, w-1);
-        int y0 = clampi(cy - bh/2, 0, h-1);
-        int x1 = clampi(cx + bw/2 + 1, 1, w);
-        int y1 = clampi(cy + bh/2 + 1, 1, h);
-
-        if (x1<=x0 || y1<=y0) continue; // fully clipped
-
-        for(int yy=y0; yy<y1; ++yy){
-            uint8_t* row = mask.data() + (size_t)yy * (size_t)w;
-            std::memset(row + x0, 255, (size_t)(x1 - x0));
-        }
+        draw_rotated_square(mask, w, h, cx, cy, side, ang, PAD);
     }
 
-    // ---- compute (dx,dy) per group: vector from dest center to TOP donor
+    // optional dilation to further kill seams
+    if (DIL > 0) {
+        std::cout << "[server] dilating masks: " << DIL << " iteration(s)\n";
+        for (auto& kv : groups) dilate3x3(kv.second, w, h, DIL);
+    }
+
+    // ---- compute (dx,dy) per group (top donor) -------------------------
     struct OutItem { CfgKey key; MaskBuf mask; float dx, dy; };
     std::vector<OutItem> outs; outs.reserve(groups.size());
     for (auto& kv : groups){
@@ -230,13 +294,13 @@ int main(int argc, char** argv){
         double vx = std::cos(ang), vy = std::sin(ang);
         double half = sep_px * 0.5;
 
-        float dx = (float)(-vx * half);   // top dot offset: (cx - vx*half, cy - vy*half)
+        float dx = (float)(-vx * half);   // top donor offset
         float dy = (float)(-vy * half);
 
         outs.push_back(OutItem{key, std::move(m), dx, dy});
     }
 
-    // ---- write meta + masks ---------------------------------------------
+    // ---- write meta + masks --------------------------------------------
     {
         std::ofstream meta("/dev/shm/wire_mask.meta");
         meta << w << " " << h << " " << outs.size() << "\n";
@@ -258,6 +322,6 @@ int main(int argc, char** argv){
     gst_sample_unref(samp);
     gst_element_set_state(p,GST_STATE_NULL);
     gst_object_unref(p);
-    std::cout << "[server] done\n";
+    std::cout << "[server] done (PAD="<<PAD<<", DIL="<<DIL<<")\n";
     return 0;
 }

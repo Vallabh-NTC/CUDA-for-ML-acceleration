@@ -4,8 +4,10 @@
 
 namespace wire {
 
-// Simplest constant-shift inpaint per mask:
-// For mask!=0, copy NV12 from donor at (x+dx, y+dy)
+// Apply mask with a *two-donor* inpaint:
+// For every pixel where mask!=0, sample NV12 from (x+dx,y+dy) *and* (x-dx,y-dy)
+//   - Y (luma): bilinear from both, 50/50 blend (t weakly tunable in .cu)
+//   - UV (chroma): average of the two nearest-neighbour samples
 void apply_mask_shift_nv12(
     uint8_t* dY,  int pitchY,
     uint8_t* dUV, int pitchUV,
