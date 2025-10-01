@@ -16,6 +16,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cuda.h>
+#include <cuda_runtime.h>
+
 // ---- Binary protocol (matches your Python client) ----
 static constexpr uint32_t fourcc_u32(const char (&tag)[5]) noexcept {
     return  (uint32_t)(unsigned char)tag[0]
@@ -40,20 +43,6 @@ struct Stamp {
 #pragma pack(pop)
 
 // ---- Tiny TCP helpers ----
-static int listen_and_accept(uint16_t port) {
-    int s = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) { perror("socket"); return -1; }
-    int yes=1; ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
-    if (::bind(s, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); ::close(s); return -1; }
-    if (::listen(s, 1) < 0) { perror("listen"); ::close(s); return -1; }
-    fprintf(stderr, "[wire] listening on %u\n", port);
-    sockaddr_in cli{}; socklen_t cl = sizeof(cli);
-    int c = ::accept(s, (sockaddr*)&cli, &cl);
-    if (c < 0) { perror("accept"); ::close(s); return -1; }
-    ::close(s);
-    return c;
-}
 static void send_all(int fd, const void* buf, size_t n) {
     const uint8_t* p = (const uint8_t*)buf; size_t off=0;
     while (off < n) {
@@ -71,6 +60,22 @@ static void recv_all(int fd, void* buf, size_t n) {
     }
 }
 
+static int open_listen_socket(uint16_t port) {
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { perror("socket"); return -1; }
+    int yes=1; ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)); // optional
+#endif
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
+    if (::bind(s, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); ::close(s); return -1; }
+    if (::listen(s, 4) < 0) { perror("listen"); ::close(s); return -1; }
+    return s;
+}
+static void close_listen_socket(int& s) {
+    if (s >= 0) { ::close(s); s = -1; }
+}
+
 // ---- Module state (singleton) ----
 namespace {
 struct DeviceMask {
@@ -85,6 +90,7 @@ struct GState {
     std::thread       th;
     CUcontext         ctx = nullptr;
     uint16_t          port = 0;
+    int               srvfd = -1;   // NEW: listening socket
 
     // snapshot handshake
     std::atomic<bool> want_snapshot{false};
@@ -212,45 +218,60 @@ static int build_and_swap_mask_from_stamps(const std::vector<Stamp>& stamps)
     return W*H;
 }
 
-// ---- Dedicated network thread (one-shot authoring round) ----
+// ---- Dedicated network thread (multi-accept) ----
 static void net_thread_body()
 {
     cuCtxSetCurrent(G.ctx);
 
-    try {
-        int cfd = listen_and_accept(G.port);
-        if (cfd < 0) return;
+    G.srvfd = open_listen_socket(G.port);
+    if (G.srvfd < 0) {
+        fprintf(stderr, "[wire] FAILED to listen on %u; authoring disabled in this process\n", G.port);
+        return;
+    }
+    fprintf(stderr, "[wire] listening on %u\n", G.port);
 
-        // Request a snapshot from the next frame
-        G.want_snapshot = true;
-        {
-            std::unique_lock<std::mutex> lk(G.snap_mtx);
-            G.snap_cv.wait(lk, []{ return G.snapshot_ready.load(); });
+    while (G.started.load(std::memory_order_relaxed)) {
+        sockaddr_in cli{}; socklen_t cl = sizeof(cli);
+        int cfd = ::accept(G.srvfd, (sockaddr*)&cli, &cl);
+        if (cfd < 0) {
+            if (!G.started.load(std::memory_order_relaxed)) break; // stopping
+            perror("accept");
+            continue;
         }
+        try {
+            // Request a snapshot from the next frame
+            G.snapshot_ready = false;
+            G.want_snapshot = true;
+            {
+                std::unique_lock<std::mutex> lk(G.snap_mtx);
+                G.snap_cv.wait(lk, []{ return G.snapshot_ready.load(); });
+            }
 
-        // Send FRAM + RGBA to the client
-        FrameHeader fh{};
-        fh.magic=FRAM_MAGIC; fh.w=G.snapW; fh.h=G.snapH;
-        fh.stride=(uint32_t)G.snapW*4; fh.channels=4; fh.size=(uint32_t)(G.snapW*G.snapH*4);
-        send_all(cfd, &fh, sizeof(fh));
-        send_all(cfd, G.h_rgba, fh.size);
-        fprintf(stderr, "[wire] sent snapshot %dx%d RGBA\n", G.snapW, G.snapH);
+            // Send FRAM + RGBA to the client
+            FrameHeader fh{};
+            fh.magic=FRAM_MAGIC; fh.w=G.snapW; fh.h=G.snapH;
+            fh.stride=(uint32_t)G.snapW*4; fh.channels=4; fh.size=(uint32_t)(G.snapW*G.snapH*4);
+            send_all(cfd, &fh, sizeof(fh));
+            send_all(cfd, G.h_rgba, fh.size);
+            fprintf(stderr, "[wire] sent snapshot %dx%d RGBA\n", G.snapW, G.snapH);
 
-        // Receive SCNT + STMP×N
-        StampsCountHeader sc{}; recv_all(cfd, &sc, sizeof(sc));
-        if (sc.magic != SCNT_MAGIC) throw std::runtime_error("SCNT magic mismatch");
-        std::vector<Stamp> stamps(sc.count);
-        for (uint32_t i=0;i<sc.count;i++) {
-            recv_all(cfd, &stamps[i], sizeof(Stamp));
-            if (stamps[i].magic != STMP_MAGIC) throw std::runtime_error("STMP magic mismatch");
+            // Receive SCNT + STMP×N
+            StampsCountHeader sc{}; recv_all(cfd, &sc, sizeof(sc));
+            if (sc.magic != SCNT_MAGIC) throw std::runtime_error("SCNT magic mismatch");
+            std::vector<Stamp> stamps(sc.count);
+            for (uint32_t i=0;i<sc.count;i++) {
+                recv_all(cfd, &stamps[i], sizeof(Stamp));
+                if (stamps[i].magic != STMP_MAGIC) throw std::runtime_error("STMP magic mismatch");
+            }
+            ::close(cfd);
+            fprintf(stderr, "[wire] received %u stamp(s) from client\n", sc.count);
+
+            // Build mask + upload to device memory
+            build_and_swap_mask_from_stamps(stamps);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[wire] net thread error: %s\n", e.what());
+            ::close(cfd);
         }
-        ::close(cfd);
-        fprintf(stderr, "[wire] received %u stamp(s) from client\n", sc.count);
-
-        // Build mask + upload to device memory (not used by any kernel yet)
-        build_and_swap_mask_from_stamps(stamps);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[wire] net thread error: %s\n", e.what());
     }
 }
 
@@ -278,6 +299,9 @@ void wire_author_start(CUcontext ctx, uint16_t tcp_port)
 void wire_author_stop()
 {
     if (G.started.exchange(false)) {
+        // Close listening socket to break accept()
+        close_listen_socket(G.srvfd);
+
         if (G.th.joinable()) G.th.join();
 
         // Free device/host buffers

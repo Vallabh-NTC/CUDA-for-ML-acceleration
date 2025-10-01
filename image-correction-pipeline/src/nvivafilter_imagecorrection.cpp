@@ -1,10 +1,18 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → tone/color.
+ * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → (optional) wire removal inpaint → tone/color.
  *
- * We add a tiny TCP helper that sends one snapshot to a Python client and receives
- * a binary packet of "stamps", which we rasterize and upload as a device mask.
- * No runtime kernel consumes that mask yet (prints only).
+ * Robust control:
+ *   - Set WIRE_ENABLE=1 to enable wire removal + authoring server in this process.
+ *   - Set WIRE_ENABLE=0 (default) to disable both (no port bind, no inpaint).
+ *   - Set WIRE_PORT=NNNN to choose TCP port (default 5555).
+ *
+ * Typical usage:
+ *   # Camera you want to author/remove wire on:
+ *   WIRE_ENABLE=1 WIRE_PORT=5555 gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so ...
+ *
+ *   # Other cameras (no wire removal, no bind conflicts):
+ *   WIRE_ENABLE=0 gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so ...
  */
 
 #include <cstdio>
@@ -20,6 +28,7 @@
 #include <cmath>
 #include <dlfcn.h>     // dladdr
 #include <cctype>      // std::tolower
+#include <atomic>
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -31,8 +40,11 @@
 #include "color_ops.cuh"
 #include "runtime_controls.hpp"
 
-// NEW: authoring server (snapshot + device upload). No disappearance kernel is touched.
+// Authoring server (snapshot + device upload).
 #include "wire_author_server.cuh"
+
+// Two-donor NV12 inpaint (mask, dx, dy)
+#include "wire_lineremoval.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -46,6 +58,9 @@ namespace {
     static std::once_flag g_ctx_once;
     static CUcontext g_primary_ctx = nullptr;
     static CUdevice  g_device      = 0;
+
+    static std::atomic<bool> g_wire_enabled{false};  // process-wide enable
+    static uint16_t          g_wire_port = 5555;     // process-wide port (if enabled)
 
     static void retain_primary_context_once() {
         cuInit(0);
@@ -97,6 +112,12 @@ static std::string section_from_loaded_name()
     return "cam0";
 }
 
+static bool env_flag_true(const char* v) {
+    if (!v) return false;
+    std::string s = to_lower(v);
+    return (s=="1" || s=="true" || s=="yes" || s=="on" || s=="y");
+}
+
 // ============================================================================
 // Per-instance state
 // ============================================================================
@@ -117,6 +138,9 @@ struct ICPState {
 
     // Post-rectification center crop/zoom
     float crop_frac = 0.20f;
+
+    // Track last applied mask version (optional, for logging)
+    uint32_t last_mask_version = 0;
 };
 
 static std::mutex              g_instances_mtx;
@@ -258,6 +282,27 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         dUV,                                  pitch,
         st->crop_frac,                        st->stream);
 
+    // 2.5) Wire removal (two-donor inpaint) — only if WIRE_ENABLE=1 AND a mask is active.
+    if (g_wire_enabled.load(std::memory_order_relaxed)) {
+        CUdeviceptr dMask = 0;
+        int         maskPitch = 0;
+        float       dx = 0.f, dy = 0.f;
+        uint32_t    ver = 0;
+        if (wire_author_get_active_mask(&dMask, &maskPitch, &dx, &dy, &ver)) {
+            wire::apply_mask_shift_nv12(
+                dY,  pitch,
+                dUV, pitch,
+                W, H,
+                (const uint8_t*)(uintptr_t)dMask, maskPitch,
+                dx, dy,
+                st->stream);
+            if (ver != st->last_mask_version) {
+                fprintf(stderr, "[ic] applied device mask (version=%u, dx=%.2f, dy=%.2f)\n", ver, dx, dy);
+                st->last_mask_version = ver;
+            }
+        }
+    }
+
     // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(
@@ -266,11 +311,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         cp,
         st->stream);
 
-    // ---- NEW: offer a snapshot for the server (one-shot, when client connects) ----
-    wire_author_snapshot_nv12_if_needed(
-        dY,  pitch,
-        dUV, pitch,
-        W, H, st->stream);
+    // 4) Optional snapshot (only if authoring is enabled; otherwise skip)
+    if (g_wire_enabled.load(std::memory_order_relaxed)) {
+        wire_author_snapshot_nv12_if_needed(
+            dY,  pitch,
+            dUV, pitch,
+            W, H, st->stream);
+    }
 
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
@@ -286,23 +333,34 @@ extern "C" void init(CustomerFunction* f)
     f->fGPUProcess  = gpu_process;
     f->fPostProcess = post_process;
 
-    // Ensure we have the primary CUDA context retained at least once
+    // Ensure CUDA primary context retained
     std::call_once(g_ctx_once, retain_primary_context_once);
 
-    // Start the authoring server. If WIRE_PORT is set, use it; else default 5555.
+    // Read process-wide enable flag and port from environment.
+    // Default: disabled (no bind, no inpaint).
+    bool enable = env_flag_true(std::getenv("WIRE_ENABLE"));
+    g_wire_enabled.store(enable, std::memory_order_relaxed);
+
     uint16_t port = 5555;
     if (const char* p = std::getenv("WIRE_PORT")) {
         int v = atoi(p); if (v>0 && v<65536) port = (uint16_t)v;
     }
-    wire_author_start(g_primary_ctx /* may be null if retention failed */, port);
-    fprintf(stderr, "[ic] wire author server started (port %u)\n", port);
+    g_wire_port = port;
+
+    if (enable) {
+        wire_author_start(g_primary_ctx /* may be null if retention failed */, g_wire_port);
+        fprintf(stderr, "[ic] wire author server ENABLED (port %u)\n", g_wire_port);
+    } else {
+        fprintf(stderr, "[ic] wire author server DISABLED (WIRE_ENABLE=0 or unset)\n");
+    }
 }
 
 extern "C" void deinit(void)
 {
-    // Stop server and free its resources (device mask + snapshot buffers)
-    wire_author_stop();
-    fprintf(stderr, "[ic] wire author server stopped\n");
+    if (g_wire_enabled.load(std::memory_order_relaxed)) {
+        wire_author_stop();
+        fprintf(stderr, "[ic] wire author server stopped\n");
+    }
 
     std::vector<ICPState*> to_free;
     {
