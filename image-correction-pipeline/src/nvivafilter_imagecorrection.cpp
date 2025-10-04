@@ -146,6 +146,23 @@ struct ICPState {
 static std::mutex              g_instances_mtx;
 static std::vector<ICPState*>  g_instances;
 
+// --- NEW: per-instance section hints (queue consumed by create_instance) ----
+static std::mutex              g_hint_mtx;
+static std::deque<std::string> g_next_section_hints;
+
+extern "C" void ic_bind_next_instance_to(const char* section /* "cam0|cam1|cam2" */) {
+    if (!section || !*section) return;
+    std::string s = to_lower(section);
+    if (s != "cam0" && s != "cam1" && s != "cam2") return;
+    std::lock_guard<std::mutex> lk(g_hint_mtx);
+    g_next_section_hints.push_back(std::move(s));
+}
+
+extern "C" void ic_clear_instance_hints() {
+    std::lock_guard<std::mutex> lk(g_hint_mtx);
+    g_next_section_hints.clear();
+}
+
 // ----------------------------------------------------------------------------
 // Alloc helpers
 // ----------------------------------------------------------------------------
@@ -196,12 +213,20 @@ static ICPState* create_instance()
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
 
-    // Bind section (cam0/cam1/cam2) from soname/symlink
+    // NEW: consume next hint if present; otherwise fallback to SONAME/path
+    std::string sec;
     {
-        std::string sec = section_from_loaded_name();
-        st->controls.set_section(sec);
-        fprintf(stderr, "[ic] Instance bound to section (soname) '%s'\n", sec.c_str());
+        std::lock_guard<std::mutex> lk(g_hint_mtx);
+        if (!g_next_section_hints.empty()) {
+            sec = std::move(g_next_section_hints.front());
+            g_next_section_hints.pop_front();
+        }
     }
+    if (sec.empty())
+        sec = section_from_loaded_name();
+
+    st->controls.set_section(sec);
+    fprintf(stderr, "[ic] Instance bound to section '%s'\n", sec.c_str());
 
     {
         std::lock_guard<std::mutex> lk(g_instances_mtx);
@@ -369,4 +394,7 @@ extern "C" void deinit(void)
     }
     for (auto* st : to_free) destroy_instance(st);
     release_primary_context();
+
+    // (opzionale) pulizia degli hint residui
+    ic_clear_instance_hints();
 }
