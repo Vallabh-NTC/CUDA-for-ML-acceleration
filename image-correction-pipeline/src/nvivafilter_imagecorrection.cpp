@@ -398,3 +398,18 @@ extern "C" void deinit(void)
     // (opzionale) pulizia degli hint residui
     ic_clear_instance_hints();
 }
+
+// ============================================================================
+// OPTIONAL HOST-QUERY API (used by the host app to fence instance binding)
+// ============================================================================
+extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
+    if (!section || !*section) return 0;
+    std::lock_guard<std::mutex> lk(g_instances_mtx);
+    for (auto* st : g_instances) {
+        if (!st) continue;
+        if (st->controls.section() == section) return 1; // found a bound instance
+    }
+    return 0; // not found yet
+}
+
+
