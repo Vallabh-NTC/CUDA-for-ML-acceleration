@@ -1,13 +1,18 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → tone/color.
+ * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → (optional) wire removal inpaint → tone/color.
  *
- * Binding deterministico della sezione (cam0/cam1/cam2) in base al NOME della .so caricata:
- *   libnvivafilter_imagecorrection_cam0.so → "cam0"
- *   libnvivafilter_imagecorrection_cam1.so → "cam1"
- *   libnvivafilter_imagecorrection_cam2.so → "cam2"
+ * Robust control:
+ *   - Set WIRE_ENABLE=1 to enable wire removal + authoring server in this process.
+ *   - Set WIRE_ENABLE=0 (default) to disable both (no port bind, no inpaint).
+ *   - Set WIRE_PORT=NNNN to choose TCP port (default 5555).
  *
- * Così possiamo usare UNA sola .so reale + 3 symlink, senza env/hint/round-robin.
+ * Typical usage:
+ *   # Camera you want to author/remove wire on:
+ *   WIRE_ENABLE=1 WIRE_PORT=5555 gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so ...
+ *
+ *   # Other cameras (no wire removal, no bind conflicts):
+ *   WIRE_ENABLE=0 gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so ...
  */
 
 #include <cstdio>
@@ -23,6 +28,7 @@
 #include <cmath>
 #include <dlfcn.h>     // dladdr
 #include <cctype>      // std::tolower
+#include <atomic>
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -33,6 +39,12 @@
 #include "kernel_rectify.cuh"
 #include "color_ops.cuh"
 #include "runtime_controls.hpp"
+
+// Authoring server (snapshot + device upload).
+#include "wire_author_server.cuh"
+
+// Two-donor NV12 inpaint (mask, dx, dy)
+#include "wire_lineremoval.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -46,6 +58,9 @@ namespace {
     static std::once_flag g_ctx_once;
     static CUcontext g_primary_ctx = nullptr;
     static CUdevice  g_device      = 0;
+
+    static std::atomic<bool> g_wire_enabled{false};  // process-wide enable
+    static uint16_t          g_wire_port = 5555;     // process-wide port (if enabled)
 
     static void retain_primary_context_once() {
         cuInit(0);
@@ -77,20 +92,18 @@ static std::string to_lower(std::string s) {
     return s;
 }
 
-// Determina "cam0|cam1|cam2" dal NOME con cui è stata caricata la .so
+// Determine "cam0|cam1|cam2" from the loaded .so name
 static std::string section_from_loaded_name()
 {
     Dl_info info{};
     if (dladdr((void*)&init, &info) && info.dli_fname) {
         std::string path(info.dli_fname);
         std::string low  = to_lower(path);
-        // 1) prima prova dal basename (gestisce anche eventuali suffissi _camX)
         std::string base = path.substr(path.find_last_of('/') + 1);
         std::string base_low = to_lower(base);
         if (base_low.find("_cam0") != std::string::npos) return "cam0";
         if (base_low.find("_cam1") != std::string::npos) return "cam1";
         if (base_low.find("_cam2") != std::string::npos) return "cam2";
-        // 2) poi guarda tutto il PATH (cartelle cam0/cam1/cam2)
         if (low.find("/cam0/") != std::string::npos) return "cam0";
         if (low.find("/cam1/") != std::string::npos) return "cam1";
         if (low.find("/cam2/") != std::string::npos) return "cam2";
@@ -99,6 +112,11 @@ static std::string section_from_loaded_name()
     return "cam0";
 }
 
+static bool env_flag_true(const char* v) {
+    if (!v) return false;
+    std::string s = to_lower(v);
+    return (s=="1" || s=="true" || s=="yes" || s=="on" || s=="y");
+}
 
 // ============================================================================
 // Per-instance state
@@ -115,15 +133,35 @@ struct ICPState {
     // Geometry (fisheye rectification)
     icp::RectifyConfig cfg{};
 
-    // Runtime controls (hot-reload) su sezione decisa a create_instance()
+    // Runtime controls (hot-reload) bound to section decided at create_instance()
     icp::RuntimeControls controls{"/home/jetson_ntc/config.json", "cam0"};
 
     // Post-rectification center crop/zoom
     float crop_frac = 0.20f;
+
+    // Track last applied mask version (optional, for logging)
+    uint32_t last_mask_version = 0;
 };
 
 static std::mutex              g_instances_mtx;
 static std::vector<ICPState*>  g_instances;
+
+// --- NEW: per-instance section hints (queue consumed by create_instance) ----
+static std::mutex              g_hint_mtx;
+static std::deque<std::string> g_next_section_hints;
+
+extern "C" void ic_bind_next_instance_to(const char* section /* "cam0|cam1|cam2" */) {
+    if (!section || !*section) return;
+    std::string s = to_lower(section);
+    if (s != "cam0" && s != "cam1" && s != "cam2") return;
+    std::lock_guard<std::mutex> lk(g_hint_mtx);
+    g_next_section_hints.push_back(std::move(s));
+}
+
+extern "C" void ic_clear_instance_hints() {
+    std::lock_guard<std::mutex> lk(g_hint_mtx);
+    g_next_section_hints.clear();
+}
 
 // ----------------------------------------------------------------------------
 // Alloc helpers
@@ -135,7 +173,6 @@ static void ensure_scratch(ICPState* st, int W, int H)
     if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
     if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
 
-    // pitched alloc per NV12
     cuMemAllocPitch(&st->sY,  &st->pY,  (size_t)W, (size_t)H,    4);
     cuMemAllocPitch(&st->sUV, &st->pUV, (size_t)W, (size_t)(H/2),4);
     st->sW = W; st->sH = H;
@@ -176,12 +213,20 @@ static ICPState* create_instance()
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
 
-    // === Bind deterministico in base al nome della .so (symlink _camX) ===
+    // NEW: consume next hint if present; otherwise fallback to SONAME/path
+    std::string sec;
     {
-        std::string sec = section_from_loaded_name();
-        st->controls.set_section(sec);
-        fprintf(stderr, "[ic] Instance bound to section (soname) '%s'\n", sec.c_str());
+        std::lock_guard<std::mutex> lk(g_hint_mtx);
+        if (!g_next_section_hints.empty()) {
+            sec = std::move(g_next_section_hints.front());
+            g_next_section_hints.pop_front();
+        }
     }
+    if (sec.empty())
+        sec = section_from_loaded_name();
+
+    st->controls.set_section(sec);
+    fprintf(stderr, "[ic] Instance bound to section '%s'\n", sec.c_str());
 
     {
         std::lock_guard<std::mutex> lk(g_instances_mtx);
@@ -253,7 +298,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
-    // 2) Crop/zoom centrale
+    // 2) Center crop/zoom
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
     icp::launch_crop_center_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
@@ -262,6 +307,27 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         dUV,                                  pitch,
         st->crop_frac,                        st->stream);
 
+    // 2.5) Wire removal (two-donor inpaint) — only if WIRE_ENABLE=1 AND a mask is active.
+    if (g_wire_enabled.load(std::memory_order_relaxed)) {
+        CUdeviceptr dMask = 0;
+        int         maskPitch = 0;
+        float       dx = 0.f, dy = 0.f;
+        uint32_t    ver = 0;
+        if (wire_author_get_active_mask(&dMask, &maskPitch, &dx, &dy, &ver)) {
+            wire::apply_mask_shift_nv12(
+                dY,  pitch,
+                dUV, pitch,
+                W, H,
+                (const uint8_t*)(uintptr_t)dMask, maskPitch,
+                dx, dy,
+                st->stream);
+            if (ver != st->last_mask_version) {
+                fprintf(stderr, "[ic] applied device mask (version=%u, dx=%.2f, dy=%.2f)\n", ver, dx, dy);
+                st->last_mask_version = ver;
+            }
+        }
+    }
+
     // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(
@@ -269,6 +335,14 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         dUV,     pitch,
         cp,
         st->stream);
+
+    // 4) Optional snapshot (only if authoring is enabled; otherwise skip)
+    if (g_wire_enabled.load(std::memory_order_relaxed)) {
+        wire_author_snapshot_nv12_if_needed(
+            dY,  pitch,
+            dUV, pitch,
+            W, H, st->stream);
+    }
 
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
@@ -283,10 +357,36 @@ extern "C" void init(CustomerFunction* f)
     f->fPreProcess  = pre_process;
     f->fGPUProcess  = gpu_process;
     f->fPostProcess = post_process;
+
+    // Ensure CUDA primary context retained
+    std::call_once(g_ctx_once, retain_primary_context_once);
+
+    // Read process-wide enable flag and port from environment.
+    // Default: disabled (no bind, no inpaint).
+    bool enable = env_flag_true(std::getenv("WIRE_ENABLE"));
+    g_wire_enabled.store(enable, std::memory_order_relaxed);
+
+    uint16_t port = 5555;
+    if (const char* p = std::getenv("WIRE_PORT")) {
+        int v = atoi(p); if (v>0 && v<65536) port = (uint16_t)v;
+    }
+    g_wire_port = port;
+
+    if (enable) {
+        wire_author_start(g_primary_ctx /* may be null if retention failed */, g_wire_port);
+        fprintf(stderr, "[ic] wire author server ENABLED (port %u)\n", g_wire_port);
+    } else {
+        fprintf(stderr, "[ic] wire author server DISABLED (WIRE_ENABLE=0 or unset)\n");
+    }
 }
 
 extern "C" void deinit(void)
 {
+    if (g_wire_enabled.load(std::memory_order_relaxed)) {
+        wire_author_stop();
+        fprintf(stderr, "[ic] wire author server stopped\n");
+    }
+
     std::vector<ICPState*> to_free;
     {
         std::lock_guard<std::mutex> lk(g_instances_mtx);
@@ -294,4 +394,22 @@ extern "C" void deinit(void)
     }
     for (auto* st : to_free) destroy_instance(st);
     release_primary_context();
+
+    // (opzionale) pulizia degli hint residui
+    ic_clear_instance_hints();
 }
+
+// ============================================================================
+// OPTIONAL HOST-QUERY API (used by the host app to fence instance binding)
+// ============================================================================
+extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
+    if (!section || !*section) return 0;
+    std::lock_guard<std::mutex> lk(g_instances_mtx);
+    for (auto* st : g_instances) {
+        if (!st) continue;
+        if (st->controls.section() == section) return 1; // found a bound instance
+    }
+    return 0; // not found yet
+}
+
+

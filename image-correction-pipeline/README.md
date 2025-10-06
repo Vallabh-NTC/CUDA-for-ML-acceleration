@@ -47,7 +47,13 @@ mkdir -p toolchain && tar -C toolchain -xf toolchain.tar.gz
 cd /workspace
 tar -I lbzip2 -xf public_sources.tbz2
 cd ./Linux_for_Tegra/source/public
+# Jetson Xavier NX
 CROSS_COMPILE_AARCH64=/l4t/toolchain/bin/aarch64-buildroot-linux-gnu- CROSS_COMPILE_AARCH64_PATH=/l4t/toolchain NV_TARGET_BOARD=t186ref ./nv_public_src_build.sh
+# Jetson Oring AGX
+CROSS_COMPILE_AARCH64=/l4t/toolchain/bin/aarch64-buildroot-linux-gnu- \
+CROSS_COMPILE_AARCH64_PATH=/l4t/toolchain \
+NV_TARGET_BOARD=t234ref \
+./nv_public_src_build.sh
 
 cd /l4t/targetfs/usr/src/jetson_multimedia_api
 export CROSS_COMPILE=aarch64-linux-gnu-
@@ -96,11 +102,21 @@ Copy code
 # --- Build project ------------------------------------------------------------
 cd /workspace/CUDA-for-ML-acceleration
 rm -rf build
+
+# Jetson Xavier NX
 cmake -S . -B build \
   -DPROJECT=image-correction-pipeline \
   -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/Toolchain_aarch64_l4t.cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES=72
+cmake --build build -j"$(nproc)" --verbose
+
+# Jetson Orin AGX
+cmake -S . -B build \
+  -DPROJECT=image-correction-pipeline \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/Toolchain_aarch64_l4t.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=87
 cmake --build build -j"$(nproc)" --verbose
 
 # Verify
