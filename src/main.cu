@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
     if (argc >= 2) { try { frames = std::stoi(argv[1]); } catch (...) {} }
 
     // -------- RTP destination config --------
-    const std::string dst_ip   = "192.168.10.201"; // <-- set to your Windows PC IP
+    const std::string dst_ip   = "192.168.10.202"; // <-- set to your Windows PC IP
 
     // -------- launch camera workers --------
     std::vector<std::thread> threads;
