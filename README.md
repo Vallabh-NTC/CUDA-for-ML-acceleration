@@ -1,0 +1,1 @@
+## Checking rule which blocks any direct commits on main
