@@ -1,42 +1,43 @@
-cmake_minimum_required(VERSION 3.18)
-project(ImageCorrectionPipeline LANGUAGES CXX CUDA)
+# =============================================================================
+# Root CMakeLists.txt
+#
+# Dispatcher for sub-projects in this workspace.
+# Example: CUDA-for-ML-acceleration can contain multiple CUDA/GStreamer modules.
+#
+# Usage:
+#   mkdir build && cd build
+#   cmake .. -DPROJECT=image-correction-pipeline \
+#            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/Toolchain_aarch64_l4t.cmake
+# =============================================================================
 
+cmake_minimum_required(VERSION 3.18)
+
+# Root project; supports both host and CUDA languages.
+# Actual cross-compilation settings are controlled via toolchain file.
+project(CUDA_for_ML_acceleration LANGUAGES C CXX CUDA)
+
+# Enforce modern C++/CUDA defaults at root level (can be overridden in subprojects).
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-find_package(CUDAToolkit REQUIRED)
-find_package(PkgConfig REQUIRED)
+# -----------------------------------------------------------------------------
+# PROJECT selection mechanism
+# -----------------------------------------------------------------------------
+# The -DPROJECT=<subdir> variable selects which module to build.
+# Example:
+#   cmake .. -DPROJECT=image-correction-pipeline
+set(PROJECT "" CACHE STRING "Subproject to build (e.g. image-correction-pipeline)")
 
-# GStreamer come target IMPORTED (propaga include + libs)
-pkg_check_modules(GST REQUIRED IMPORTED_TARGET
-  gstreamer-1.0
-  gstreamer-app-1.0
-  gstreamer-video-1.0
-)
+# Require explicit selection
+if (PROJECT STREQUAL "")
+    message(FATAL_ERROR "Please specify -DPROJECT=<subdir>, e.g. -DPROJECT=image-correction-pipeline")
+endif()
 
-# Sotto-progetto con le librerie
-add_subdirectory(image-correction-pipeline)
+# Check subproject existence and include its CMakeLists.txt
+if (EXISTS "${CMAKE_SOURCE_DIR}/${PROJECT}/CMakeLists.txt")
+    add_subdirectory(${PROJECT})
+else()
+    message(FATAL_ERROR "Unknown project: ${PROJECT}")
+endif()
 
-# ---- Executable principale (CUDA) ----
-add_executable(main_app
-  src/main.cu
-)
 
-target_include_directories(main_app
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-# Linka TUTTO ciò che serve a main.cu:
-target_link_libraries(main_app
-  PRIVATE
-    PkgConfig::GST            # <gst/gst.h> + libs
-    gstreamer_frontend        # implementazione della pipeline (cpp)
-    image_correction_kernels  # i tuoi kernel CUDA
-    CUDA::cudart
-)
-
-# Opzionale: se serve separable compilation
-set_target_properties(main_app PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-)
