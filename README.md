@@ -1,1 +1,0 @@
-If you see this text, master branch is still not protected from git pushes
