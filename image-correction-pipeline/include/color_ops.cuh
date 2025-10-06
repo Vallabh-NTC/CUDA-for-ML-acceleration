@@ -1,3 +1,4 @@
+// color_ops.cuh
 #pragma once
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -8,27 +9,26 @@ namespace icp {
 struct ColorParams {
     bool  enable      = true;
 
-    // Manual exposure in EV (negative = darker). Range: [-2.0 .. +2.0]
-    float exposure_ev = 0.0f;
+    // Manual exposure in EV (negative = darker).
+    float exposure_ev = 0.0f;   // neutral
 
-    // Tone (iPhone-like)
-    float contrast    = 1.10f;  // [0.50 .. 1.80] S-curve around mid-gray
-    float highlights  = -0.30f; // [-1.0 .. +1.0] <0 = earlier soft-knee
-    float shadows     = 0.25f;  // [-1.0 .. +1.0] >0 = lift shadows
-    float whites      = -0.20f; // [-1.0 .. +1.0] <0 = lower white ceiling
-    float gamma       = 1.00f;  // [0.70 .. 1.30]
+    // Tone (neutral defaults)
+    float contrast    = 1.00f;  // neutral (UI 0)
+    float highlights  = 0.00f;  // neutral
+    float shadows     = 0.00f;  // neutral
+    float whites      = 0.00f;  // neutral
+    float gamma       = 1.00f;  // neutral
 
-    // Added controls
-    float brightness  = 0.0f;   // [-1.0 .. +1.0] mid-shift
-    float brilliance  = 0.0f;   // [-1.0 .. +1.0] mid-boost with edge-protection
-    float sharpness   = 0.0f;   // [0.0 .. 1.0] unsharp mask amount
+    // Added controls (neutral)
+    float brightness  = 0.0f;   // neutral
+    float brilliance  = 0.0f;   // neutral
+    float sharpness   = 0.0f;   // off
 
     // Color
-    float saturation  = 1.15f;  // [0.50 .. 1.50]
-    bool  tv_range    = true;   // true: clamp Y to [16..235]
+    float saturation  = 1.00f;  // neutral (UI 0 -> 1.0)
+    bool  tv_range    = true;   
 };
 
-// Launch: in-place on NV12 planes
 void launch_tone_saturation_nv12(
     uint8_t* dY, int W, int H, int pitchY,
     uint8_t* dUV,            int pitchUV,
