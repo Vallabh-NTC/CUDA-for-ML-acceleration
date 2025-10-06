@@ -33,14 +33,14 @@ __device__ __forceinline__ float laplacian3x3(const uint8_t* Y, int W, int H, in
 }
 
 // Nonlinear contrast S-curve around mid.
-// c in [-1..+1]. For c -> +1 it approaches a hard threshold @0.5.
+// c in [-1..+1]. For c -> +1 it approaches a hard threshold @0.5 (asymptotically).
 // For c -> -1 it compresses toward mid-gray.
 __device__ __forceinline__ float scontrast_curve(float t, float c)
 {
     t = clamp(t, 0.f, 1.f);
     if (c >= 0.f) {
         // Boost contrast: exponent g in (0,1].
-        float g = fmaxf(1e-3f, 1.f - 0.999f * c); // c=1 -> g≈0 (hard)
+        float g = fmaxf(1e-3f, 1.f - 0.999f * c); // c=1 -> g≈0 (very steep but continuous)
         if (t < 0.5f) return 0.5f * powf(2.f * t, g);
         else          return 1.f - 0.5f * powf(2.f * (1.f - t), g);
     } else {
@@ -56,7 +56,7 @@ __device__ __forceinline__ float scontrast_curve(float t, float c)
 //   - Brightness full-range at the end (±1 => white/black).
 //   - Stronger shadows/highlights response.
 //   - Whites sign: >0 raises headroom, <0 lowers ceiling.
-//   - Contrast: UI 0.50..1.80 → [-1..+1]; at 1.80 force hard threshold (B/W).
+//   - Contrast: UI 0.50..1.80 → [-1..+1]; **no hard threshold at max**.
 //   - Saturation: neutral at 1.0; >1 boosts aggressively (up to 4x).
 // ============================================================================
 __global__ void toneSat_kernel(
@@ -112,17 +112,13 @@ __global__ void toneSat_kernel(
     }
     c01 = clamp(c01, -1.f, 1.f);
 
-    // Extreme → pure B/W around mid-gray.
-    if (c01 > 0.98f) {
-        t = (t >= 0.5f) ? 1.0f : 0.0f;  // hard threshold → black/white
-    } else {
-        t = scontrast_curve(t, c01);    // smooth S-curve elsewhere
-    }
+    c01 = fminf(c01, 0.97f);
+    t = scontrast_curve(t, c01);    // always smooth S-curve
 
     // Global gamma
     t = powf(t, 1.0f / gamma);
 
-    // FINAL Brightness: full-range offset so that +1 => pure white, -1 => pure black
+
     t = clamp(t + brightness, 0.0f, 1.0f);
 
     // Back to luma (pre-sharpen)
@@ -163,8 +159,8 @@ __global__ void toneSat_kernel(
 
 // ============================================================================
 // Host launcher: keep ranges aligned to your current JSON/UI
-//   contrast:   0.50 .. 1.80 (at 1.80 => hard B/W)
-//   saturation: 0.00 .. 4.00 (neutral 1.0)
+//   contrast:   0.50 .. 1.80  (UI 0..100; at 100 we cap to 0.97 internally)
+//   saturation: 0.00 .. 4.00  (neutral 1.0)
 //   brightness: -1.00.. +1.00 (full white/black)
 // ============================================================================
 void launch_tone_saturation_nv12(
@@ -177,7 +173,7 @@ void launch_tone_saturation_nv12(
 
     ColorParams p = pin;
     p.exposure_ev = clamp(p.exposure_ev, -2.0f,  2.0f);
-    p.contrast    = clamp(p.contrast,     0.50f, 1.80f); // match your JSON scale
+    p.contrast    = clamp(p.contrast,     0.50f, 1.80f); // UI maps to this range; kernel caps smoothly
     p.highlights  = clamp(p.highlights,  -1.0f,  1.0f);
     p.shadows     = clamp(p.shadows,     -1.0f,  1.0f);
     p.whites      = clamp(p.whites,      -1.0f,  1.0f);
