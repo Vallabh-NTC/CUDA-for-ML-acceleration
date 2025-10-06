@@ -28,7 +28,10 @@ if(NOT DEFINED CUDA_TOOLKIT_ROOT_DIR)
 endif()
 
 # Jetson Xavier/NX/Nano → Volta (sm_72)
-set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "CUDA architectures")
+#set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "CUDA architectures")
+
+# Jetson Orin AGX → Volta (sm_87)
+set(CMAKE_CUDA_ARCHITECTURES 87 CACHE STRING "CUDA architectures")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -38,6 +41,8 @@ set(CMAKE_CUDA_STANDARD 17)
 # -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
+    src/wire_author_server.cu
+    src/wire_lineremoval.cu
     src/color_ops.cu   
 )
 
