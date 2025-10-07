@@ -41,7 +41,6 @@ set(CMAKE_CUDA_STANDARD 17)
 # -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
-    src/wire_author_server.cu
     src/wire_lineremoval.cu
     src/color_ops.cu   
 )
