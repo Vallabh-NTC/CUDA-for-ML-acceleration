@@ -2,17 +2,26 @@
  * @file nvivafilter_imagecorrection.cpp
  * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → (optional) wire removal inpaint → tone/color.
  *
- * Robust control:
- *   - Set WIRE_ENABLE=1 to enable wire removal + authoring server in this process.
- *   - Set WIRE_ENABLE=0 (default) to disable both (no port bind, no inpaint).
- *   - Set WIRE_PORT=NNNN to choose TCP port (default 5555).
+ * This version **removes** any built-in authoring/network server. The mask is
+ * produced by an external process and saved on CPU as:
+ *   - /dev/shm/wire_mask_camN.raw  (W*H bytes, 8-bit)
+ *   - /dev/shm/wire_mask_camN.meta (single line: "W H dx dy")
  *
- * Typical usage:
- *   # Camera you want to author/remove wire on:
- *   WIRE_ENABLE=1 WIRE_PORT=5555 gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so ...
+ * At the first frame of each instance, the .so loads the mask **once** for the
+ * instance's section (cam0|cam1|cam2). At runtime the mask is applied **only**
+ * if:
+ *   - a valid device mask was loaded,
+ *   - the current frame resolution matches the mask resolution,
+ *   - the instance section index (0/1/2) equals the mask's cam index N.
  *
- *   # Other cameras (no wire removal, no bind conflicts):
- *   WIRE_ENABLE=0 gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so ...
+ * Examples:
+ *   instance = cam0, mask files are "cam0" → apply
+ *   instance = cam0, mask files are "cam2" → do NOT apply
+ *
+ * Typical pipeline:
+ *   gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection_cam0.so ...
+ *   gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection_cam1.so ...
+ *   gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection_cam2.so ...
  */
 
 #include <cstdio>
@@ -40,10 +49,7 @@
 #include "color_ops.cuh"
 #include "runtime_controls.hpp"
 
-// Authoring server (snapshot + device upload).
-#include "wire_author_server.cuh"
-
-// Two-donor NV12 inpaint (mask, dx, dy)
+// Wire removal kernel (two-donor NV12 inpaint)
 #include "wire_lineremoval.cuh"
 
 #ifndef M_PI
@@ -58,9 +64,6 @@ namespace {
     static std::once_flag g_ctx_once;
     static CUcontext g_primary_ctx = nullptr;
     static CUdevice  g_device      = 0;
-
-    static std::atomic<bool> g_wire_enabled{false};  // process-wide enable
-    static uint16_t          g_wire_port = 5555;     // process-wide port (if enabled)
 
     static void retain_primary_context_once() {
         cuInit(0);
@@ -112,10 +115,18 @@ static std::string section_from_loaded_name()
     return "cam0";
 }
 
-static bool env_flag_true(const char* v) {
-    if (!v) return false;
-    std::string s = to_lower(v);
-    return (s=="1" || s=="true" || s=="yes" || s=="on" || s=="y");
+static int section_to_index(const std::string& sec) {
+    if (sec == "cam0") return 0;
+    if (sec == "cam1") return 1;
+    if (sec == "cam2") return 2;
+    return -1;
+}
+
+static std::string mask_raw_path_for(int cam_idx) {
+    return "/dev/shm/wire_mask_cam" + std::to_string(cam_idx) + ".raw";
+}
+static std::string mask_meta_path_for(int cam_idx) {
+    return "/dev/shm/wire_mask_cam" + std::to_string(cam_idx) + ".meta";
 }
 
 // ============================================================================
@@ -139,14 +150,25 @@ struct ICPState {
     // Post-rectification center crop/zoom
     float crop_frac = 0.20f;
 
-    // Track last applied mask version (optional, for logging)
+    // --- NEW: per-instance, device-resident mask loaded once from CPU ---
+    struct DeviceMask {
+        CUdeviceptr dMask = 0;   // 8-bit mask on device
+        size_t      pitch = 0;   // bytes per row for mask
+        int         W = 0, H = 0;
+        float       dx = 0.f, dy = 0.f;
+        bool        valid = false;
+        int         cam_index = -1; // 0/1/2 corresponding to the files used
+    } mask{};
+    bool mask_checked_once = false; // ensures we attempt loading only once
+
+    // Track last-applied mask version (kept for parity with older logs, unused)
     uint32_t last_mask_version = 0;
 };
 
 static std::mutex              g_instances_mtx;
 static std::vector<ICPState*>  g_instances;
 
-// --- NEW: per-instance section hints (queue consumed by create_instance) ----
+// --- per-instance section hints (queue consumed by create_instance) ----
 static std::mutex              g_hint_mtx;
 static std::deque<std::string> g_next_section_hints;
 
@@ -197,6 +219,83 @@ static void copy_to_scratch_async(ICPState* st,
 }
 
 // ----------------------------------------------------------------------------
+// Mask loader: read once from CPU file(s) and upload to device
+// ----------------------------------------------------------------------------
+static bool load_mask_from_cpu_once(ICPState* st)
+{
+    const std::string sec = st->controls.section();
+    const int my_idx = section_to_index(sec);
+    if (my_idx < 0) {
+        fprintf(stderr, "[ic] mask: unknown section '%s'\n", sec.c_str());
+        return false;
+    }
+
+    const std::string meta = mask_meta_path_for(my_idx);
+    const std::string raw  = mask_raw_path_for(my_idx);
+
+    // Read META: "W H dx dy"
+    FILE* fm = fopen(meta.c_str(), "r");
+    if (!fm) {
+        // Not an error: absence of mask simply means "do not apply"
+        fprintf(stderr, "[ic] mask: meta not found for %s (skipping)\n", sec.c_str());
+        return false;
+    }
+    int W=0, H=0; float dx=0.f, dy=0.f;
+    int n = fscanf(fm, "%d %d %f %f", &W, &H, &dx, &dy);
+    fclose(fm);
+    if (n != 4 || W<=0 || H<=0) {
+        fprintf(stderr, "[ic] mask: bad meta format for %s (skipping)\n", sec.c_str());
+        return false;
+    }
+
+    // Read RAW: W*H bytes
+    const size_t bytes = (size_t)W * (size_t)H;
+    std::vector<uint8_t> hostMask(bytes);
+    FILE* fr = fopen(raw.c_str(), "rb");
+    if (!fr) {
+        fprintf(stderr, "[ic] mask: raw not found for %s (skipping)\n", sec.c_str());
+        return false;
+    }
+    size_t rd = fread(hostMask.data(), 1, bytes, fr);
+    fclose(fr);
+    if (rd != bytes) {
+        fprintf(stderr, "[ic] mask: raw size mismatch for %s (%zu vs %zu)\n",
+                sec.c_str(), rd, bytes);
+        return false;
+    }
+
+    // Allocate device mask (pitched) if needed
+    if (!st->mask.dMask || st->mask.W != W || st->mask.H != H) {
+        if (st->mask.dMask) { cuMemFree(st->mask.dMask); st->mask.dMask = 0; }
+        CUdeviceptr dptr = 0; size_t pitch = 0;
+        CUresult rc = cuMemAllocPitch(&dptr, &pitch, (size_t)W, (size_t)H, 4);
+        if (rc != CUDA_SUCCESS) {
+            fprintf(stderr, "[ic] mask: cuMemAllocPitch failed (%d)\n", (int)rc);
+            return false;
+        }
+        st->mask.dMask = dptr;
+        st->mask.pitch = pitch;
+        st->mask.W = W; st->mask.H = H;
+    }
+
+    // Upload H2D
+    CUDA_MEMCPY2D c{};
+    c.srcMemoryType = CU_MEMORYTYPE_HOST;   c.srcHost   = hostMask.data(); c.srcPitch = (size_t)W;
+    c.dstMemoryType = CU_MEMORYTYPE_DEVICE; c.dstDevice = st->mask.dMask;  c.dstPitch = st->mask.pitch;
+    c.WidthInBytes  = (size_t)W; c.Height = (size_t)H;
+    cuMemcpy2D(&c);
+
+    // Store meta and mark valid
+    st->mask.dx = dx; st->mask.dy = dy;
+    st->mask.cam_index = my_idx;
+    st->mask.valid = true;
+
+    fprintf(stderr, "[ic] mask: loaded for %s (W=%d H=%d, dx=%.2f dy=%.2f)\n",
+            sec.c_str(), W, H, dx, dy);
+    return true;
+}
+
+// ----------------------------------------------------------------------------
 // Instance allocation / destruction
 // ----------------------------------------------------------------------------
 static ICPState* create_instance()
@@ -213,7 +312,7 @@ static ICPState* create_instance()
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
 
-    // NEW: consume next hint if present; otherwise fallback to SONAME/path
+    // Consume next hint if present; otherwise fallback to SONAME/path
     std::string sec;
     {
         std::lock_guard<std::mutex> lk(g_hint_mtx);
@@ -243,6 +342,9 @@ static void destroy_instance(ICPState* st)
     if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
     if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
 
+    if (st->mask.dMask) { cuMemFree(st->mask.dMask); st->mask.dMask = 0; }
+    st->mask = {}; // reset
+
     if (st->stream) { cudaStreamDestroy(st->stream); st->stream = nullptr; }
     st->ctx = nullptr;
     delete st;
@@ -264,7 +366,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     }
     cuCtxSetCurrent(st->ctx);
 
-    // Map EGLImage → CUDA
+    // Load the per-instance mask once (if present on CPU)
+    if (!st->mask_checked_once) {
+        st->mask_checked_once = true;
+        (void)load_mask_from_cpu_once(st); // soft-fail: simply no mask applied
+    }
+
+    // Map EGLImage → CUDA (expect NV12, pitched)
     CUgraphicsResource res=nullptr;
     if(cuGraphicsEGLRegisterImage(&res,image,CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE)!=CUDA_SUCCESS) return;
     CUeglFrame f{};
@@ -307,24 +415,21 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         dUV,                                  pitch,
         st->crop_frac,                        st->stream);
 
-    // 2.5) Wire removal (two-donor inpaint) — only if WIRE_ENABLE=1 AND a mask is active.
-    if (g_wire_enabled.load(std::memory_order_relaxed)) {
-        CUdeviceptr dMask = 0;
-        int         maskPitch = 0;
-        float       dx = 0.f, dy = 0.f;
-        uint32_t    ver = 0;
-        if (wire_author_get_active_mask(&dMask, &maskPitch, &dx, &dy, &ver)) {
+    // 2.5) Wire removal (two-donor inpaint) — only if mask is valid and belongs to this instance
+    if (st->mask.valid && st->mask.W == W && st->mask.H == H) {
+        const int my_idx = section_to_index(st->controls.section());
+        if (my_idx == st->mask.cam_index) {
             wire::apply_mask_shift_nv12(
                 dY,  pitch,
                 dUV, pitch,
                 W, H,
-                (const uint8_t*)(uintptr_t)dMask, maskPitch,
-                dx, dy,
+                (const uint8_t*)(uintptr_t)st->mask.dMask, (int)st->mask.pitch,
+                st->mask.dx, st->mask.dy,
                 st->stream);
-            if (ver != st->last_mask_version) {
-                fprintf(stderr, "[ic] applied device mask (version=%u, dx=%.2f, dy=%.2f)\n", ver, dx, dy);
-                st->last_mask_version = ver;
-            }
+            // fprintf(stderr, "[ic] mask applied to %s\n", st->controls.section().c_str());
+        } else {
+            // Mask was loaded for a different cam index → do nothing
+            // fprintf(stderr, "[ic] mask not for this instance (%s)\n", st->controls.section().c_str());
         }
     }
 
@@ -335,14 +440,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         dUV,     pitch,
         cp,
         st->stream);
-
-    // 4) Optional snapshot (only if authoring is enabled; otherwise skip)
-    if (g_wire_enabled.load(std::memory_order_relaxed)) {
-        wire_author_snapshot_nv12_if_needed(
-            dY,  pitch,
-            dUV, pitch,
-            W, H, st->stream);
-    }
 
     cudaStreamSynchronize(st->stream);
     cuGraphicsUnregisterResource(res);
@@ -361,32 +458,12 @@ extern "C" void init(CustomerFunction* f)
     // Ensure CUDA primary context retained
     std::call_once(g_ctx_once, retain_primary_context_once);
 
-    // Read process-wide enable flag and port from environment.
-    // Default: disabled (no bind, no inpaint).
-    bool enable = env_flag_true(std::getenv("WIRE_ENABLE"));
-    g_wire_enabled.store(enable, std::memory_order_relaxed);
-
-    uint16_t port = 5555;
-    if (const char* p = std::getenv("WIRE_PORT")) {
-        int v = atoi(p); if (v>0 && v<65536) port = (uint16_t)v;
-    }
-    g_wire_port = port;
-
-    if (enable) {
-        wire_author_start(g_primary_ctx /* may be null if retention failed */, g_wire_port);
-        fprintf(stderr, "[ic] wire author server ENABLED (port %u)\n", g_wire_port);
-    } else {
-        fprintf(stderr, "[ic] wire author server DISABLED (WIRE_ENABLE=0 or unset)\n");
-    }
+    // No authoring server here; mask is loaded once from CPU when the first frame arrives.
+    fprintf(stderr, "[ic] imagecorrection initialized (no built-in authoring server)\n");
 }
 
 extern "C" void deinit(void)
 {
-    if (g_wire_enabled.load(std::memory_order_relaxed)) {
-        wire_author_stop();
-        fprintf(stderr, "[ic] wire author server stopped\n");
-    }
-
     std::vector<ICPState*> to_free;
     {
         std::lock_guard<std::mutex> lk(g_instances_mtx);
@@ -395,7 +472,7 @@ extern "C" void deinit(void)
     for (auto* st : to_free) destroy_instance(st);
     release_primary_context();
 
-    // (opzionale) pulizia degli hint residui
+    // Clear any residual instance-binding hints
     ic_clear_instance_hints();
 }
 
@@ -411,5 +488,3 @@ extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
     }
     return 0; // not found yet
 }
-
-

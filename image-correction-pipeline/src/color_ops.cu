@@ -113,7 +113,7 @@ __global__ void toneSat_kernel(
     c01 = clamp(c01, -1.f, 1.f);
 
     c01 = fminf(c01, 0.97f);
-    t = scontrast_curve(t, c01);    // always smooth S-curve
+    t = scontrast_curve(t, -c01);    // always smooth S-curve
 
     // Global gamma
     t = powf(t, 1.0f / gamma);
