@@ -8,11 +8,27 @@
     "shadows": 0.0,
     "whites": 0.0,
     "gamma": 1.0,
+    "saturation": 1.0,
     "brightness": 0.0,
     "brilliance": 0.0,
-    "saturation": 1.0,
-    "sharpness": 0.0
+    "sharpness": 0.0,
+
+    "gesture": {
+      "enable": true,
+      "engine": "/home/jetson_ntc/gesture.engine",
+      "start_th": 0.80,
+      "stop_th": 0.80,
+      "streak": 3,
+      "mqtt": {
+        "host": "192.168.10.50",
+        "port": 1883,
+        "topic": "jetson/stream/cmd",
+        "user": "",
+        "pass": ""
+      }
+    }
   },
+
   "cam1": {
     "enable": true,
     "tv_range": true,
@@ -22,11 +38,13 @@
     "shadows": 0.0,
     "whites": 0.0,
     "gamma": 1.0,
+    "saturation": 1.0,
     "brightness": 0.0,
     "brilliance": 0.0,
-    "saturation": 1.0,
-    "sharpness": 0.0
+    "sharpness": 0.0,
+    "gesture": { "enable": false, "engine": "/home/jetson_ntc/gesture.engine" }
   },
+
   "cam2": {
     "enable": true,
     "tv_range": true,
@@ -36,9 +54,10 @@
     "shadows": 0.0,
     "whites": 0.0,
     "gamma": 1.0,
+    "saturation": 1.0,
     "brightness": 0.0,
     "brilliance": 0.0,
-    "saturation": 1.0,
-    "sharpness": 0.0
+    "sharpness": 0.0,
+    "gesture": { "enable": false, "engine": "/home/jetson_ntc/gesture.engine" }
   }
 }

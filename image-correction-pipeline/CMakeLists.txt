@@ -1,48 +1,41 @@
 # =============================================================================
 # CMake build script for the "image-correction-pipeline" project
 #
-# Builds a GStreamer "nvivafilter" plugin with CUDA support
-# for NVIDIA Jetson (cross-compiled from x86 host).
+# Builds a GStreamer "nvivafilter" plugin with CUDA support for Jetson.
 #
 # Produces:
 #   libnvivafilter_imagecorrection.so
-# Install path:
+# Install path (runtime):
 #   /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
-#
-# Sources:
-#   - kernel_rectify.cu  : fisheye undistortion
-#   - nvivafilter_imagecorrection.cpp : plugin integration
-#   - runtime_controls.cpp : JSON config hot-reload
 # =============================================================================
-
 
 cmake_minimum_required(VERSION 3.18)
 
 project(image_correction_pipeline LANGUAGES CXX CUDA)
 
-# ----------------------------------------------------------------------------- 
-# Force CUDA toolkit root (fix cross-build autodetect issues)
+# -----------------------------------------------------------------------------
+# CUDA toolkit root (helps cross-builds)
 # -----------------------------------------------------------------------------
 if(NOT DEFINED CUDA_TOOLKIT_ROOT_DIR)
     set(CUDA_TOOLKIT_ROOT_DIR /usr/local/cuda CACHE PATH "CUDA Toolkit root")
 endif()
 
-# Jetson Xavier/NX/Nano → Volta (sm_72)
-#set(CMAKE_CUDA_ARCHITECTURES 72 CACHE STRING "CUDA architectures")
-
-# Jetson Orin AGX → Volta (sm_87)
+# Jetson Orin (Ampere)
 set(CMAKE_CUDA_ARCHITECTURES 87 CACHE STRING "CUDA architectures")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Sources
 # -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
     src/wire_lineremoval.cu
-    src/color_ops.cu   
+    src/color_ops.cu
+    src/ei_gesture_infer.cu        # <<< NEW
 )
 
 set(CPP_SOURCES
@@ -55,10 +48,9 @@ add_library(nvivafilter_imagecorrection SHARED
     ${CPP_SOURCES}
 )
 
-
 set_source_files_properties(${CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Include directories
 # -----------------------------------------------------------------------------
 target_include_directories(nvivafilter_imagecorrection PRIVATE
@@ -70,9 +62,9 @@ target_include_directories(nvivafilter_imagecorrection PRIVATE
     ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu
 )
 
-# ----------------------------------------------------------------------------- 
-# Libraries
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
+# Core CUDA libraries
+# -----------------------------------------------------------------------------
 find_library(CUDART_LIBRARY cudart
     HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64
           ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
@@ -87,6 +79,29 @@ find_library(CUDA_DRIVER_LIBRARY cuda
           ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/tegra
 )
 
+# -----------------------------------------------------------------------------
+# TensorRT (headers + libs) — NO OpenCV
+# -----------------------------------------------------------------------------
+find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+    HINTS /usr/include /usr/include/aarch64-linux-gnu /l4t/targetfs/usr/include/aarch64-linux-gnu
+)
+find_library(TENSORRT_LIB nvinfer
+    HINTS /usr/lib /usr/lib/aarch64-linux-gnu /l4t/targetfs/usr/lib/aarch64-linux-gnu
+)
+find_library(TENSORRT_PLUGIN_LIB nvinfer_plugin
+    HINTS /usr/lib /usr/lib/aarch64-linux-gnu /l4t/targetfs/usr/lib/aarch64-linux-gnu
+)
+if (NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_LIB)
+    message(FATAL_ERROR "TensorRT not found. Set TENSORRT_INCLUDE_DIR/TENSORRT_LIB.")
+endif()
+
+target_include_directories(nvivafilter_imagecorrection PRIVATE
+    ${TENSORRT_INCLUDE_DIR}
+)
+
+# -----------------------------------------------------------------------------
+# System libs
+# -----------------------------------------------------------------------------
 find_library(LIB_EGL EGL HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
 find_library(LIB_X11 X11 HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
 find_library(LIB_XEXT Xext HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
@@ -98,7 +113,9 @@ find_library(LIB_DL dl HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
 
 target_link_libraries(nvivafilter_imagecorrection
     ${CUDART_LIBRARY}
-    ${CUDA_DRIVER_LIBRARY}   
+    ${CUDA_DRIVER_LIBRARY}
+    ${TENSORRT_LIB}
+    ${TENSORRT_PLUGIN_LIB}
     ${LIB_X11}
     ${LIB_XEXT}
     ${LIB_BSD}
@@ -108,8 +125,8 @@ target_link_libraries(nvivafilter_imagecorrection
     ${LIB_DL}
 )
 
-# ----------------------------------------------------------------------------- 
-# Sysroot library paths
+# -----------------------------------------------------------------------------
+# Linker search paths for sysroot + CUDA
 # -----------------------------------------------------------------------------
 target_link_options(nvivafilter_imagecorrection PRIVATE
     -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
@@ -118,7 +135,21 @@ target_link_options(nvivafilter_imagecorrection PRIVATE
     -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
 )
 
-# ----------------------------------------------------------------------------- 
+# Keep RPATH so runtime finds TRT on Jetson
+set_target_properties(nvivafilter_imagecorrection PROPERTIES
+    BUILD_RPATH "/usr/lib/aarch64-linux-gnu"
+    INSTALL_RPATH "/usr/lib/aarch64-linux-gnu"
+)
+
+# -----------------------------------------------------------------------------
+# Compile options — fix ptxas spillover (-Xptxas=-O3)
+# -----------------------------------------------------------------------------
+target_compile_options(nvivafilter_imagecorrection PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3 -DNDEBUG -Wall -Wextra>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -Xptxas=-O3 --expt-relaxed-constexpr>
+)
+
+# -----------------------------------------------------------------------------
 # Install
 # -----------------------------------------------------------------------------
 install(TARGETS nvivafilter_imagecorrection
