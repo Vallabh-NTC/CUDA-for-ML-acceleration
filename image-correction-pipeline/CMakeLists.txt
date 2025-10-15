@@ -1,32 +1,45 @@
 # =============================================================================
 # CMake build script for the "image-correction-pipeline" project
-# Builds a GStreamer "nvivafilter" plugin with CUDA support.
-# Works on host (x86_64) and for Jetson cross-compile (aarch64).
+#
+# Builds a GStreamer "nvivafilter" plugin with CUDA support
+# for NVIDIA Jetson (cross-compiled from x86 host).
+#
+# Produces:
+#   libnvivafilter_imagecorrection.so
+# Install path:
+#   /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
+#
+# Sources:
+#   - kernel_rectify.cu           : fisheye undistortion
+#   - wire_lineremoval.cu         : optional wire inpaint
+#   - color_ops.cu                : tone/color
+#   - nvivafilter_imagecorrection.cpp : plugin integration
+#   - runtime_controls.cpp        : JSON config hot-reload
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.18)
 project(image_correction_pipeline LANGUAGES CXX CUDA)
 
-# ---- Options ----------------------------------------------------------------
-option(HOST_BUILD "Build on host x86_64 without Jetson sysroot" OFF)
-
-# Force/assume CUDA toolkit root if not provided
+# ----------------------------------------------------------------------------- 
+# CUDA toolkit root
+# -----------------------------------------------------------------------------
 if(NOT DEFINED CUDA_TOOLKIT_ROOT_DIR)
     set(CUDA_TOOLKIT_ROOT_DIR /usr/local/cuda CACHE PATH "CUDA Toolkit root")
 endif()
 
-# Respect user-provided arch; default to GT1030 (sm_61) for quick host tests
+# GPU arch: respect caller; default to 87 (Orin) if not set
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 61 CACHE STRING "CUDA architectures")
+    set(CMAKE_CUDA_ARCHITECTURES 87 CACHE STRING "CUDA architectures")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-# ---- Sources ----------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
+# Sources
+# -----------------------------------------------------------------------------
 set(CUDA_SOURCES
     src/kernel_rectify.cu
-    src/wire_author_server.cu
     src/wire_lineremoval.cu
     src/color_ops.cu
 )
@@ -40,183 +53,102 @@ add_library(nvivafilter_imagecorrection SHARED
     ${CUDA_SOURCES}
     ${CPP_SOURCES}
 )
+
 set_source_files_properties(${CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
 
-# ---- Profiling-friendly compile flags  -----
-# Keep CPU call stacks and CUDA line mapping visible in Nsight Systems.
+# ----------------------------------------------------------------------------- 
+# Profiling-friendly flags (NVTX/range visibility)
+# -----------------------------------------------------------------------------
 target_compile_options(nvivafilter_imagecorrection PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     $<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-fno-omit-frame-pointer>
 )
-
-# Ensure NVTX markers are compiled in
 target_compile_definitions(nvivafilter_imagecorrection PRIVATE NVTX_ENABLE=1)
 
-# ---- Include directories -----------------------------------------------------
+# ----------------------------------------------------------------------------- 
+# Include directories
+# -----------------------------------------------------------------------------
 target_include_directories(nvivafilter_imagecorrection PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    /l4t/targetfs/usr/src/jetson_multimedia_api/include
     ${CUDA_TOOLKIT_ROOT_DIR}/include
+    ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/include
+    ${CMAKE_SYSROOT}/usr/include
+    ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu
 )
 
-# Only add Jetson/sysroot includes when cross-compiling
-if(NOT HOST_BUILD)
-    target_include_directories(nvivafilter_imagecorrection PRIVATE
-        /l4t/targetfs/usr/src/jetson_multimedia_api/include
-        ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/include
-        ${CMAKE_SYSROOT}/usr/include
-        ${CMAKE_SYSROOT}/usr/include/aarch64-linux-gnu
-    )
-endif()
-
-# ---- Libraries ---------------------------------------------------------------
-# CUDA runtime/driver (host first)
+# ----------------------------------------------------------------------------- 
+# Libraries
+# -----------------------------------------------------------------------------
 find_library(CUDART_LIBRARY cudart
     HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
+          ${CMAKE_SYSROOT}/usr/local/cuda/lib64
 )
 find_library(CUDA_DRIVER_LIBRARY cuda
     HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
+          ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/tegra
 )
 
 # NVTX (nvToolsExt) — used by nvtxRangePush/Pop
-# Host first:
 find_library(NVTOOLSEXT_LIBRARY nvToolsExt
     HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
+          ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
+          ${CMAKE_SYSROOT}/usr/local/cuda/lib64
+          ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
 )
 
-# If cross-compiling, also search aarch64 locations
-if(NOT HOST_BUILD AND NOT NVTOOLSEXT_LIBRARY)
-    find_library(NVTOOLSEXT_LIBRARY nvToolsExt
-        HINTS
-            ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
-            ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
-            ${CMAKE_SYSROOT}/usr/local/cuda/lib64
-            ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
-    )
-endif()
+find_library(LIB_EGL EGL HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_X11 X11 HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_XEXT Xext HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_BSD bsd HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_RT rt HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_PTHREAD pthread HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_M m HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
+find_library(LIB_DL dl HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
 
+target_link_libraries(nvivafilter_imagecorrection
+    ${CUDART_LIBRARY}
+    ${CUDA_DRIVER_LIBRARY}
+    ${LIB_X11}
+    ${LIB_XEXT}
+    ${LIB_BSD}
+    ${LIB_RT}
+    ${LIB_PTHREAD}
+    ${LIB_M}
+    ${LIB_DL}
+)
+
+# Link NVTX if found (for your NVTX v3 ranges)
 if(NVTOOLSEXT_LIBRARY)
     target_link_libraries(nvivafilter_imagecorrection PRIVATE ${NVTOOLSEXT_LIBRARY})
 else()
-    message(WARNING "nvToolsExt (NVTX) not found — NVTX markers will not link. \
-Ensure CUDA Toolkit is present in the sysroot/host and try again.")
+    message(WARNING "nvToolsExt (NVTX) not found — NVTX ranges will not link.")
 endif()
 
-# If cross-compiling and not found yet, look in sysroot/targets too
-if(NOT HOST_BUILD)
-    if(NOT CUDART_LIBRARY)
-        find_library(CUDART_LIBRARY cudart
-            HINTS ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
-                  ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
-                  ${CMAKE_SYSROOT}/usr/local/cuda/lib64
-        )
-    endif()
-    if(NOT CUDA_DRIVER_LIBRARY)
-        find_library(CUDA_DRIVER_LIBRARY cuda
-            HINTS ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
-                  ${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
-                  ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu/tegra
-        )
-    endif()
-endif()
-
-# POSIX/common
-find_package(Threads REQUIRED)
-find_library(LIB_DL dl)
-find_library(LIB_M m)
-find_library(LIB_RT rt)
-
-# Windowing/libs:
-if(HOST_BUILD)
-    # On desktop: try to use system packages; all are OPTIONAL
-    find_package(X11 QUIET)          # Provides X11::X11 and X11::Xext if found
-    find_library(LIB_EGL EGL)        # Optional
-    find_library(LIB_BSD bsd)        # Optional (libbsd-dev)
-else()
-    # On Jetson/sysroot: look explicitly in aarch64 paths
-    find_library(LIB_EGL EGL HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
-    find_library(LIB_X11 X11 HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
-    find_library(LIB_XEXT Xext HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
-    find_library(LIB_BSD bsd HINTS ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu)
-endif()
-
-# ---- Link --------------------------------------------------------------------
-target_link_libraries(nvivafilter_imagecorrection
-    PRIVATE
-        ${CUDART_LIBRARY}
-        ${CUDA_DRIVER_LIBRARY}
-        Threads::Threads
+# ----------------------------------------------------------------------------- 
+# Sysroot library paths
+# -----------------------------------------------------------------------------
+target_link_options(nvivafilter_imagecorrection PRIVATE
+    -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
+    -L${CMAKE_SYSROOT}/lib/aarch64-linux-gnu
+    -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
+    -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
 )
 
-# Host: link optional desktop libs only if found
-if(HOST_BUILD)
-    if(TARGET X11::X11)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE X11::X11)
-    endif()
-    if(TARGET X11::Xext)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE X11::Xext)
-    endif()
-    if(LIB_EGL)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_EGL})
-    endif()
-    if(LIB_BSD)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_BSD})
-    endif()
-    if(LIB_RT)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_RT})
-    endif()
-    if(LIB_M)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_M})
-    endif()
-    if(LIB_DL)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_DL})
-    endif()
-else()
-    # Cross-compile: assume these exist in sysroot
-    if(LIB_X11)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_X11})
-    endif()
-    if(LIB_XEXT)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_XEXT})
-    endif()
-    if(LIB_BSD)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_BSD})
-    endif()
-    if(LIB_RT)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_RT})
-    endif()
-    if(LIB_M)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_M})
-    endif()
-    if(LIB_DL)
-        target_link_libraries(nvivafilter_imagecorrection PRIVATE ${LIB_DL})
-    endif()
-endif()
+# ----------------------------------------------------------------------------- 
+# Install
+# -----------------------------------------------------------------------------
+install(TARGETS nvivafilter_imagecorrection
+    LIBRARY DESTINATION lib/aarch64-linux-gnu/gstreamer-1.0/
+)
 
-# ---- Sysroot link paths (only for cross) ------------------------------------
-if(NOT HOST_BUILD)
-    target_link_options(nvivafilter_imagecorrection PRIVATE
-        -L${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
-        -L${CMAKE_SYSROOT}/lib/aarch64-linux-gnu
-        -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
-        -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib/stubs
-    )
-endif()
-
-# ---- Install (Jetson layout only when cross) --------------------------------
-if(NOT HOST_BUILD)
-    install(TARGETS nvivafilter_imagecorrection
-        LIBRARY DESTINATION lib/aarch64-linux-gnu/gstreamer-1.0/
-    )
-endif()
-
-# NEW: Deployment folder & run scripts
-# ========================= Deploy folder & run scripts =========================
-# Creates: build/image-correction-pipeline/deploy/
-#   - libnvivafilter_imagecorrection.so
-#   - run.sh
-#   - run_profile.sh
-
-# Where to stage deploy artifacts (on x86 build host)
+# ========================= Deploy folder & run scripts ========================
+# Creates: build/.../deploy/{libnvivafilter_imagecorrection.so, run.sh, run_profile.sh)
 set(DEPLOY_DIR "${CMAKE_CURRENT_BINARY_DIR}/deploy")
 file(MAKE_DIRECTORY "${DEPLOY_DIR}")
 
@@ -241,12 +173,10 @@ file(APPEND "${RUN_SH}" ": \${WIDTH:=1920}\n")
 file(APPEND "${RUN_SH}" ": \${HEIGHT:=1080}\n")
 file(APPEND "${RUN_SH}" ": \${FPS:=30}\n")
 file(APPEND "${RUN_SH}" ": \${BITRATE:=12000000}\n")
-# NEW: default sensor id
 file(APPEND "${RUN_SH}" ": \${SENSOR_ID:=0}\n")
 file(APPEND "${RUN_SH}" "echo \"→ Using SO: $SO\" >&2\n")
 file(APPEND "${RUN_SH}" "echo \"→ Camera sensor-id=\${SENSOR_ID} → \${HOST_IP}:\${HOST_PORT} (\${WIDTH}x\${HEIGHT}@\${FPS})\" >&2\n")
 file(APPEND "${RUN_SH}" "exec gst-launch-1.0 -e -v \\\n")
-# NEW: pass sensor-id into nvarguscamerasrc
 file(APPEND "${RUN_SH}" "  nvarguscamerasrc sensor-id=\${SENSOR_ID} ! \\\n")
 file(APPEND "${RUN_SH}" "  \"video/x-raw(memory:NVMM),format=NV12,width=\${WIDTH},height=\${HEIGHT},framerate=\${FPS}/1\" ! \\\n")
 file(APPEND "${RUN_SH}" "  nvivafilter customer-lib-name=$SO pre-process=false cuda-process=true post-process=false ! \\\n")
