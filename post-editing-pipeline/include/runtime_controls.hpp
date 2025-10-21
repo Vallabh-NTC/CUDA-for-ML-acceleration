@@ -7,7 +7,7 @@ namespace pe {
 
 class RuntimeControls {
 public:
-    explicit RuntimeControls(std::string path = "/home/jetson_ntc/editor.json");
+    explicit RuntimeControls(std::string path = "/home/moviemaker/editor.json");
 
     
     icp::ColorParams current();
