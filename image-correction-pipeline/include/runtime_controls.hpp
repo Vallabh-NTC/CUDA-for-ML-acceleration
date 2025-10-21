@@ -5,7 +5,7 @@
 
 namespace icp {
 
-/**
+
  * Minimal file watcher + flat-or-sectioned JSON reader. No external deps.
  * - path_: JSON file path (default: /home/jetson_ntc/config.json).
  * - section_: "cam0", "cam1", "cam2" or "" (flat JSON mode).
@@ -14,7 +14,7 @@ namespace icp {
 class RuntimeControls {
 public:
     // section: "cam0", "cam1", "cam2" or "" (flat JSON mode)
-    explicit RuntimeControls(std::string path = "/home/jetson_ntc/config.json",
+    explicit RuntimeControls(std::string path = "/home/moviemaker/config.json",
                              std::string section = "");
 
     // Check mtime (nanosecond precision when available) and hot-reload

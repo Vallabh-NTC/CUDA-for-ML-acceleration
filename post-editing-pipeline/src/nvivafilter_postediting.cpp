@@ -11,7 +11,7 @@ namespace {
 struct State {
     CUcontext     ctx   = nullptr;   // primary
     cudaStream_t  stream= nullptr;
-    pe::RuntimeControls controls{"/home/jetson_ntc/editor.json"};
+    pe::RuntimeControls controls{"/home/moviemaker/editor.json"};
 };
 static State g; 
 
