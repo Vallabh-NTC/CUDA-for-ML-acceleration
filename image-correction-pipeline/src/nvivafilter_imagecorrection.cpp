@@ -1,27 +1,12 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * @brief GStreamer `nvivafilter` plugin: fisheye rectification → crop → (optional) wire removal inpaint → tone/color.
+ * @brief GStreamer `nvivafilter` plugin: fisheye rectification → (optional) wire inpaint
+ *        → gesture inference (cam1 only) → tone/color.
  *
- * This version **removes** any built-in authoring/network server. The mask is
- * produced by an external process and saved on CPU as:
- *   - /dev/shm/wire_mask_camN.raw  (W*H bytes, 8-bit)
- *   - /dev/shm/wire_mask_camN.meta (single line: "W H dx dy")
- *
- * At the first frame of each instance, the .so loads the mask **once** for the
- * instance's section (cam0|cam1|cam2). At runtime the mask is applied **only**
- * if:
- *   - a valid device mask was loaded,
- *   - the current frame resolution matches the mask resolution,
- *   - the instance section index (0/1/2) equals the mask's cam index N.
- *
- * Examples:
- *   instance = cam0, mask files are "cam0" → apply
- *   instance = cam0, mask files are "cam2" → do NOT apply
- *
- * Typical pipeline:
- *   gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection_cam0.so ...
- *   gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection_cam1.so ...
- *   gst-launch-1.0 ... nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection_cam2.so ...
+ * - NV12 in/out (pitched), CUDA primary context shared across instances.
+ * - Runtime color controls hot-reload from JSON section "cam0|cam1|cam2".
+ * - Per-instance wire mask loaded once from /dev/shm/wire_mask_camN.{raw,meta}.
+ * - Gesture inference (TensorRT) runs ONLY for the cam1-bound instance, prints start/stop.
  */
 
 #include <cstdio>
@@ -35,8 +20,8 @@
 #include <vector>
 #include <deque>
 #include <cmath>
-#include <dlfcn.h>     // dladdr
-#include <cctype>      // std::tolower
+#include <dlfcn.h>
+#include <cctype>
 #include <atomic>
 
 #include <cuda.h>
@@ -48,14 +33,18 @@
 #include "kernel_rectify.cuh"
 #include "color_ops.cuh"
 #include "runtime_controls.hpp"
-
-// Wire removal kernel (two-donor NV12 inpaint)
 #include "wire_lineremoval.cuh"
+
+#include "trt_gesture.hpp"
+#include "ei_gesture_infer.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 constexpr float M_PI_F = static_cast<float>(M_PI);
+
+// Path to the TensorRT engine
+static const char* kGestureEnginePath = "/home/moviemaker/gesture_recog.engine";
 
 // ============================================================================
 // Global CUDA primary context (shared across instances)
@@ -95,7 +84,7 @@ static std::string to_lower(std::string s) {
     return s;
 }
 
-// Determine "cam0|cam1|cam2" from the loaded .so name
+// Determine "cam0|cam1|cam2" from the loaded .so name (or a parent folder)
 static std::string section_from_loaded_name()
 {
     Dl_info info{};
@@ -136,7 +125,7 @@ struct ICPState {
     CUcontext     ctx   = nullptr;
     cudaStream_t  stream= nullptr;
 
-    // Scratch (NV12)
+    // Scratch (NV12) for rectification
     CUdeviceptr sY = 0, sUV = 0;
     size_t      pY = 0, pUV = 0;
     int         sW = 0, sH = 0;
@@ -144,13 +133,13 @@ struct ICPState {
     // Geometry (fisheye rectification)
     icp::RectifyConfig cfg{};
 
-    // Runtime controls (hot-reload) bound to section decided at create_instance()
+    // Runtime controls (hot-reload)
     icp::RuntimeControls controls{"/home/moviemaker/config.json", "cam0"};
 
-    // Post-rectification center crop/zoom
+    // Post-rectification center crop/zoom (declared in headers, not implemented here)
     float crop_frac = 0.0f;
 
-    // --- NEW: per-instance, device-resident mask loaded once from CPU ---
+    // Per-instance, device-resident mask loaded once from CPU
     struct DeviceMask {
         CUdeviceptr dMask = 0;   // 8-bit mask on device
         size_t      pitch = 0;   // bytes per row for mask
@@ -159,19 +148,24 @@ struct ICPState {
         bool        valid = false;
         int         cam_index = -1; // 0/1/2 corresponding to the files used
     } mask{};
-    bool mask_checked_once = false; // ensures we attempt loading only once
+    bool mask_checked_once = false;
 
-    // Track last-applied mask version (kept for parity with older logs, unused)
+    // Gesture NN (TensorRT), only used on cam1
+    trt::Engine gesture;
+    bool gesture_loaded_once = false;
+
+    // (optional) last mask version (not used)
     uint32_t last_mask_version = 0;
 };
 
 static std::mutex              g_instances_mtx;
 static std::vector<ICPState*>  g_instances;
 
-// --- per-instance section hints (queue consumed by create_instance) ----
+// Per-instance section hints (consumed by create_instance)
 static std::mutex              g_hint_mtx;
 static std::deque<std::string> g_next_section_hints;
 
+// ---- OPTIONAL host hint API -------------------------------------------------
 extern "C" void ic_bind_next_instance_to(const char* section /* "cam0|cam1|cam2" */) {
     if (!section || !*section) return;
     std::string s = to_lower(section);
@@ -184,6 +178,17 @@ extern "C" void ic_clear_instance_hints() {
     std::lock_guard<std::mutex> lk(g_hint_mtx);
     g_next_section_hints.clear();
 }
+
+extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
+    if (!section || !*section) return 0;
+    std::lock_guard<std::mutex> lk(g_instances_mtx);
+    for (auto* st : g_instances) {
+        if (!st) continue;
+        if (st->controls.section() == section) return 1;
+    }
+    return 0;
+}
+// -----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
 // Alloc helpers
@@ -236,7 +241,6 @@ static bool load_mask_from_cpu_once(ICPState* st)
     // Read META: "W H dx dy"
     FILE* fm = fopen(meta.c_str(), "r");
     if (!fm) {
-        // Not an error: absence of mask simply means "do not apply"
         fprintf(stderr, "[ic] mask: meta not found for %s (skipping)\n", sec.c_str());
         return false;
     }
@@ -296,6 +300,27 @@ static bool load_mask_from_cpu_once(ICPState* st)
 }
 
 // ----------------------------------------------------------------------------
+// Gesture helper: lazy-load engine only for cam1
+// ----------------------------------------------------------------------------
+static void ensure_gesture_loaded_for_cam1(ICPState* st)
+{
+    if (st->gesture_loaded_once) return;
+    st->gesture_loaded_once = true;
+
+    if (st->controls.section() != std::string("cam1")) {
+        fprintf(stderr, "[ic] gesture: skipped (section is '%s', only cam1 runs it)\n",
+                st->controls.section().c_str());
+        return;
+    }
+
+    if (!st->gesture.load_from_file(kGestureEnginePath, st->stream)) {
+        fprintf(stderr, "[ic] gesture: load failed (path=%s)\n", kGestureEnginePath);
+    } else {
+        fprintf(stderr, "[ic] gesture: ready (path=%s)\n", kGestureEnginePath);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Instance allocation / destruction
 // ----------------------------------------------------------------------------
 static ICPState* create_instance()
@@ -343,7 +368,9 @@ static void destroy_instance(ICPState* st)
     if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
 
     if (st->mask.dMask) { cuMemFree(st->mask.dMask); st->mask.dMask = 0; }
-    st->mask = {}; // reset
+    st->mask = {};
+
+    st->gesture.destroy();
 
     if (st->stream) { cudaStreamDestroy(st->stream); st->stream = nullptr; }
     st->ctx = nullptr;
@@ -383,38 +410,32 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     uint8_t* dUV = static_cast<uint8_t*>(f.frame.pPitch[1]);
     const int W = (int)f.width, H=(int)f.height, pitch=(int)f.pitch;
 
-    // Scratch
+    // Scratch for rectification textures
     ensure_scratch(st, W, H);
 
-    // -------------------- RECTIFICATION GEOMETRY (UPDATED FOR 4K) --------------------
-    // Keep equidistant model (r = f_fish * theta). We:
-    // 1) scale the fisheye circle (cx_f, cy_f, r_f) from a 1080p reference to runtime 4K,
-    // 2) anchor f_fish to the measured center resolution (px/deg) at 4K.
-
+    // -------------------- Rectification geometry --------------------
     icp::RectifyConfig cfg = st->cfg;
 
-    // (1) Scale fisheye circle from 1080p reference → runtime (here W=3840, H=2160)
+    // Scale fisheye circle from 1080p reference → runtime
     constexpr float REF_W_1080 = 1920.f;
     constexpr float REF_H_1080 = 1080.f;
-    const float sx_1080 = (float)W / REF_W_1080;   // = 2.0 at 3840
-    const float sy_1080 = (float)H / REF_H_1080;   // = 2.0 at 2160
+    const float sx_1080 = (float)W / REF_W_1080;
+    const float sy_1080 = (float)H / REF_H_1080;
 
-    // Scaled circle center and radius at 4K
-    const float cx_f = cfg.cx_f * sx_1080;                     // ≈ 959.50 * 2 = 1919.0
-    const float cy_f = cfg.cy_f * sy_1080;                     // ≈ 539.50 * 2 = 1079.0
-    const float r_f  = cfg.r_f  * 0.5f * (sx_1080 + sy_1080);  // ≈ 1100.77 * 2 = 2201.54
+    const float cx_f = cfg.cx_f * sx_1080;
+    const float cy_f = cfg.cy_f * sy_1080;
+    const float r_f  = cfg.r_f  * 0.5f * (sx_1080 + sy_1080);
 
-    // (2) f_fish from center px/deg @ 4K table (32.38 px/deg)
-    // px/deg → px/rad  (multiply by 180/π). At 3840×2160, no extra scaling is needed.
-    constexpr float K_PX_PER_DEG_CENTER = 32.38f;                         // table value @ 4K
-    const float f_fish = K_PX_PER_DEG_CENTER * (180.0f / (float)M_PI_F);  // ≈ 1855.2373 px/rad
+    // Equidistant focal (px/rad) using 4K px/deg center value
+    constexpr float K_PX_PER_DEG_CENTER = 32.38f;
+    const float f_fish = K_PX_PER_DEG_CENTER * (180.0f / (float)M_PI_F);
 
-    // Perspective intrinsics for the rectified target HFOV (unchanged)
+    // Perspective intrinsics for the rectified target HFOV
     const float fx      = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI_F / 360.f);
     const float cx_rect = W * 0.5f;
     const float cy_rect = H * 0.5f;
 
-    // 1) Rectification
+    // 1) Rectification (src → dst in-place)
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
     icp::launch_rectify_nv12(
         (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
@@ -425,7 +446,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
 
-    // 2.5) Wire removal (two-donor inpaint) — only if mask is valid and belongs to this instance
+    // 2) Wire removal (two-donor inpaint) — only if mask is valid and belongs to this instance
     if (st->mask.valid && st->mask.W == W && st->mask.H == H) {
         const int my_idx = section_to_index(st->controls.section());
         if (my_idx == st->mask.cam_index) {
@@ -436,10 +457,28 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                 (const uint8_t*)(uintptr_t)st->mask.dMask, (int)st->mask.pitch,
                 st->mask.dx, st->mask.dy,
                 st->stream);
-            // fprintf(stderr, "[ic] mask applied to %s\n", st->controls.section().c_str());
-        } else {
-            // Mask was loaded for a different cam index → do nothing
-            // fprintf(stderr, "[ic] mask not for this instance (%s)\n", st->controls.section().c_str());
+        }
+    }
+
+    // 2.8) Gesture inference (ONLY for cam1): run on rectified luminance
+    ensure_gesture_loaded_for_cam1(st);
+    if (st->gesture.engine) { // engine loaded only when section == cam1
+        if (st->gesture.infer_from_nv12_y(dY, W, H, pitch, st->stream)) {
+            float start_logit=0.f, stop_logit=0.f, p_start=0.f, p_stop=0.f;
+            int top=-1;
+            if (st->gesture.get_start_stop(start_logit, stop_logit, p_start, p_stop, top)) {
+                const char* top_lbl = (top==0) ? "start" : "stop";
+                fprintf(stderr,
+                    "[gesture][%s] start=%.3f stop=%.3f | p_start=%.3f p_stop=%.3f | top=%s\n",
+                    st->controls.section().c_str(),
+                    start_logit, stop_logit, p_start, p_stop, top_lbl);
+            } else {
+                // Fallback: generic top-1 if output isn't 2-wide
+                float p = 0.f;
+                int cls = st->gesture.top1(&p);
+                fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
+                        st->controls.section().c_str(), cls, p);
+            }
         }
     }
 
@@ -468,8 +507,7 @@ extern "C" void init(CustomerFunction* f)
     // Ensure CUDA primary context retained
     std::call_once(g_ctx_once, retain_primary_context_once);
 
-    // No authoring server here; mask is loaded once from CPU when the first frame arrives.
-    fprintf(stderr, "[ic] imagecorrection initialized (no built-in authoring server)\n");
+    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1)\n");
 }
 
 extern "C" void deinit(void)
@@ -484,17 +522,4 @@ extern "C" void deinit(void)
 
     // Clear any residual instance-binding hints
     ic_clear_instance_hints();
-}
-
-// ============================================================================
-// OPTIONAL HOST-QUERY API (used by the host app to fence instance binding)
-// ============================================================================
-extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
-    if (!section || !*section) return 0;
-    std::lock_guard<std::mutex> lk(g_instances_mtx);
-    for (auto* st : g_instances) {
-        if (!st) continue;
-        if (st->controls.section() == section) return 1; // found a bound instance
-    }
-    return 0; // not found yet
 }
