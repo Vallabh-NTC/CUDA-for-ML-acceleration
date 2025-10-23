@@ -1,12 +1,8 @@
 /**
  * @file kernel_rectify.cuh
  * @brief CUDA interfaces for:
- *   1) fisheye rectification (NV12 → NV12)
+ *   1) fisheye rectification (NV12 → NV12, equidistant model r = f_fish * theta)
  *   2) post-rectification center-crop/zoom (NV12 → NV12, same size)
- *
- * Notes:
- *   - Equidistant fisheye projection model for rectification.
- *   - Crop works in the rectified (perspective) domain and keeps output size.
  */
 
 #pragma once
@@ -17,14 +13,16 @@ namespace icp {
 
 /**
  * @brief Launch CUDA kernel for fisheye rectification (NV12 → NV12).
+ * Equidistant projection: r = f_fish * theta.
  */
 void launch_rectify_nv12(
     const uint8_t* d_src_y,  int src_w, int src_h, int src_pitch_y,
     const uint8_t* d_src_uv,                   int src_pitch_uv,
     uint8_t* d_dst_y,        int dst_w, int dst_h, int dst_pitch_y,
     uint8_t* d_dst_uv,                       int dst_pitch_uv,
-    // Geometry parameters
+    // Geometry parameters (fisheye image circle on source)
     float cx_f, float cy_f, float r_f,
+    // Projection params
     float f_fish, float fx, float cx_rect, float cy_rect,
     cudaStream_t stream);
 

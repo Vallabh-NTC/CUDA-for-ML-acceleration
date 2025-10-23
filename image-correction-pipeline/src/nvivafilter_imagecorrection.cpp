@@ -145,10 +145,10 @@ struct ICPState {
     icp::RectifyConfig cfg{};
 
     // Runtime controls (hot-reload) bound to section decided at create_instance()
-    icp::RuntimeControls controls{"/home/jetson_ntc/config.json", "cam0"};
+    icp::RuntimeControls controls{"/home/moviemaker/config.json", "cam0"};
 
     // Post-rectification center crop/zoom
-    float crop_frac = 0.20f;
+    float crop_frac = 0.0f;
 
     // --- NEW: per-instance, device-resident mask loaded once from CPU ---
     struct DeviceMask {
@@ -386,14 +386,33 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     // Scratch
     ensure_scratch(st, W, H);
 
-    // Geometry
+    // -------------------- RECTIFICATION GEOMETRY (UPDATED FOR 4K) --------------------
+    // Keep equidistant model (r = f_fish * theta). We:
+    // 1) scale the fisheye circle (cx_f, cy_f, r_f) from a 1080p reference to runtime 4K,
+    // 2) anchor f_fish to the measured center resolution (px/deg) at 4K.
+
     icp::RectifyConfig cfg = st->cfg;
 
-    const float FOV_fish = cfg.fish_fov_deg * (float)M_PI_F / 180.f;
-    const float f_fish   = cfg.r_f / (FOV_fish * 0.5f);
-    const float fx       = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI_F / 360.f);
-    const float cx_rect  = W * 0.5f;
-    const float cy_rect  = H * 0.5f;
+    // (1) Scale fisheye circle from 1080p reference → runtime (here W=3840, H=2160)
+    constexpr float REF_W_1080 = 1920.f;
+    constexpr float REF_H_1080 = 1080.f;
+    const float sx_1080 = (float)W / REF_W_1080;   // = 2.0 at 3840
+    const float sy_1080 = (float)H / REF_H_1080;   // = 2.0 at 2160
+
+    // Scaled circle center and radius at 4K
+    const float cx_f = cfg.cx_f * sx_1080;                     // ≈ 959.50 * 2 = 1919.0
+    const float cy_f = cfg.cy_f * sy_1080;                     // ≈ 539.50 * 2 = 1079.0
+    const float r_f  = cfg.r_f  * 0.5f * (sx_1080 + sy_1080);  // ≈ 1100.77 * 2 = 2201.54
+
+    // (2) f_fish from center px/deg @ 4K table (32.38 px/deg)
+    // px/deg → px/rad  (multiply by 180/π). At 3840×2160, no extra scaling is needed.
+    constexpr float K_PX_PER_DEG_CENTER = 32.38f;                         // table value @ 4K
+    const float f_fish = K_PX_PER_DEG_CENTER * (180.0f / (float)M_PI_F);  // ≈ 1855.2373 px/rad
+
+    // Perspective intrinsics for the rectified target HFOV (unchanged)
+    const float fx      = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI_F / 360.f);
+    const float cx_rect = W * 0.5f;
+    const float cy_rect = H * 0.5f;
 
     // 1) Rectification
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
@@ -402,18 +421,9 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
         dY, W,H,pitch,
         dUV, pitch,
-        cfg.cx_f, cfg.cy_f, cfg.r_f,
+        cx_f, cy_f, r_f,
         f_fish, fx, cx_rect, cy_rect,
         st->stream);
-
-    // 2) Center crop/zoom
-    copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
-    icp::launch_crop_center_nv12(
-        (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
-        (const uint8_t*)(uintptr_t)st->sUV, (int)st->pUV,
-        dY,                                   pitch,
-        dUV,                                  pitch,
-        st->crop_frac,                        st->stream);
 
     // 2.5) Wire removal (two-donor inpaint) — only if mask is valid and belongs to this instance
     if (st->mask.valid && st->mask.W == W && st->mask.H == H) {

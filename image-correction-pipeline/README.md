@@ -120,7 +120,7 @@ cmake -S . -B build \
 cmake --build build -j"$(nproc)" --verbose
 
 # Verify
-file build/image-correction-pipeline/libnvivafilter_rectify.so
+file build/image-correction-pipeline/libnvivafilter_imagecorrection.so
 aarch64-linux-gnu-objdump -p build/image-correction-pipeline/lib
 
 # Deployment on Jetson Xavier
@@ -133,7 +133,21 @@ scp build/image-correction-pipeline/libnvivafilter_rectify.so jetson@<JETSON_IP>
 
 Run this on the Jetson Xavier to capture from the CSI camera, apply image correction, encode to H.264, and stream via UDP:
 
- gst-launch-1.0 -e -v   nvarguscamerasrc ! 'video/x-raw(memory:NVMM),format=NV12,width=1920,height=1080,framerate=30/1'   ! nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so pre-process=false cuda-process=true post-process=false   ! 'video/x-raw(memory:NVMM),format=NV12'   ! nvv4l2h264enc bitrate=12000000 insert-sps-pps=true idrinterval=30 preset-level=4   ! h264parse ! rtph264pay pt=96 config-interval=1   ! udpsink host=192.168.10.201 port=5000 sync=false async=false
+gst-launch-1.0 -e -v \
+  nvarguscamerasrc sensor-id=0 ! \
+  'video/x-raw(memory:NVMM),format=NV12,width=3840,height=2160,framerate=30/1' ! \
+  queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
+  nvivafilter customer-lib-name=/usr/local/lib/nvivafilter/libnvivafilter_imagecorrection.so \
+             pre-process=false cuda-process=true post-process=false ! \
+  'video/x-raw(memory:NVMM),format=NV12' ! \
+  queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
+  nvv4l2h264enc control-rate=1 bitrate=12000000 \
+                iframeinterval=30 idrinterval=30 \
+                insert-sps-pps=true maxperf-enable=true ! \
+  h264parse config-interval=1 ! \
+  rtph264pay pt=96 config-interval=1 ! \
+  udpsink host=192.168.10.201 port=5000 sync=false async=false
+
 
 # Receiver pipeline Windows
  
