@@ -98,55 +98,39 @@ bool Engine::load_from_file(const std::string& path, cudaStream_t /*stream*/) {
 bool Engine::infer_from_nv12_y(const uint8_t* dY, int W, int H, int pitch, cudaStream_t stream) {
     if (!context || !dIn || !dOut) return false;
 
-    // 0) If engine uses explicit batch AND dynamic shapes, set dims:
 #if NV_TENSORRT_MAJOR >= 7
     const bool explicitBatch = !engine->hasImplicitBatchDimension();
 #else
-    const bool explicitBatch = true; // older headers: be conservative
+    const bool explicitBatch = true;
 #endif
 
     if (explicitBatch) {
-        // Query current binding dims
         nvinfer1::Dims inDims = context->getBindingDimensions(inIdx);
-
-        // If any dimension is -1, set it to (1,1,96,96)
         bool needSet = false;
         for (int i = 0; i < inDims.nbDims; ++i) {
             if (inDims.d[i] == -1) { needSet = true; break; }
         }
         if (needSet) {
             nvinfer1::Dims wanted{};
-            // Assume NCHW with explicit batch excluded (TRT explicit-batch dims EXCLUDE N),
-            // BUT context->setBindingDimensions expects dims WITHOUT the batch dim.
-            // Check how the engine was exported:
-            // - Most ONNX→TRT explicit-batch models have input dims [1,1,96,96] at network level,
-            //   but setBindingDimensions expects [1,96,96] (C,H,W) if the network input excludes N.
-            // To be robust, infer from nbDims:
-            //   nbDims==4 → likely NCHW WITH batch inside dims → set [1,1,96,96]
-            //   nbDims==3 → likely CHW (batch separate)      → set [1,96,96]
             wanted.nbDims = inDims.nbDims;
-            if (inDims.nbDims == 4) {            // N, C, H, W (all explicit)
-                wanted.d[0] = 1;                 // N
-                wanted.d[1] = 1;                 // C
-                wanted.d[2] = 96;                // H
-                wanted.d[3] = 96;                // W
-            } else if (inDims.nbDims == 3) {     // C, H, W (batch handled outside)
-                wanted.d[0] = 1;                 // C
-                wanted.d[1] = 96;                // H
-                wanted.d[2] = 96;                // W
+            if (inDims.nbDims == 4) {            // N, C, H, W
+                wanted.d[0] = 1;
+                wanted.d[1] = 1;
+                wanted.d[2] = 96;
+                wanted.d[3] = 96;
+            } else if (inDims.nbDims == 3) {     // C, H, W
+                wanted.d[0] = 1;
+                wanted.d[1] = 96;
+                wanted.d[2] = 96;
             } else {
-                // Fallback: fill any -1 with a sane value
                 for (int i=0;i<wanted.nbDims;++i)
                     wanted.d[i] = (inDims.d[i] == -1 ? (i==0?1:(i==1?96:96)) : inDims.d[i]);
             }
-
             if (!context->setBindingDimensions(inIdx, wanted)) {
                 fprintf(stderr, "[trt] setBindingDimensions failed (nbDims=%d)\n", wanted.nbDims);
                 return false;
             }
         }
-
-        // If your engine has optimization profiles, you can also set profile 0:
 #if NV_TENSORRT_MAJOR >= 7
         if (engine->getNbOptimizationProfiles() > 0) {
             context->setOptimizationProfile(0);
@@ -154,13 +138,15 @@ bool Engine::infer_from_nv12_y(const uint8_t* dY, int W, int H, int pitch, cudaS
 #endif
     }
 
-    // 1) GPU preprocess into dIn (96x96, NCHW 1x1x96x96, [0,1])
-    if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch, dIn, inputIsFP16, stream)) {
+    // Pass tv_range=true for NV12 (16..235)
+    const bool tv_range = true;
+    if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch, dIn, inputIsFP16, tv_range, stream)) {
         fprintf(stderr, "[trt] preprocess enqueue failed\n");
         return false;
     }
+    // Optional debug (uncomment if input is FP32):
+    // if (!inputIsFP16) ei::launch_debug_stats_f32(reinterpret_cast<const float*>(dIn), 96*96, stream);
 
-    // 2) Bindings & enqueueV2 (explicit-batch safe)
     void* bindings[2];
     bindings[inIdx]  = dIn;
     bindings[outIdx] = dOut;
@@ -170,7 +156,6 @@ bool Engine::infer_from_nv12_y(const uint8_t* dY, int W, int H, int pitch, cudaS
         return false;
     }
 
-    // 3) D2H copy for logging
     if (cudaMemcpyAsync(hostOut.data(), dOut, outBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         fprintf(stderr, "[trt] D2H failed\n"); return false;
     }
