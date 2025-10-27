@@ -6,7 +6,9 @@
  * - NV12 in/out (pitched), CUDA primary context shared across instances.
  * - Runtime color controls hot-reload from JSON section "cam0|cam1|cam2".
  * - Per-instance wire mask loaded once from /dev/shm/wire_mask_camN.{raw,meta}.
- * - Gesture inference (TensorRT) runs ONLY for the cam1-bound instance, prints start/stop.
+ * - Gesture inference (TensorRT) runs ONLY for the cam1-bound instance.
+ * - UPDATED: inference runs on a **dedicated CUDA stream** (low priority) with
+ *            async D2H into **pinned** host memory; no blocking on the video path.
  */
 
 #include <cstdio>
@@ -123,7 +125,13 @@ static std::string mask_meta_path_for(int cam_idx) {
 // ============================================================================
 struct ICPState {
     CUcontext     ctx   = nullptr;
-    cudaStream_t  stream= nullptr;
+
+    // Video stream: rectification, inpaint, tone/color
+    cudaStream_t  stream      = nullptr;
+
+    // NEW: dedicated TRT stream (low priority) + event to fence preprocess
+    cudaStream_t  trt_stream  = nullptr;
+    cudaEvent_t   ev_trt_ready = nullptr;
 
     // Scratch (NV12) for rectification
     CUdeviceptr sY = 0, sUV = 0;
@@ -337,6 +345,14 @@ static ICPState* create_instance()
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
 
+    // NEW: create a low-priority stream for TRT work, and an event to fence preprocess
+    {
+        int low = 0, high = 0;
+        cudaDeviceGetStreamPriorityRange(&low, &high); // low has the numerically largest value
+        cudaStreamCreateWithPriority(&st->trt_stream, cudaStreamNonBlocking, low);
+        cudaEventCreateWithFlags(&st->ev_trt_ready, cudaEventDisableTiming);
+    }
+
     // Consume next hint if present; otherwise fallback to SONAME/path
     std::string sec;
     {
@@ -372,7 +388,9 @@ static void destroy_instance(ICPState* st)
 
     st->gesture.destroy();
 
-    if (st->stream) { cudaStreamDestroy(st->stream); st->stream = nullptr; }
+    if (st->ev_trt_ready) { cudaEventDestroy(st->ev_trt_ready); st->ev_trt_ready=nullptr; }
+    if (st->trt_stream)   { cudaStreamDestroy(st->trt_stream);  st->trt_stream=nullptr; }
+    if (st->stream)       { cudaStreamDestroy(st->stream);       st->stream=nullptr; }
     st->ctx = nullptr;
     delete st;
 }
@@ -460,29 +478,41 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         }
     }
 
-    // 2.8) Gesture inference (ONLY for cam1): run on rectified luminance
+    // 2.8) Gesture inference (ONLY for cam1): **non-blocking path**
     ensure_gesture_loaded_for_cam1(st);
     if (st->gesture.engine) { // engine loaded only when section == cam1
-        if (st->gesture.infer_from_nv12_y(dY, W, H, pitch, st->stream)) {
-            float start_logit=0.f, stop_logit=0.f, p_start=0.f, p_stop=0.f;
-            int top=-1;
-            if (st->gesture.get_start_stop(start_logit, stop_logit, p_start, p_stop, top)) {
-                const char* top_lbl = (top==0) ? "start" : "stop";
-                fprintf(stderr,
-                    "[gesture][%s] start=%.3f stop=%.3f | p_start=%.3f p_stop=%.3f | top=%s\n",
-                    st->controls.section().c_str(),
-                    start_logit, stop_logit, p_start, p_stop, top_lbl);
+        // (a) Ensure binding dims are set (no-op after first time)
+        (void)st->gesture.ensure_binding_dims_96x96();
+
+        // (b) Preprocess NV12 Y → NCHW 1x1x96x96 into engine.dIn on the **video stream**
+        const bool tv_range = true;
+        if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch,
+                                                 st->gesture.dIn,
+                                                 st->gesture.inputIsFP16,
+                                                 tv_range,
+                                                 st->stream)) {
+            fprintf(stderr, "[gesture] preprocess enqueue failed\n");
+        } else {
+            // (c) Signal "tensor ready" to TRT stream and run TRT there
+            cudaEventRecord(st->ev_trt_ready, st->stream);
+            cudaStreamWaitEvent(st->trt_stream, st->ev_trt_ready, 0);
+
+            void* bindings[2];
+            bindings[st->gesture.inIdx]  = st->gesture.dIn;
+            bindings[st->gesture.outIdx] = st->gesture.dOut;
+
+            if (!st->gesture.context->enqueueV2(bindings, st->trt_stream, nullptr)) {
+                fprintf(stderr, "[gesture] enqueueV2 failed\n");
             } else {
-                // Fallback: generic top-1 if output isn't 2-wide
-                float p = 0.f;
-                int cls = st->gesture.top1(&p);
-                fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
-                        st->controls.section().c_str(), cls, p);
+                // (d) Async D2H into pinned host buffer + record "done" event
+                cudaMemcpyAsync(st->gesture.hostOutPinned, st->gesture.dOut,
+                                st->gesture.outBytes, cudaMemcpyDeviceToHost, st->trt_stream);
+                cudaEventRecord(st->gesture.ev_trt_done, st->trt_stream);
             }
         }
     }
 
-    // 3) Tone + color (hot-reload)
+    // 3) Tone + color (hot-reload) on the video stream
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(
         dY, W, H, pitch,
@@ -490,7 +520,24 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         cp,
         st->stream);
 
+    // IMPORTANT: synchronize **only** the video stream before releasing EGL resource.
     cudaStreamSynchronize(st->stream);
+
+    // Best-effort, non-blocking logging of gesture result (if ready)
+    if (st->gesture.engine && st->gesture.try_commit_host_output()) {
+        float sL=0.f, tL=0.f, okL=0.f, ps=0.f, pt=0.f, pok=0.f; int top=-1;
+        if (st->gesture.get_start_stop_ok(sL, tL, okL, ps, pt, pok, top)) {
+            const char* top_lbl = (top==0) ? "START" : (top==1 ? "STOP" : "OK");
+            fprintf(stderr,
+                "[gesture][%s] logits: start=%.3f stop=%.3f ok=%.3f | p: start=%.3f stop=%.3f ok=%.3f | top=%s\n",
+                st->controls.section().c_str(), sL, tL, okL, ps, pt, pok, top_lbl);
+        } else {
+            float p=0.f; int cls = st->gesture.top1(&p);
+            fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
+                    st->controls.section().c_str(), cls, p);
+        }
+    }
+
     cuGraphicsUnregisterResource(res);
 }
 
@@ -507,7 +554,7 @@ extern "C" void init(CustomerFunction* f)
     // Ensure CUDA primary context retained
     std::call_once(g_ctx_once, retain_primary_context_once);
 
-    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1)\n");
+    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1; 3-class START/STOP/OK)\n");
 }
 
 extern "C" void deinit(void)
