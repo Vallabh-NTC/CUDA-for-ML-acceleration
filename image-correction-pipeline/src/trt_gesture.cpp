@@ -3,7 +3,6 @@
 #endif
 
 #include "trt_gesture.hpp"
-#include "ei_gesture_infer.cuh"   // Only needed by the caller (nvivafilter) for preprocessing
 
 #include <fstream>
 #include <iterator>
@@ -11,6 +10,8 @@
 #include <cmath>
 #include <vector>
 #include <cstring>
+#include <cstdlib>   // getenv, atoi
+#include <cstdio>
 
 using namespace nvinfer1;
 
@@ -56,7 +57,7 @@ bool Engine::load_from_file(const std::string& path, cudaStream_t /*video_stream
         return false;
     }
 
-    // Discover 1 input and 1 output binding
+    // Bindings
     const int nb = engine->getNbBindings();
     for (int i = 0; i < nb; ++i) {
         if (engine->bindingIsInput(i)) inIdx = i;
@@ -67,48 +68,53 @@ bool Engine::load_from_file(const std::string& path, cudaStream_t /*video_stream
         return false;
     }
 
-    // Input type and tentative shape
-    auto inType = engine->getBindingDataType(inIdx);
-    inputIsFP16 = (inType == DataType::kHALF);
+    // Types
+    auto inType  = engine->getBindingDataType(inIdx);
+    auto outType = engine->getBindingDataType(outIdx);
+    inputIsFP16  = (inType  == DataType::kHALF);
+    outputIsFP16 = (outType == DataType::kHALF);
+    fprintf(stderr, "[trt] dtypes: in=%d out=%d  (0=float32, 1=float16)\n", (int)inType, (int)outType);
 
-    // For explicit batch and dynamic shapes, set the input dims to 1x1x96x96 if needed.
     if (!ensure_binding_dims_96x96()) {
         fprintf(stderr, "[trt] ensure_binding_dims_96x96 failed\n");
         return false;
     }
 
-    // Compute buffer sizes
+    // Sizes
     auto volume = [](Dims d)->size_t {
         size_t v = 1;
         for (int i = 0; i < d.nbDims; ++i) v *= static_cast<size_t>(d.d[i]);
         return v;
     };
-
     auto inDims  = context->getBindingDimensions(inIdx);
     auto outDims = context->getBindingDimensions(outIdx);
 
-    size_t inElems  = volume(inDims);
-    size_t outElems = volume(outDims);
+    const size_t inElems = volume(inDims);
+    outElems             = volume(outDims);
 
-    inBytes  = inElems  * (inputIsFP16 ? sizeof(__half) : sizeof(float));
-    outBytes = outElems * sizeof(float); // we read as float
+    inBytes     = inElems  * (inputIsFP16  ? sizeof(__half) : sizeof(float));
+    outBytesDev = outElems * (outputIsFP16 ? sizeof(__half) : sizeof(float));
 
-    // Allocate device buffers
-    if (cudaMalloc(&dIn,  inBytes)  != cudaSuccess) { fprintf(stderr, "[trt] cudaMalloc dIn failed\n");  return false; }
-    if (cudaMalloc(&dOut, outBytes) != cudaSuccess) { fprintf(stderr, "[trt] cudaMalloc dOut failed\n"); return false; }
+    // Device buffers
+    if (cudaMalloc(&dIn,  inBytes)     != cudaSuccess) { fprintf(stderr, "[trt] cudaMalloc dIn failed\n");  return false; }
+    if (cudaMalloc(&dOut, outBytesDev) != cudaSuccess) { fprintf(stderr, "[trt] cudaMalloc dOut failed\n"); return false; }
 
-    // Allocate pinned host buffer and a std::vector view
-    if (cudaMallocHost(&hostOutPinned, outBytes) != cudaSuccess) {
-        fprintf(stderr, "[trt] cudaMallocHost(hostOutPinned) failed\n");
-        return false;
+    // Host buffers
+    if (cudaMallocHost(&hostOutPinnedRaw, outBytesDev) != cudaSuccess) {
+        fprintf(stderr, "[trt] cudaMallocHost(hostOutPinnedRaw) failed\n"); return false;
     }
-    hostOut.resize(outElems);
+    hostOut.resize(outElems, 0.0f);
 
-    // Create an event (disabled timing) to signal "done"
+    // Event
     cudaEventCreateWithFlags(&ev_trt_done, cudaEventDisableTiming);
 
-    fprintf(stderr, "[trt] engine loaded: inIdx=%d(%zuB) outIdx=%d(%zuB) FP16in=%d\n",
-            inIdx, inBytes, outIdx, outBytes, (int)inputIsFP16);
+    // Label map (default EI order; allow env override)
+    set_label_map(/*start*/1, /*stop*/2, /*ok*/0);
+    load_label_map_from_env();
+    fprintf(stderr, "[trt] label map: ok=%d start=%d stop=%d\n", idx_ok, idx_start, idx_stop);
+
+    fprintf(stderr, "[trt] engine loaded: inIdx=%d(%zuB) outIdx=%d(outElems=%zu, devBytes=%zu) FP16in=%d FP16out=%d\n",
+            inIdx, inBytes, outIdx, outElems, outBytesDev, (int)inputIsFP16, (int)outputIsFP16);
     return true;
 }
 
@@ -118,116 +124,151 @@ bool Engine::ensure_binding_dims_96x96() {
 #else
     const bool explicitBatch = true;
 #endif
+    if (!explicitBatch) return true;
 
-    if (!explicitBatch) {
-        // Implicit batch engines already have fixed dims.
-        return true;
-    }
-
-    nvinfer1::Dims inDims = context->getBindingDimensions(inIdx);
+    Dims inDims = context->getBindingDimensions(inIdx);
     bool needSet = false;
     for (int i = 0; i < inDims.nbDims; ++i) {
         if (inDims.d[i] == -1) { needSet = true; break; }
     }
     if (!needSet) return true;
 
-    nvinfer1::Dims wanted{};
-    wanted.nbDims = inDims.nbDims;
-    if (inDims.nbDims == 4) {            // N, C, H, W
-        wanted.d[0] = 1;
-        wanted.d[1] = 1;
-        wanted.d[2] = 96;
-        wanted.d[3] = 96;
-    } else if (inDims.nbDims == 3) {     // C, H, W
-        wanted.d[0] = 1;
-        wanted.d[1] = 96;
-        wanted.d[2] = 96;
-    } else {
-        // Generic fallback: put 1,96,96 on any -1 dims in order
+    Dims wanted{}; wanted.nbDims = inDims.nbDims;
+    if (inDims.nbDims == 4) { wanted.d[0]=1; wanted.d[1]=1; wanted.d[2]=96; wanted.d[3]=96; }
+    else if (inDims.nbDims == 3) { wanted.d[0]=1; wanted.d[1]=96; wanted.d[2]=96; }
+    else {
         for (int i=0;i<wanted.nbDims;++i)
             wanted.d[i] = (inDims.d[i] == -1 ? (i==0?1:(i==1?96:96)) : inDims.d[i]);
     }
-
     if (!context->setBindingDimensions(inIdx, wanted)) {
         fprintf(stderr, "[trt] setBindingDimensions failed (nbDims=%d)\n", wanted.nbDims);
         return false;
     }
 #if NV_TENSORRT_MAJOR >= 7
-    if (engine->getNbOptimizationProfiles() > 0) {
-        context->setOptimizationProfile(0);
-    }
+    if (engine->getNbOptimizationProfiles() > 0) context->setOptimizationProfile(0);
 #endif
     return true;
+}
+
+bool Engine::try_commit_host_output() {
+    if (!ev_trt_done || !hostOutPinnedRaw || hostOut.empty()) return false;
+    if (cudaEventQuery(ev_trt_done) != cudaSuccess) return false;
+
+    if (outputIsFP16) {
+        const __half* src = reinterpret_cast<const __half*>(hostOutPinnedRaw);
+        for (size_t i=0; i<outElems; ++i) hostOut[i] = __half2float(src[i]);
+    } else {
+        std::memcpy(hostOut.data(), hostOutPinnedRaw, outElems * sizeof(float));
+    }
+    return true;
+}
+
+static inline bool is_prob_like(const float* v, size_t n) {
+    // All in [0,1] and sum ~ 1 (tolerances allow for fp noise)
+    if (n == 0) return false;
+    double sum = 0.0;
+    for (size_t i=0;i<n;++i) {
+        if (v[i] < -0.01f || v[i] > 1.01f) return false;
+        sum += v[i];
+    }
+    return (sum > 0.95 && sum < 1.05);
 }
 
 int Engine::top1(float* probOut) const {
     if (hostOut.empty()) return -1;
 
-    // Numerically-stable softmax
-    float maxv = *std::max_element(hostOut.begin(), hostOut.end());
-    double sum = 0.0;
-    std::vector<float> probs(hostOut.size());
-    for (size_t i = 0; i < hostOut.size(); ++i) {
-        probs[i] = std::exp(hostOut[i] - maxv);
-        sum += probs[i];
+    // If it looks like probabilities, just argmax.
+    if (is_prob_like(hostOut.data(), hostOut.size())) {
+        int arg = 0; float best = hostOut[0];
+        for (size_t i=1;i<hostOut.size();++i) {
+            if (hostOut[i] > best) { best = hostOut[i]; arg = (int)i; }
+        }
+        if (probOut) *probOut = best;
+        return arg;
     }
-    int arg = -1;
-    float best = -1.f;
-    for (size_t i = 0; i < probs.size(); ++i) {
-        probs[i] = (float)(probs[i] / sum);
-        if (probs[i] > best) { best = probs[i]; arg = (int)i; }
+
+    // Otherwise logits → softmax once.
+    float maxv = *std::max_element(hostOut.begin(), hostOut.end());
+    double den = 0.0;
+    std::vector<float> probs(hostOut.size());
+    for (size_t i=0;i<hostOut.size();++i) { probs[i] = std::exp(hostOut[i]-maxv); den += probs[i]; }
+    int arg = 0; float best = (float)(probs[0]/den);
+    for (size_t i=1;i<probs.size();++i) {
+        float p = (float)(probs[i]/den);
+        if (p > best) { best = p; arg = (int)i; }
     }
     if (probOut) *probOut = best;
     return arg;
 }
 
-bool Engine::get_start_stop_ok(float& start_logit, float& stop_logit, float& ok_logit,
+bool Engine::get_start_stop_ok(float& start_score, float& stop_score, float& ok_score,
                                float& p_start, float& p_stop, float& p_ok, int& top_class) const
 {
-    if (hostOut.size() < 3) return false;
+    const int n = (int)hostOut.size();
+    if (n <= idx_start || n <= idx_stop || n <= idx_ok) return false;
 
-    start_logit = hostOut[0];
-    stop_logit  = hostOut[1];
-    ok_logit    = hostOut[2];
+    // Engine output in mapped order
+    start_score = hostOut[idx_start];
+    stop_score  = hostOut[idx_stop];
+    ok_score    = hostOut[idx_ok];
 
-    // 3-class softmax
-    float m = std::max(start_logit, std::max(stop_logit, ok_logit));
-    float e0 = std::exp(start_logit - m);
-    float e1 = std::exp(stop_logit  - m);
-    float e2 = std::exp(ok_logit    - m);
-    float den = e0 + e1 + e2;
+    if (is_prob_like(hostOut.data(), hostOut.size())) {
+        // The network already applied softmax; treat scores as probabilities.
+        p_start = start_score;
+        p_stop  = stop_score;
+        p_ok    = ok_score;
+    } else {
+        // Compute softmax across the three mapped indices only.
+        const float m  = std::max(start_score, std::max(stop_score, ok_score));
+        const float eS = std::exp(start_score - m);
+        const float eT = std::exp(stop_score  - m);
+        const float eK = std::exp(ok_score    - m);
+        const float den = eS + eT + eK;
+        p_start = eS / den;
+        p_stop  = eT / den;
+        p_ok    = eK / den;
+    }
 
-    p_start = e0 / den;
-    p_stop  = e1 / den;
-    p_ok    = e2 / den;
-
-    // top-class by probability
-    if (p_start >= p_stop && p_start >= p_ok)      top_class = 0;
-    else if (p_stop >= p_start && p_stop >= p_ok)  top_class = 1;
-    else                                           top_class = 2;
-
+    // Top among (start, stop, ok)
+    top_class = 0; float best = p_start;
+    if (p_stop > best) { best = p_stop; top_class = 1; }
+    if (p_ok   > best) { best = p_ok;   top_class = 2; }
     return true;
 }
 
-bool Engine::try_commit_host_output() {
-    if (!ev_trt_done || !hostOutPinned || hostOut.empty()) return false;
-    if (cudaEventQuery(ev_trt_done) != cudaSuccess) return false;
+void Engine::set_label_map(int start_idx, int stop_idx, int ok_idx) {
+    idx_start = start_idx; idx_stop = stop_idx; idx_ok = ok_idx;
+}
 
-    std::memcpy(hostOut.data(), hostOutPinned, outBytes);
+static bool parse_kv_index(const char* env, const char* key, int& out) {
+    const char* p = std::strstr(env, key);
+    if (!p) return false;
+    p += std::strlen(key);
+    if (*p != '=') return false;
+    ++p;
+    out = std::atoi(p);
+    return true;
+}
+
+bool Engine::load_label_map_from_env() {
+    const char* env = std::getenv("TRT_LABEL_MAP"); // e.g. "start=1,stop=2,ok=0"
+    if (!env) return false;
+    int s = idx_start, t = idx_stop, k = idx_ok;
+    parse_kv_index(env, "start", s);
+    parse_kv_index(env, "stop",  t);
+    parse_kv_index(env, "ok",    k);
+    idx_start = s; idx_stop = t; idx_ok = k;
+    fprintf(stderr, "[trt] label map (env): ok=%d start=%d stop=%d\n", idx_ok, idx_start, idx_stop);
     return true;
 }
 
 void Engine::destroy() {
     if (dIn)  { cudaFree(dIn);  dIn  = nullptr; }
     if (dOut) { cudaFree(dOut); dOut = nullptr; }
-    if (hostOutPinned) { cudaFreeHost(hostOutPinned); hostOutPinned = nullptr; }
+    if (hostOutPinnedRaw) { cudaFreeHost(hostOutPinnedRaw); hostOutPinnedRaw=nullptr; }
     hostOut.clear();
-
     if (ev_trt_done) { cudaEventDestroy(ev_trt_done); ev_trt_done = nullptr; }
-
-    context.reset();
-    engine.reset();
-    runtime.reset();
+    context.reset(); engine.reset(); runtime.reset();
 }
 
 } // namespace trt
