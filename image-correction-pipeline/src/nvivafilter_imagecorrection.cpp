@@ -3,12 +3,25 @@
  * @brief GStreamer `nvivafilter` plugin: fisheye rectification → (optional) wire inpaint
  *        → gesture inference (cam1 only) → tone/color.
  *
- * - NV12 in/out (pitched), CUDA primary context shared across instances.
- * - Runtime color controls hot-reload from JSON section "cam0|cam1|cam2".
- * - Per-instance wire mask loaded once from /dev/shm/wire_mask_camN.{raw,meta}.
- * - Gesture inference (TensorRT) runs ONLY for the cam1-bound instance.
- * - UPDATED: inference runs on a **dedicated CUDA stream** (low priority) with
- *            async D2H into **pinned** host memory; no blocking on the video path.
+ * Notes (debug build):
+ *  - NV12 in/out (pitched), CUDA primary context shared across instances.
+ *  - Runtime color controls hot-reload from JSON section "cam0|cam1|cam2".
+ *  - Per-instance wire mask loaded once from /dev/shm/wire_mask_camN.{raw,meta}.
+ *  - Gesture inference (TensorRT) runs ONLY for the cam1-bound instance.
+ *  - Robust TRT output dtype handling (FP16/FP32) + env-driven debugging.
+ *
+ * Env toggles:
+ *   TRT_TV_RANGE=0/1     : 0 = full-range 0..255 → 0..1 (default, like Edge Impulse)
+ *                          1 = TV range 16..235 → 0..1
+ *   TRT_LABEL_MAP="start=1,stop=2,ok=0"  : override label indices without rebuild
+ *   TRT_DUMP_EI_RAW=1    : print EI-order raw vector (ok,start,stop) per frame
+ *
+ * MQTT / FSM (questa integrazione):
+ *   MQTT_URL=tcp://HOST:PORT   (oppure MQTT_HOST / MQTT_PORT)
+ *   MQTT_TOPIC=jetson/stream/cmd
+ *   MQTT_USER=...  MQTT_PASS=...
+ *   GESTURE_TH_START=0.80  GESTURE_TH_STOP=0.80  GESTURE_TH_OK=0.80
+ *   GESTURE_HOLD_MS=1200   (durata richiesta per ciascun passo)
  */
 
 #include <cstdio>
@@ -25,6 +38,8 @@
 #include <dlfcn.h>
 #include <cctype>
 #include <atomic>
+#include <thread>
+#include <chrono>
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -121,17 +136,64 @@ static std::string mask_meta_path_for(int cam_idx) {
 }
 
 // ============================================================================
+// MQTT helpers (shell out to mosquitto_pub, config via env)
+// ============================================================================
+struct MqttCfg {
+    std::string host;
+    int         port   = 1883;
+    std::string topic  = "jetson/stream/cmd";
+    std::string user;
+    std::string pass;
+    bool        valid  = false;
+};
+
+static std::string shell_quote(const std::string& s){
+    std::string o; o.reserve(s.size()+8); o.push_back('\'');
+    for(char c: s){ if(c=='\'') o += "'\"'\"'"; else o.push_back(c); } o.push_back('\''); return o;
+}
+
+static void parse_mqtt_env(MqttCfg& out){
+    const char* url = std::getenv("MQTT_URL");
+    if (url && *url) {
+        // tcp://host:port
+        std::string u(url);
+        auto pos = u.find("://");
+        std::string rest = (pos==std::string::npos)? u : u.substr(pos+3);
+        auto colon = rest.find(':');
+        if (colon!=std::string::npos){
+            out.host = rest.substr(0, colon);
+            try { out.port = std::stoi(rest.substr(colon+1)); } catch(...) {}
+        } else {
+            out.host = rest;
+        }
+    }
+    if (const char* h = std::getenv("MQTT_HOST"); h && *h) out.host = h;
+    if (const char* p = std::getenv("MQTT_PORT"); p && *p){ try{ out.port = std::stoi(p);}catch(...){} }
+    if (const char* t = std::getenv("MQTT_TOPIC"); t && *t) out.topic = t;
+    if (const char* u = std::getenv("MQTT_USER");  u && *u) out.user  = u;
+    if (const char* pw= std::getenv("MQTT_PASS");  pw&& *pw) out.pass  = pw;
+    out.valid = !out.host.empty();
+}
+
+static void mqtt_publish(const MqttCfg& c, const std::string& payload){
+    if (!c.valid) return;
+    const char* bin = "/usr/bin/mosquitto_pub";
+    std::string cmd = std::string(bin) + " -h " + shell_quote(c.host)
+                    + " -p " + std::to_string(c.port)
+                    + " -t " + shell_quote(c.topic)
+                    + " -m " + shell_quote(payload);
+    if (!c.user.empty()) cmd += " -u " + shell_quote(c.user);
+    if (!c.pass.empty()) cmd += " -P " + shell_quote(c.pass);
+    int rc = std::system(cmd.c_str());
+    fprintf(stderr, "[MQTT] rc=%d topic=%s payload=%s\n", rc, c.topic.c_str(), payload.c_str());
+}
+
+// ============================================================================
 // Per-instance state
 // ============================================================================
 struct ICPState {
     CUcontext     ctx   = nullptr;
-
-    // Video stream: rectification, inpaint, tone/color
-    cudaStream_t  stream      = nullptr;
-
-    // NEW: dedicated TRT stream (low priority) + event to fence preprocess
-    cudaStream_t  trt_stream  = nullptr;
-    cudaEvent_t   ev_trt_ready = nullptr;
+    cudaStream_t  stream= nullptr;
 
     // Scratch (NV12) for rectification
     CUdeviceptr sY = 0, sUV = 0;
@@ -162,8 +224,38 @@ struct ICPState {
     trt::Engine gesture;
     bool gesture_loaded_once = false;
 
-    // (optional) last mask version (not used)
-    uint32_t last_mask_version = 0;
+    // MQTT + FSM
+    MqttCfg mqtt{};
+    bool mqtt_checked_once = false;
+
+    struct {
+        // config
+        float th_start = 0.80f;
+        float th_stop  = 0.80f;
+        float th_ok    = 0.80f;
+        int   hold_ms  = 1200;
+
+        // state machine
+        enum class State { IDLE, AWAIT_OK_FOR_START, RECORDING, AWAIT_OK_FOR_STOP } st = State::IDLE;
+        std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
+
+        int hold_start_ms = 0;
+        int hold_stop_ms  = 0;
+        int hold_ok_ms    = 0;
+        int ok_after_gate_ms = 0; // timer while waiting the second step
+
+        // helpers
+        void reset_holds(){ hold_start_ms=hold_stop_ms=hold_ok_ms=0; }
+        void tick_delta_ms(int dms, float ps, float pt, float pok){
+            // Update per-class holds
+            if (ps >= th_start) hold_start_ms += dms; else hold_start_ms = 0;
+            if (pt >= th_stop ) hold_stop_ms  += dms; else hold_stop_ms  = 0;
+            if (pok>= th_ok   ) hold_ok_ms    += dms; else hold_ok_ms    = 0;
+
+            // Gate timer for the second step
+            ok_after_gate_ms = (st==State::AWAIT_OK_FOR_START || st==State::AWAIT_OK_FOR_STOP) ? (ok_after_gate_ms + dms) : 0;
+        }
+    } fsm;
 };
 
 static std::mutex              g_instances_mtx;
@@ -197,6 +289,7 @@ extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
     return 0;
 }
 // -----------------------------------------------------------------------------
+
 
 // ----------------------------------------------------------------------------
 // Alloc helpers
@@ -329,6 +422,25 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st)
 }
 
 // ----------------------------------------------------------------------------
+// FSM helper: init MQTT + thresholds from env
+// ----------------------------------------------------------------------------
+static void ensure_mqtt_and_fsm_config(ICPState* st){
+    if (!st->mqtt_checked_once){
+        st->mqtt_checked_once = true;
+        parse_mqtt_env(st->mqtt);
+
+        if (const char* v = std::getenv("GESTURE_TH_START"); v && *v) st->fsm.th_start = std::max(0.f, std::min(1.f, (float)atof(v)));
+        if (const char* v = std::getenv("GESTURE_TH_STOP" ); v && *v) st->fsm.th_stop  = std::max(0.f, std::min(1.f, (float)atof(v)));
+        if (const char* v = std::getenv("GESTURE_TH_OK"   ); v && *v) st->fsm.th_ok    = std::max(0.f, std::min(1.f, (float)atof(v)));
+        if (const char* v = std::getenv("GESTURE_HOLD_MS" ); v && *v) st->fsm.hold_ms  = std::max(100, atoi(v));
+
+        fprintf(stderr, "[FSM] th_start=%.2f th_stop=%.2f th_ok=%.2f hold_ms=%d mqtt=%s:%d topic=%s\n",
+            st->fsm.th_start, st->fsm.th_stop, st->fsm.th_ok, st->fsm.hold_ms,
+            st->mqtt.host.c_str(), st->mqtt.port, st->mqtt.topic.c_str());
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Instance allocation / destruction
 // ----------------------------------------------------------------------------
 static ICPState* create_instance()
@@ -344,14 +456,6 @@ static ICPState* create_instance()
 #else
     cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking);
 #endif
-
-    // NEW: create a low-priority stream for TRT work, and an event to fence preprocess
-    {
-        int low = 0, high = 0;
-        cudaDeviceGetStreamPriorityRange(&low, &high); // low has the numerically largest value
-        cudaStreamCreateWithPriority(&st->trt_stream, cudaStreamNonBlocking, low);
-        cudaEventCreateWithFlags(&st->ev_trt_ready, cudaEventDisableTiming);
-    }
 
     // Consume next hint if present; otherwise fallback to SONAME/path
     std::string sec;
@@ -388,9 +492,7 @@ static void destroy_instance(ICPState* st)
 
     st->gesture.destroy();
 
-    if (st->ev_trt_ready) { cudaEventDestroy(st->ev_trt_ready); st->ev_trt_ready=nullptr; }
-    if (st->trt_stream)   { cudaStreamDestroy(st->trt_stream);  st->trt_stream=nullptr; }
-    if (st->stream)       { cudaStreamDestroy(st->stream);       st->stream=nullptr; }
+    if (st->stream) { cudaStreamDestroy(st->stream); st->stream = nullptr; }
     st->ctx = nullptr;
     delete st;
 }
@@ -478,14 +580,16 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         }
     }
 
-    // 2.8) Gesture inference (ONLY for cam1): **non-blocking path**
+    // 2.8) Gesture inference (ONLY for cam1)
     ensure_gesture_loaded_for_cam1(st);
     if (st->gesture.engine) { // engine loaded only when section == cam1
-        // (a) Ensure binding dims are set (no-op after first time)
-        (void)st->gesture.ensure_binding_dims_96x96();
+        // Read TV/full-range from env (default full-range like Edge Impulse)
+        bool tv_range = false;
+        if (const char* e = std::getenv("TRT_TV_RANGE")) {
+            tv_range = (*e == '1');
+        }
 
-        // (b) Preprocess NV12 Y → NCHW 1x1x96x96 into engine.dIn on the **video stream**
-        const bool tv_range = true;
+        // Preprocess NV12 Y → NCHW 1x1x96x96 into TRT input buffer
         if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch,
                                                  st->gesture.dIn,
                                                  st->gesture.inputIsFP16,
@@ -493,26 +597,24 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                                                  st->stream)) {
             fprintf(stderr, "[gesture] preprocess enqueue failed\n");
         } else {
-            // (c) Signal "tensor ready" to TRT stream and run TRT there
-            cudaEventRecord(st->ev_trt_ready, st->stream);
-            cudaStreamWaitEvent(st->trt_stream, st->ev_trt_ready, 0);
-
             void* bindings[2];
             bindings[st->gesture.inIdx]  = st->gesture.dIn;
             bindings[st->gesture.outIdx] = st->gesture.dOut;
 
-            if (!st->gesture.context->enqueueV2(bindings, st->trt_stream, nullptr)) {
+            if (!st->gesture.context->enqueueV2(bindings, st->stream, nullptr)) {
                 fprintf(stderr, "[gesture] enqueueV2 failed\n");
             } else {
-                // (d) Async D2H into pinned host buffer + record "done" event
-                cudaMemcpyAsync(st->gesture.hostOutPinned, st->gesture.dOut,
-                                st->gesture.outBytes, cudaMemcpyDeviceToHost, st->trt_stream);
-                cudaEventRecord(st->gesture.ev_trt_done, st->trt_stream);
+                // Async D2H into pinned buffer that matches device dtype
+                const size_t dbytes = st->gesture.outElems *
+                                      (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float));
+                cudaMemcpyAsync(st->gesture.hostOutPinnedRaw, st->gesture.dOut,
+                                dbytes, cudaMemcpyDeviceToHost, st->stream);
+                cudaEventRecord(st->gesture.ev_trt_done, st->stream);
             }
         }
     }
 
-    // 3) Tone + color (hot-reload) on the video stream
+    // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(
         dY, W, H, pitch,
@@ -520,17 +622,98 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         cp,
         st->stream);
 
-    // IMPORTANT: synchronize **only** the video stream before releasing EGL resource.
+    // Fence the per-frame GPU work
     cudaStreamSynchronize(st->stream);
 
-    // Best-effort, non-blocking logging of gesture result (if ready)
+    // ---- Emit gesture logs + drive FSM if a fresh result is available ----
     if (st->gesture.engine && st->gesture.try_commit_host_output()) {
+        ensure_mqtt_and_fsm_config(st);
+
+        // (A) EI-order raw dump (true tensor order: ok=0, start=1, stop=2)
+        if (const char* dumpEI = std::getenv("TRT_DUMP_EI_RAW"); dumpEI && *dumpEI=='1') {
+            const float v_ok    = st->gesture.hostOut[0];
+            const float v_start = st->gesture.hostOut[1];
+            const float v_stop  = st->gesture.hostOut[2];
+            fprintf(stderr, "[gesture][%s] EI-order raw: ok=%.3f start=%.3f stop=%.3f | sum=%.3f\n",
+                    st->controls.section().c_str(), v_ok, v_start, v_stop, v_ok+v_start+v_stop);
+        }
+
+        // (B) Pretty print using logical mapping (START/STOP/OK)
         float sL=0.f, tL=0.f, okL=0.f, ps=0.f, pt=0.f, pok=0.f; int top=-1;
         if (st->gesture.get_start_stop_ok(sL, tL, okL, ps, pt, pok, top)) {
             const char* top_lbl = (top==0) ? "START" : (top==1 ? "STOP" : "OK");
             fprintf(stderr,
-                "[gesture][%s] logits: start=%.3f stop=%.3f ok=%.3f | p: start=%.3f stop=%.3f ok=%.3f | top=%s\n",
+                "[gesture][%s] logits/scores: start=%.3f stop=%.3f ok=%.3f | p: start=%.3f stop=%.3f ok=%.3f | top=%s\n",
                 st->controls.section().c_str(), sL, tL, okL, ps, pt, pok, top_lbl);
+
+            // --------- FSM update ----------
+            using clk = std::chrono::steady_clock;
+            auto now = clk::now();
+            int dms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - st->fsm.t_last).count();
+            if (dms < 0 || dms > 1000) dms = 0; // guard
+            st->fsm.t_last = now;
+
+            st->fsm.tick_delta_ms(dms, ps, pt, pok);
+
+            auto &fsm = st->fsm;
+
+            switch (fsm.st) {
+                case decltype(fsm.st)::IDLE:
+                    // Need START ≥ hold_ms, then OK ≥ hold_ms
+                    if (fsm.hold_start_ms >= fsm.hold_ms) {
+                        fsm.st = decltype(fsm.st)::AWAIT_OK_FOR_START;
+                        fsm.hold_ok_ms = 0;
+                        fsm.ok_after_gate_ms = 0;
+                        fprintf(stderr, "[FSM] START qualified; awaiting OK...\n");
+                    }
+                    break;
+
+                case decltype(fsm.st)::AWAIT_OK_FOR_START:
+                    // OK must be held ≥ hold_ms after START was qualified
+                    if (fsm.hold_ok_ms >= fsm.hold_ms) {
+                        // publish START
+                        mqtt_publish(st->mqtt, R"({"value":{"recording":"start"}})");
+                        fprintf(stderr, "[TRIGGER] recording START\n");
+                        fsm.st = decltype(fsm.st)::RECORDING;
+                        fsm.reset_holds();
+                    } else {
+                        // optional timeout to reset if nothing happens for a while
+                        if (fsm.ok_after_gate_ms > 4000) {
+                            fprintf(stderr, "[FSM] timeout waiting OK after START; reset\n");
+                            fsm.st = decltype(fsm.st)::IDLE;
+                            fsm.reset_holds();
+                        }
+                    }
+                    break;
+
+                case decltype(fsm.st)::RECORDING:
+                    // Need STOP ≥ hold_ms, then OK ≥ hold_ms
+                    if (fsm.hold_stop_ms >= fsm.hold_ms) {
+                        fsm.st = decltype(fsm.st)::AWAIT_OK_FOR_STOP;
+                        fsm.hold_ok_ms = 0;
+                        fsm.ok_after_gate_ms = 0;
+                        fprintf(stderr, "[FSM] STOP qualified; awaiting OK...\n");
+                    }
+                    break;
+
+                case decltype(fsm.st)::AWAIT_OK_FOR_STOP:
+                    if (fsm.hold_ok_ms >= fsm.hold_ms) {
+                        // publish STOP
+                        mqtt_publish(st->mqtt, R"({"value":{"recording":"stop"}})");
+                        fprintf(stderr, "[TRIGGER] recording STOP\n");
+                        fsm.st = decltype(fsm.st)::IDLE;
+                        fsm.reset_holds();
+                    } else {
+                        if (fsm.ok_after_gate_ms > 4000) {
+                            fprintf(stderr, "[FSM] timeout waiting OK after STOP; back to RECORDING\n");
+                            fsm.st = decltype(fsm.st)::RECORDING;
+                            fsm.hold_stop_ms = 0;
+                            fsm.hold_ok_ms   = 0;
+                        }
+                    }
+                    break;
+            }
+
         } else {
             float p=0.f; int cls = st->gesture.top1(&p);
             fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
@@ -554,7 +737,7 @@ extern "C" void init(CustomerFunction* f)
     // Ensure CUDA primary context retained
     std::call_once(g_ctx_once, retain_primary_context_once);
 
-    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1; 3-class START/STOP/OK)\n");
+    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1)\n");
 }
 
 extern "C" void deinit(void)

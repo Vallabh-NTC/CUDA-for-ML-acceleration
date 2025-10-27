@@ -15,7 +15,9 @@ __device__ __forceinline__ float clamp01(float v) {
  * @brief NV12(Y) → 96x96, FIT_LONGEST + letterbox (padding=0 after normalization).
  *
  * Mapping:
- *  - Compute a single scale so that the **longest** source side matches the output side.
+ *  - Compute a single scale so that the **longest source side fits inside** the output side.
+ *    (i.e., scale = min(OW/srcW, OH/srcH)). This preserves the full image and letterboxes
+ *    the short side — matching Edge Impulse's EI_CLASSIFIER_RESIZE_FIT_LONGEST.
  *  - Center the scaled image inside the 96x96 canvas, filling the rest with 0.0.
  *  - Bilinear interpolation in source space.
  *  - Normalization:
@@ -39,10 +41,10 @@ __global__ void nv12_y_to_norm_96_fit_longest(
         return;
     }
 
-    // Scale so that the LONGEST source side matches output
+    // ---- Correct FIT_LONGEST letterbox scale: min(...) ----
     const float sX = static_cast<float>(OW) / static_cast<float>(srcW);
     const float sY = static_cast<float>(OH) / static_cast<float>(srcH);
-    const float scale = (sX > sY) ? sX : sY;     // max(sX, sY)
+    const float scale = (sX < sY) ? sX : sY;   // preserve entire image, pad short side
 
     // Drawn area in output space
     const float drawnW = scale * static_cast<float>(srcW);
