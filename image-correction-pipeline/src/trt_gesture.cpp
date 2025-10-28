@@ -92,6 +92,11 @@ bool Engine::load_from_file(const std::string& path, cudaStream_t /*video_stream
     const size_t inElems = volume(inDims);
     outElems             = volume(outDims);
 
+    if (outElems < 2) {
+        fprintf(stderr, "[trt] expected 2 outputs (START/STOP), got %zu\n", outElems);
+        return false;
+    }
+
     inBytes     = inElems  * (inputIsFP16  ? sizeof(__half) : sizeof(float));
     outBytesDev = outElems * (outputIsFP16 ? sizeof(__half) : sizeof(float));
 
@@ -108,10 +113,10 @@ bool Engine::load_from_file(const std::string& path, cudaStream_t /*video_stream
     // Event
     cudaEventCreateWithFlags(&ev_trt_done, cudaEventDisableTiming);
 
-    // Label map (default EI order; allow env override)
-    set_label_map(/*start*/1, /*stop*/2, /*ok*/0);
+    // Label map (default 2-class: start=0, stop=1; allow env override)
+    set_label_map(/*start*/0, /*stop*/1);
     load_label_map_from_env();
-    fprintf(stderr, "[trt] label map: ok=%d start=%d stop=%d\n", idx_ok, idx_start, idx_stop);
+    fprintf(stderr, "[trt] label map: start=%d stop=%d\n", idx_start, idx_stop);
 
     fprintf(stderr, "[trt] engine loaded: inIdx=%d(%zuB) outIdx=%d(outElems=%zu, devBytes=%zu) FP16in=%d FP16out=%d\n",
             inIdx, inBytes, outIdx, outElems, outBytesDev, (int)inputIsFP16, (int)outputIsFP16);
@@ -163,8 +168,8 @@ bool Engine::try_commit_host_output() {
     return true;
 }
 
+// Heuristic: looks like probabilities if all in [0,1] and sum ~ 1
 static inline bool is_prob_like(const float* v, size_t n) {
-    // All in [0,1] and sum ~ 1 (tolerances allow for fp noise)
     if (n == 0) return false;
     double sum = 0.0;
     for (size_t i=0;i<n;++i) {
@@ -191,7 +196,10 @@ int Engine::top1(float* probOut) const {
     float maxv = *std::max_element(hostOut.begin(), hostOut.end());
     double den = 0.0;
     std::vector<float> probs(hostOut.size());
-    for (size_t i=0;i<hostOut.size();++i) { probs[i] = std::exp(hostOut[i]-maxv); den += probs[i]; }
+    for (size_t i=0;i<hostOut.size();++i) {
+        probs[i] = std::exp(hostOut[i]-maxv);
+        den += probs[i];
+    }
     int arg = 0; float best = (float)(probs[0]/den);
     for (size_t i=1;i<probs.size();++i) {
         float p = (float)(probs[i]/den);
@@ -201,43 +209,36 @@ int Engine::top1(float* probOut) const {
     return arg;
 }
 
-bool Engine::get_start_stop_ok(float& start_score, float& stop_score, float& ok_score,
-                               float& p_start, float& p_stop, float& p_ok, int& top_class) const
+bool Engine::get_start_stop(float& start_score, float& stop_score,
+                            float& p_start, float& p_stop, int& top_class) const
 {
     const int n = (int)hostOut.size();
-    if (n <= idx_start || n <= idx_stop || n <= idx_ok) return false;
+    if (n <= idx_start || n <= idx_stop) return false;
 
     // Engine output in mapped order
     start_score = hostOut[idx_start];
     stop_score  = hostOut[idx_stop];
-    ok_score    = hostOut[idx_ok];
 
     if (is_prob_like(hostOut.data(), hostOut.size())) {
-        // The network already applied softmax; treat scores as probabilities.
+        // Already probabilities.
         p_start = start_score;
         p_stop  = stop_score;
-        p_ok    = ok_score;
     } else {
-        // Compute softmax across the three mapped indices only.
-        const float m  = std::max(start_score, std::max(stop_score, ok_score));
+        // Softmax across the two mapped indices only.
+        const float m  = std::max(start_score, stop_score);
         const float eS = std::exp(start_score - m);
         const float eT = std::exp(stop_score  - m);
-        const float eK = std::exp(ok_score    - m);
-        const float den = eS + eT + eK;
+        const float den = eS + eT;
         p_start = eS / den;
         p_stop  = eT / den;
-        p_ok    = eK / den;
     }
 
-    // Top among (start, stop, ok)
-    top_class = 0; float best = p_start;
-    if (p_stop > best) { best = p_stop; top_class = 1; }
-    if (p_ok   > best) { best = p_ok;   top_class = 2; }
+    top_class = (p_start >= p_stop) ? 0 : 1; // 0=START, 1=STOP
     return true;
 }
 
-void Engine::set_label_map(int start_idx, int stop_idx, int ok_idx) {
-    idx_start = start_idx; idx_stop = stop_idx; idx_ok = ok_idx;
+void Engine::set_label_map(int start_idx, int stop_idx) {
+    idx_start = start_idx; idx_stop = stop_idx;
 }
 
 static bool parse_kv_index(const char* env, const char* key, int& out) {
@@ -251,14 +252,13 @@ static bool parse_kv_index(const char* env, const char* key, int& out) {
 }
 
 bool Engine::load_label_map_from_env() {
-    const char* env = std::getenv("TRT_LABEL_MAP"); // e.g. "start=1,stop=2,ok=0"
+    const char* env = std::getenv("TRT_LABEL_MAP"); // e.g. "start=0,stop=1"
     if (!env) return false;
-    int s = idx_start, t = idx_stop, k = idx_ok;
+    int s = idx_start, t = idx_stop;
     parse_kv_index(env, "start", s);
     parse_kv_index(env, "stop",  t);
-    parse_kv_index(env, "ok",    k);
-    idx_start = s; idx_stop = t; idx_ok = k;
-    fprintf(stderr, "[trt] label map (env): ok=%d start=%d stop=%d\n", idx_ok, idx_start, idx_stop);
+    idx_start = s; idx_stop = t;
+    fprintf(stderr, "[trt] label map (env): start=%d stop=%d\n", idx_start, idx_stop);
     return true;
 }
 

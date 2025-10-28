@@ -13,15 +13,18 @@
  * Env toggles:
  *   TRT_TV_RANGE=0/1     : 0 = full-range 0..255 → 0..1 (default, like Edge Impulse)
  *                          1 = TV range 16..235 → 0..1
- *   TRT_LABEL_MAP="start=1,stop=2,ok=0"  : override label indices without rebuild
- *   TRT_DUMP_EI_RAW=1    : print EI-order raw vector (ok,start,stop) per frame
+ *   TRT_LABEL_MAP="start=0,stop=1"  : override output indices without rebuild
+ *   TRT_DUMP_EI_RAW=1    : print raw vector per frame in the model’s mapped order
  *
- * MQTT / FSM (questa integrazione):
- *   MQTT_URL=tcp://HOST:PORT   (oppure MQTT_HOST / MQTT_PORT)
+ * MQTT / FSM (simplified integration):
+ *   MQTT_URL=tcp://HOST:PORT   (or MQTT_HOST / MQTT_PORT)
  *   MQTT_TOPIC=jetson/stream/cmd
  *   MQTT_USER=...  MQTT_PASS=...
- *   GESTURE_TH_START=0.80  GESTURE_TH_STOP=0.80  GESTURE_TH_OK=0.80
- *   GESTURE_HOLD_MS=1200   (durata richiesta per ciascun passo)
+ *   GESTURE_HOLD_START_MS=1200   (optional; default 1200)
+ *   GESTURE_HOLD_STOP_MS=1200    (optional; default 1200)
+ *   GESTURE_CYCLE_RESET_MS=8000  (optional; default 8000)
+ *   GESTURE_START_P=0.75         (optional; default 0.75)  probability threshold for START
+ *   GESTURE_STOP_P=0.80          (optional; default 0.80)  probability threshold for STOP
  */
 
 #include <cstdio>
@@ -99,6 +102,12 @@ static std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c){ return (char)std::tolower(c); });
     return s;
+}
+
+static float clamp01(float v) {
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
 }
 
 // Determine "cam0|cam1|cam2" from the loaded .so name (or a parent folder)
@@ -228,32 +237,33 @@ struct ICPState {
     MqttCfg mqtt{};
     bool mqtt_checked_once = false;
 
+    // -------------------- 2-step FSM (START → STOP) --------------------
     struct {
-        // config
-        float th_start = 0.80f;
-        float th_stop  = 0.80f;
-        float th_ok    = 0.80f;
-        int   hold_ms  = 1200;
+        // hold durations (ms)
+        int   hold_start_target_ms = 800;   // need 1.2 s of START as top1
+        int   hold_stop_target_ms  = 800;   // then 1.2 s of STOP  as top1
+        // watchdog window (ms)
+        int   cycle_reset_ms       = 5000;   // reset sequence after 8 s
+        // probability thresholds
+        float start_prob_thresh    = 0.75f;  // require START ≥ 0.75
+        float stop_prob_thresh     = 0.80f;  // require STOP  ≥ 0.80
 
-        // state machine
-        enum class State { IDLE, AWAIT_OK_FOR_START, RECORDING, AWAIT_OK_FOR_STOP } st = State::IDLE;
+        // phase machine: SEEK_START → SEEK_STOP
+        enum class Phase { SEEK_START, SEEK_STOP } phase = Phase::SEEK_START;
+
+        // timers
         std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point t_cycle_start = std::chrono::steady_clock::now();
+        int hold_start_ms = 0;   // accumulated time with START as top1 (and ≥ threshold)
+        int hold_stop_ms  = 0;   // accumulated time with STOP  as top1 (and ≥ threshold)
 
-        int hold_start_ms = 0;
-        int hold_stop_ms  = 0;
-        int hold_ok_ms    = 0;
-        int ok_after_gate_ms = 0; // timer while waiting the second step
+        // current belief of recording state (toggles on completion)
+        bool recording = false;
 
-        // helpers
-        void reset_holds(){ hold_start_ms=hold_stop_ms=hold_ok_ms=0; }
-        void tick_delta_ms(int dms, float ps, float pt, float pok){
-            // Update per-class holds
-            if (ps >= th_start) hold_start_ms += dms; else hold_start_ms = 0;
-            if (pt >= th_stop ) hold_stop_ms  += dms; else hold_stop_ms  = 0;
-            if (pok>= th_ok   ) hold_ok_ms    += dms; else hold_ok_ms    = 0;
-
-            // Gate timer for the second step
-            ok_after_gate_ms = (st==State::AWAIT_OK_FOR_START || st==State::AWAIT_OK_FOR_STOP) ? (ok_after_gate_ms + dms) : 0;
+        void reset_phase_to_start() {
+            phase = Phase::SEEK_START;
+            hold_start_ms = hold_stop_ms = 0;
+            t_cycle_start = std::chrono::steady_clock::now();
         }
     } fsm;
 };
@@ -289,7 +299,6 @@ extern "C" int ic_has_instance_for(const char* section /* "cam0|cam1|cam2" */) {
     return 0;
 }
 // -----------------------------------------------------------------------------
-
 
 // ----------------------------------------------------------------------------
 // Alloc helpers
@@ -422,20 +431,31 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st)
 }
 
 // ----------------------------------------------------------------------------
-// FSM helper: init MQTT + thresholds from env
+// FSM helper: init MQTT + durations from env
 // ----------------------------------------------------------------------------
 static void ensure_mqtt_and_fsm_config(ICPState* st){
     if (!st->mqtt_checked_once){
         st->mqtt_checked_once = true;
         parse_mqtt_env(st->mqtt);
 
-        if (const char* v = std::getenv("GESTURE_TH_START"); v && *v) st->fsm.th_start = std::max(0.f, std::min(1.f, (float)atof(v)));
-        if (const char* v = std::getenv("GESTURE_TH_STOP" ); v && *v) st->fsm.th_stop  = std::max(0.f, std::min(1.f, (float)atof(v)));
-        if (const char* v = std::getenv("GESTURE_TH_OK"   ); v && *v) st->fsm.th_ok    = std::max(0.f, std::min(1.f, (float)atof(v)));
-        if (const char* v = std::getenv("GESTURE_HOLD_MS" ); v && *v) st->fsm.hold_ms  = std::max(100, atoi(v));
+        // Optional overrides; defaults match spec
+        if (const char* v = std::getenv("GESTURE_HOLD_START_MS"); v && *v)
+            st->fsm.hold_start_target_ms = std::max(100, atoi(v));
+        if (const char* v = std::getenv("GESTURE_HOLD_STOP_MS"); v && *v)
+            st->fsm.hold_stop_target_ms = std::max(100, atoi(v));
+        if (const char* v = std::getenv("GESTURE_CYCLE_RESET_MS"); v && *v)
+            st->fsm.cycle_reset_ms = std::max(1000, atoi(v));
 
-        fprintf(stderr, "[FSM] th_start=%.2f th_stop=%.2f th_ok=%.2f hold_ms=%d mqtt=%s:%d topic=%s\n",
-            st->fsm.th_start, st->fsm.th_stop, st->fsm.th_ok, st->fsm.hold_ms,
+        // Probability thresholds (0..1)
+        if (const char* v = std::getenv("GESTURE_START_P"); v && *v)
+            st->fsm.start_prob_thresh = clamp01(strtof(v, nullptr));
+        if (const char* v = std::getenv("GESTURE_STOP_P"); v && *v)
+            st->fsm.stop_prob_thresh  = clamp01(strtof(v, nullptr));
+
+        fprintf(stderr, "[FSM] hold_start=%dms hold_stop=%dms cycle_reset=%dms "
+                        "p_thresh(start=%.2f stop=%.2f) mqtt=%s:%d topic=%s\n",
+            st->fsm.hold_start_target_ms, st->fsm.hold_stop_target_ms, st->fsm.cycle_reset_ms,
+            st->fsm.start_prob_thresh, st->fsm.stop_prob_thresh,
             st->mqtt.host.c_str(), st->mqtt.port, st->mqtt.topic.c_str());
     }
 }
@@ -629,95 +649,88 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     if (st->gesture.engine && st->gesture.try_commit_host_output()) {
         ensure_mqtt_and_fsm_config(st);
 
-        // (A) EI-order raw dump (true tensor order: ok=0, start=1, stop=2)
+        // (A) Raw dump (two-class head: start, stop)
         if (const char* dumpEI = std::getenv("TRT_DUMP_EI_RAW"); dumpEI && *dumpEI=='1') {
-            const float v_ok    = st->gesture.hostOut[0];
-            const float v_start = st->gesture.hostOut[1];
-            const float v_stop  = st->gesture.hostOut[2];
-            fprintf(stderr, "[gesture][%s] EI-order raw: ok=%.3f start=%.3f stop=%.3f | sum=%.3f\n",
-                    st->controls.section().c_str(), v_ok, v_start, v_stop, v_ok+v_start+v_stop);
+            const float v_start = st->gesture.hostOut[st->gesture.idx_start];
+            const float v_stop  = st->gesture.hostOut[st->gesture.idx_stop];
+            fprintf(stderr, "[gesture][%s] raw: start=%.3f stop=%.3f\n",
+                    st->controls.section().c_str(), v_start, v_stop);
         }
 
-        // (B) Pretty print using logical mapping (START/STOP/OK)
-        float sL=0.f, tL=0.f, okL=0.f, ps=0.f, pt=0.f, pok=0.f; int top=-1;
-        if (st->gesture.get_start_stop_ok(sL, tL, okL, ps, pt, pok, top)) {
-            const char* top_lbl = (top==0) ? "START" : (top==1 ? "STOP" : "OK");
+        // (B) Pretty print using logical mapping (2-class: START/STOP)
+        float sL=0.f, tL=0.f, ps=0.f, pt=0.f; int top=-1;
+        if (st->gesture.get_start_stop(sL, tL, ps, pt, top)) {
+            const char* top_lbl = (top==0) ? "START" : "STOP";
             fprintf(stderr,
-                "[gesture][%s] logits/scores: start=%.3f stop=%.3f ok=%.3f | p: start=%.3f stop=%.3f ok=%.3f | top=%s\n",
-                st->controls.section().c_str(), sL, tL, okL, ps, pt, pok, top_lbl);
+                "[gesture][%s] logits/scores: start=%.3f stop=%.3f | p: start=%.3f stop=%.3f | top=%s\n",
+                st->controls.section().c_str(), sL, tL, ps, pt, top_lbl);
 
-            // --------- FSM update ----------
+            // Threshold gating: accumulate holds only when top class also passes its threshold
+            const bool start_ok = (top == 0) && (ps >= st->fsm.start_prob_thresh);
+            const bool stop_ok  = (top == 1) && (pt >= st->fsm.stop_prob_thresh);
+
+            // --------- 2-step FSM (START → STOP → toggle) ----------
             using clk = std::chrono::steady_clock;
             auto now = clk::now();
             int dms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - st->fsm.t_last).count();
             if (dms < 0 || dms > 1000) dms = 0; // guard
             st->fsm.t_last = now;
 
-            st->fsm.tick_delta_ms(dms, ps, pt, pok);
+            // initialize cycle start on first run of SEEK_START
+            if (st->fsm.hold_start_ms == 0 && st->fsm.hold_stop_ms == 0 &&
+                st->fsm.phase == decltype(st->fsm.phase)::SEEK_START) {
+                st->fsm.t_cycle_start = now;
+            }
 
-            auto &fsm = st->fsm;
+            // Watchdog: reset whole sequence every cycle_reset_ms
+            int cycle_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - st->fsm.t_cycle_start).count();
+            if (cycle_elapsed_ms > st->fsm.cycle_reset_ms) {
+                fprintf(stderr, "[FSM] cycle watchdog (%d ms) → reset to SEEK_START\n", cycle_elapsed_ms);
+                st->fsm.reset_phase_to_start();
+            }
 
-            switch (fsm.st) {
-                case decltype(fsm.st)::IDLE:
-                    // Need START ≥ hold_ms, then OK ≥ hold_ms
-                    if (fsm.hold_start_ms >= fsm.hold_ms) {
-                        fsm.st = decltype(fsm.st)::AWAIT_OK_FOR_START;
-                        fsm.hold_ok_ms = 0;
-                        fsm.ok_after_gate_ms = 0;
-                        fprintf(stderr, "[FSM] START qualified; awaiting OK...\n");
-                    }
-                    break;
-
-                case decltype(fsm.st)::AWAIT_OK_FOR_START:
-                    // OK must be held ≥ hold_ms after START was qualified
-                    if (fsm.hold_ok_ms >= fsm.hold_ms) {
-                        // publish START
-                        mqtt_publish(st->mqtt, R"({"value":{"recording":"start"}})");
-                        fprintf(stderr, "[TRIGGER] recording START\n");
-                        fsm.st = decltype(fsm.st)::RECORDING;
-                        fsm.reset_holds();
-                    } else {
-                        // optional timeout to reset if nothing happens for a while
-                        if (fsm.ok_after_gate_ms > 4000) {
-                            fprintf(stderr, "[FSM] timeout waiting OK after START; reset\n");
-                            fsm.st = decltype(fsm.st)::IDLE;
-                            fsm.reset_holds();
+            switch (st->fsm.phase) {
+                case decltype(st->fsm.phase)::SEEK_START:
+                    // accumulate time ONLY when START is top1 AND ≥ threshold
+                    if (start_ok) {
+                        st->fsm.hold_start_ms += dms;
+                        if (st->fsm.hold_start_ms >= st->fsm.hold_start_target_ms) {
+                            st->fsm.phase = decltype(st->fsm.phase)::SEEK_STOP;
+                            st->fsm.hold_stop_ms = 0;
+                            // If you want STOP to have its own full watchdog window, uncomment:
+                            // st->fsm.t_cycle_start = now;
+                            fprintf(stderr, "[FSM] START confirmed (%.3fs). Now seeking STOP...\n",
+                                    st->fsm.hold_start_ms / 1000.0);
                         }
                     }
                     break;
 
-                case decltype(fsm.st)::RECORDING:
-                    // Need STOP ≥ hold_ms, then OK ≥ hold_ms
-                    if (fsm.hold_stop_ms >= fsm.hold_ms) {
-                        fsm.st = decltype(fsm.st)::AWAIT_OK_FOR_STOP;
-                        fsm.hold_ok_ms = 0;
-                        fsm.ok_after_gate_ms = 0;
-                        fprintf(stderr, "[FSM] STOP qualified; awaiting OK...\n");
-                    }
-                    break;
+                case decltype(st->fsm.phase)::SEEK_STOP:
+                    // accumulate time ONLY when STOP is top1 AND ≥ threshold
+                    if (stop_ok) {
+                        st->fsm.hold_stop_ms += dms;
+                        if (st->fsm.hold_stop_ms >= st->fsm.hold_stop_target_ms) {
+                            // Completed START→STOP: toggle recording immediately
+                            bool next_rec = !st->fsm.recording;
+                            const char* action = next_rec ? "start" : "stop";
+                            std::string payload = std::string("{\"value\":{\"recording\":\"") + action + "\"}}";
+                            mqtt_publish(st->mqtt, payload);
 
-                case decltype(fsm.st)::AWAIT_OK_FOR_STOP:
-                    if (fsm.hold_ok_ms >= fsm.hold_ms) {
-                        // publish STOP
-                        mqtt_publish(st->mqtt, R"({"value":{"recording":"stop"}})");
-                        fprintf(stderr, "[TRIGGER] recording STOP\n");
-                        fsm.st = decltype(fsm.st)::IDLE;
-                        fsm.reset_holds();
-                    } else {
-                        if (fsm.ok_after_gate_ms > 4000) {
-                            fprintf(stderr, "[FSM] timeout waiting OK after STOP; back to RECORDING\n");
-                            fsm.st = decltype(fsm.st)::RECORDING;
-                            fsm.hold_stop_ms = 0;
-                            fsm.hold_ok_ms   = 0;
+                            fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n", action);
+
+                            st->fsm.recording = next_rec;
+                            st->fsm.reset_phase_to_start(); // begin a new cycle
                         }
                     }
                     break;
             }
 
         } else {
+            // Fallback if mapping helper failed; use generic top1
             float p=0.f; int cls = st->gesture.top1(&p);
             fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
                     st->controls.section().c_str(), cls, p);
+            // We don't drive the FSM here because label mapping is unknown
         }
     }
 
@@ -737,7 +750,7 @@ extern "C" void init(CustomerFunction* f)
     // Ensure CUDA primary context retained
     std::call_once(g_ctx_once, retain_primary_context_once);
 
-    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1)\n");
+    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1; 2-class START/STOP)\n");
 }
 
 extern "C" void deinit(void)

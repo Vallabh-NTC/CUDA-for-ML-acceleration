@@ -4,15 +4,18 @@
  * @brief Minimal TensorRT wrapper for a single .engine used for gesture recognition,
  *        instrumented for debugging.
  *
- * Key points:
- * - One input, one output binding (dynamic shapes allowed).
- * - Input 1x1x96x96 (FP16 or FP32).
- * - Output 3 values, default label order matches Edge Impulse:
- *      ok=0, start=1, stop=2   (override via env TRT_LABEL_MAP="start=1,stop=2,ok=0")
- * - Robust dtype handling: output can be FP32 or FP16; we convert to float on host.
- * - Probability-head detection: if outputs already look like probabilities, we do NOT
- *   apply softmax again; else we softmax logits exactly once.
- * - Exposes a "done" event so the caller can fence the async D2H.
+ * Two-class head (no "OK"):
+ *  - Classes: START and STOP (indices configurable via env).
+ *  - Output size: 2 values. If they already look like probabilities ([0,1], sum≈1),
+ *    we do NOT apply softmax again; otherwise we softmax once.
+ *
+ * Env override:
+ *   TRT_LABEL_MAP="start=0,stop=1"
+ *
+ * Input:
+ *  - One input binding 1x1x96x96 (FP16 or FP32).
+ * Output:
+ *  - One output binding with 2 elements (FP16 or FP32).
  */
 
 #include <NvInfer.h>
@@ -46,7 +49,7 @@ struct Engine {
     bool   inputIsFP16   = false;
     bool   outputIsFP16  = false;
     size_t inBytes       = 0;
-    size_t outElems      = 0;    // number of floats in output
+    size_t outElems      = 0;    // number of floats in output (expect 2)
     size_t outBytesDev   = 0;    // device bytes (depends on dtype)
 
     // Device buffers
@@ -59,13 +62,12 @@ struct Engine {
     void*              hostOutPinnedRaw = nullptr;
     std::vector<float> hostOut;
 
-    // Optional event: caller will record this after async D2H to signal completion.
+    // Event set by the caller when D2H has been enqueued; polled via try_commit_host_output()
     cudaEvent_t ev_trt_done = nullptr;
 
-    // Label mapping (default = Edge Impulse: ok=0, start=1, stop=2)
-    int idx_ok    = 0;
-    int idx_start = 1;
-    int idx_stop  = 2;
+    // Label mapping (default: start=0, stop=1)
+    int idx_start = 0;
+    int idx_stop  = 1;
 
     // API
     bool load_from_file(const std::string& path, cudaStream_t video_stream /*unused*/);
@@ -77,12 +79,12 @@ struct Engine {
     // Top-1 index (returns argmax; if probOut!=nullptr returns the winning prob).
     int  top1(float* probOut = nullptr) const;
 
-    // 3-class helper in logical order (START/STOP/OK via idx_* mapping).
-    bool get_start_stop_ok(float& start_score, float& stop_score, float& ok_score,
-                           float& p_start, float& p_stop, float& p_ok, int& top_class) const;
+    // 2-class helper in logical order (START/STOP via idx_* mapping).
+    bool get_start_stop(float& start_score, float& stop_score,
+                        float& p_start, float& p_stop, int& top_class) const;
 
     // Mapping helpers
-    void set_label_map(int start_idx, int stop_idx, int ok_idx);
+    void set_label_map(int start_idx, int stop_idx);
     bool load_label_map_from_env();
 
     // Cleanup
