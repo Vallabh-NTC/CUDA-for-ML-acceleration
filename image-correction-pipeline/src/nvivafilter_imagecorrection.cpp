@@ -18,6 +18,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <unistd.h>   // getpid()
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -145,6 +146,44 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
     if (!c.pass.empty()) cmd += " -P " + shell_quote(c.pass);
     int rc = std::system(cmd.c_str());
     fprintf(stderr, "[MQTT] rc=%d topic=%s payload=%s\n", rc, c.topic.c_str(), payload.c_str());
+}
+
+// ============================================================================
+// Audio TTS helper (pico2wave + paplay)  <-- ADDED
+// ============================================================================
+static void speak_async(const std::string& phrase) {
+    // Allow overriding binaries from env, else use defaults.
+    const char* pico_bin = std::getenv("PICOWAVE_BIN");
+    const char* play_bin = std::getenv("PAPLAY_BIN");
+    const std::string pico = (pico_bin && *pico_bin) ? pico_bin : "/usr/bin/pico2wave";
+    const std::string play = (play_bin && *play_bin) ? play_bin : "/usr/bin/paplay";
+
+    // Optional language (default en-US)
+    const char* lang_env = std::getenv("PICOWAVE_LANG");
+    const std::string lang = (lang_env && *lang_env) ? lang_env : "en-US";
+
+    // Allow disabling via env
+    if (const char* disa = std::getenv("GESTURE_AUDIO_DISABLE"); disa && *disa=='1') {
+        fprintf(stderr, "[AUDIO] disabled by GESTURE_AUDIO_DISABLE=1 (phrase=%s)\n", phrase.c_str());
+        return;
+    }
+
+    // Unique temp path in RAM FS
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    const std::string tmpwav = "/dev/shm/tts_" + std::to_string(getpid()) + "_" + std::to_string(ns) + ".wav";
+
+    // Build command
+    std::string cmd = shell_quote(pico) + " -l " + shell_quote(lang)
+                    + " -w " + shell_quote(tmpwav) + " " + shell_quote(phrase)
+                    + " && " + shell_quote(play) + " " + shell_quote(tmpwav)
+                    + " ; rm -f " + shell_quote(tmpwav);
+
+    // Run detached so the pipeline stays non-blocking.
+    std::thread([cmd=std::move(cmd), phrase](){
+        int rc = std::system(cmd.c_str());
+        fprintf(stderr, "[AUDIO] rc=%d phrase=%s\n", rc, phrase.c_str());
+    }).detach();
 }
 
 // ============================================================================
@@ -518,6 +557,14 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                             std::string payload = std::string("{\"value\":{\"recording\":\"") + action + "\"}}";
                             mqtt_publish(st->mqtt, payload);
                             fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n", action);
+
+                            // ---- Audio feedback (non-blocking)  <-- ADDED
+                            if (next_rec) {
+                                speak_async("Recording started");
+                            } else {
+                                speak_async("Recording stopped");
+                            }
+
                             st->fsm.recording = next_rec; st->fsm.reset_phase_to_start();
                         }
                     }
@@ -546,4 +593,3 @@ extern "C" void deinit(void){
     for (auto* st : to_free) destroy_instance(st);
     release_primary_context(); ic_clear_instance_hints();
 }
-
