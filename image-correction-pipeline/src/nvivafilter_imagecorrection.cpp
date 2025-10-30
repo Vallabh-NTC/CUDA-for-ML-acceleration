@@ -1,5 +1,5 @@
 /**
- * @file nvivafilter_imagecorrection.cpp (decoupled TRT stream + device FIFO)
+ * @file nvivafilter_imagecorrection.cpp (decoupled TRT stream + device FIFO + UI indicator JSON)
  */
 
 #include <cstdio>
@@ -18,7 +18,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include <unistd.h>   // getpid()
+#include <unistd.h>   // getpid(), unlink()
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -149,41 +149,66 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
 }
 
 // ============================================================================
-// Audio TTS helper (pico2wave + paplay)  <-- ADDED
+// Audio TTS helper (pico2wave + paplay)  <-- unchanged
 // ============================================================================
 static void speak_async(const std::string& phrase) {
-    // Allow overriding binaries from env, else use defaults.
     const char* pico_bin = std::getenv("PICOWAVE_BIN");
     const char* play_bin = std::getenv("PAPLAY_BIN");
     const std::string pico = (pico_bin && *pico_bin) ? pico_bin : "/usr/bin/pico2wave";
     const std::string play = (play_bin && *play_bin) ? play_bin : "/usr/bin/paplay";
-
-    // Optional language (default en-US)
     const char* lang_env = std::getenv("PICOWAVE_LANG");
     const std::string lang = (lang_env && *lang_env) ? lang_env : "en-US";
-
-    // Allow disabling via env
     if (const char* disa = std::getenv("GESTURE_AUDIO_DISABLE"); disa && *disa=='1') {
         fprintf(stderr, "[AUDIO] disabled by GESTURE_AUDIO_DISABLE=1 (phrase=%s)\n", phrase.c_str());
         return;
     }
-
-    // Unique temp path in RAM FS
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     const std::string tmpwav = "/dev/shm/tts_" + std::to_string(getpid()) + "_" + std::to_string(ns) + ".wav";
-
-    // Build command
     std::string cmd = shell_quote(pico) + " -l " + shell_quote(lang)
                     + " -w " + shell_quote(tmpwav) + " " + shell_quote(phrase)
                     + " && " + shell_quote(play) + " " + shell_quote(tmpwav)
                     + " ; rm -f " + shell_quote(tmpwav);
-
-    // Run detached so the pipeline stays non-blocking.
     std::thread([cmd=std::move(cmd), phrase](){
         int rc = std::system(cmd.c_str());
         fprintf(stderr, "[AUDIO] rc=%d phrase=%s\n", rc, phrase.c_str());
     }).detach();
+}
+
+// ============================================================================
+// NEW: UI indicator helper — atomic JSON to /dev/shm with logs
+// ============================================================================
+static void emit_ui_indicator_json(int cam, const char* indicator) {
+    if (cam != 1) return; // Only cam1 surfaces this UI (can be generalized later)
+    const char* final_path = "/dev/shm/ui_cam1.json";
+    const char* tmp_path   = "/dev/shm/ui_cam1.tmp";
+
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "{ \"cam\": %d, \"indicator\": \"%s\" }\n", cam, indicator ? indicator : "off");
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        fprintf(stderr, "[UI] snprintf failed for indicator='%s'\n", indicator ? indicator : "(null)");
+        return;
+    }
+
+    FILE* f = fopen(tmp_path, "wb");
+    if (!f) {
+        fprintf(stderr, "[UI] fopen(tmp) failed: %s\n", tmp_path);
+        return;
+    }
+    size_t wr = fwrite(buf, 1, (size_t)n, f);
+    if (wr != (size_t)n) {
+        fprintf(stderr, "[UI] fwrite short (%zu/%d) to %s\n", wr, n, tmp_path);
+        fclose(f);
+        unlink(tmp_path);
+        return;
+    }
+    fclose(f);
+    if (rename(tmp_path, final_path) != 0) {
+        fprintf(stderr, "[UI] rename(%s -> %s) failed\n", tmp_path, final_path);
+        unlink(tmp_path);
+        return;
+    }
+    fprintf(stderr, "[UI] wrote %s: %s", final_path, buf);
 }
 
 // ============================================================================
@@ -365,6 +390,12 @@ static ICPState* create_instance(){
     std::string sec; { std::lock_guard<std::mutex> lk(g_hint_mtx); if (!g_next_section_hints.empty()){ sec = std::move(g_next_section_hints.front()); g_next_section_hints.pop_front(); } }
     if (sec.empty()) sec = section_from_loaded_name(); st->controls.set_section(sec);
     fprintf(stderr, "[ic] Instance bound to section '%s'\n", sec.c_str());
+
+    // NEW: seed UI for cam1 as "yellow" (FSM starts in SEEK_START)
+    if (sec == "cam1") {
+        emit_ui_indicator_json(1, "yellow");
+    }
+
     { std::lock_guard<std::mutex> lk(g_instances_mtx); g_instances.push_back(st);} return st;
 }
 
@@ -394,48 +425,37 @@ static int acquire_free_slot(ICPState* st){
         int idx = st->prod_idx;
         auto s = (ICPState::SlotState) st->slots[idx].state.load(std::memory_order_relaxed);
         if (s == ICPState::SlotState::FREE) return idx;
-        // Try next slot (drop policy: mark as FREE if INFLIGHT done)
-        // We opportunistically free INFLIGHT slots that have completed
         if (s == ICPState::SlotState::INFLIGHT && cudaEventQuery(st->slots[idx].ev_done) == cudaSuccess){
             st->slots[idx].state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
             return idx;
         }
         st->prod_idx = (st->prod_idx + 1) % ICPState::kSlots;
     }
-    // If all are busy, drop-oldest: take current prod_idx and overwrite
     return st->prod_idx;
 }
 
 static void kick_trt_for_ready_slots(ICPState* st){
     if (!st->gesture.engine || !st->trt_stream) return;
-    // Consume any READY slots. We schedule at most one per call to bound queueing.
     for (int i=0;i<ICPState::kSlots;++i){
         auto &slot = st->slots[i];
         auto s = (ICPState::SlotState) slot.state.load(std::memory_order_acquire);
         if (s != ICPState::SlotState::READY) continue;
-        // Wait on the producer event (device-side)
         cudaStreamWaitEvent(st->trt_stream, slot.ev_ready, 0);
-        // Bindings: use slot.dTensor as input directly (no extra copy)
         void* bindings[2];
         bindings[st->gesture.inIdx]  = slot.dTensor;
         bindings[st->gesture.outIdx] = st->gesture.dOut;
         if (!st->gesture.context->enqueueV2(bindings, st->trt_stream, nullptr)){
             fprintf(stderr, "[gesture] enqueueV2 failed\n");
-            // On failure, free the slot so pipeline keeps moving
             slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
             continue;
         }
-        // Async D2H of the 2-class output
         const size_t dbytes = st->gesture.outElems * (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float));
         cudaMemcpyAsync(st->gesture.hostOutPinnedRaw, st->gesture.dOut, dbytes, cudaMemcpyDeviceToHost, st->trt_stream);
-        // Record per-slot done and also the engine-level event for logging/FSM
         cudaEventRecord(slot.ev_done, st->trt_stream);
         cudaEventRecord(st->gesture.ev_trt_done, st->trt_stream);
         slot.state.store((int)ICPState::SlotState::INFLIGHT, std::memory_order_release);
-        break; // schedule at most one per call (frames drive the cadence)
+        break;
     }
-
-    // Reclaim finished INFLIGHT slots
     for (int i=0;i<ICPState::kSlots;++i){
         auto &slot = st->slots[i];
         if ((ICPState::SlotState)slot.state.load(std::memory_order_relaxed) == ICPState::SlotState::INFLIGHT){
@@ -482,7 +502,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                              f_fish, fx, cx_rect, cy_rect,
                              st->video_stream);
 
-    // 2) Wire removal (if mask matches and belongs to this instance)
+    // 2) Wire removal
     if (st->mask.valid && st->mask.W==W && st->mask.H==H){
         const int my_idx = section_to_index(st->controls.section());
         if (my_idx == st->mask.cam_index){
@@ -492,9 +512,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
         }
     }
 
-    // =====================================================================
-    // NEW: AI enable gate — run gesture pipeline ONLY if ai_enabled == 1
-    // =====================================================================
+    // AI gate
     const bool ai_on = st->controls.ai_enabled();
 
     // 2.8) Gesture pipeline setup (cam1 only) — guarded by ai_on
@@ -502,9 +520,8 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
         ensure_gesture_loaded_for_cam1(st);
         if (st->gesture.engine) {
             bool tv_range = false; if (const char* e = std::getenv("TRT_TV_RANGE")) tv_range = (*e=='1');
-            // [DECPL] Acquire a slot and write the 96x96 tensor on the VIDEO stream
             int slot_idx = acquire_free_slot(st); auto &slot = st->slots[slot_idx];
-            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed); // ensure known base state
+            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
             if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch,
                                                      slot.dTensor,
                                                      st->gesture.inputIsFP16,
@@ -516,18 +533,17 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                 slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
                 st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
             }
-            // [DECPL] Kick TRT consumption for any READY slot(s)
             kick_trt_for_ready_slots(st);
         }
     } else {
-        // AI disabled: skip gesture preprocessing + TRT scheduling entirely.
+        // AI disabled: skip gesture
     }
 
     // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(dY, W, H, pitch, dUV, pitch, cp, st->video_stream);
 
-    // Fence the per-frame VIDEO work (not the TRT stream)
+    // Fence VIDEO work
     cudaStreamSynchronize(st->video_stream);
 
     // ---- FSM + MQTT if a fresh result is available AND AI is enabled ----
@@ -547,7 +563,14 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
             if (dms < 0 || dms > 1000) dms = 0; st->fsm.t_last = now;
             if (st->fsm.hold_start_ms==0 && st->fsm.hold_stop_ms==0 && st->fsm.phase==decltype(st->fsm.phase)::SEEK_START) st->fsm.t_cycle_start = now;
             int cycle_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - st->fsm.t_cycle_start).count();
-            if (cycle_elapsed_ms > st->fsm.cycle_reset_ms) { fprintf(stderr, "[FSM] cycle watchdog (%d ms) → reset to SEEK_START\n", cycle_elapsed_ms); st->fsm.reset_phase_to_start(); }
+            if (cycle_elapsed_ms > st->fsm.cycle_reset_ms) {
+                fprintf(stderr, "[FSM] cycle watchdog (%d ms) → reset to SEEK_START\n", cycle_elapsed_ms);
+                st->fsm.reset_phase_to_start();
+                // NEW: UI = yellow (seeking START) — only for cam1
+                if (st->controls.section() == std::string("cam1")) {
+                    emit_ui_indicator_json(1, "yellow");
+                }
+            }
             switch (st->fsm.phase) {
                 case decltype(st->fsm.phase)::SEEK_START:
                     if (start_ok) {
@@ -555,6 +578,10 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                         if (st->fsm.hold_start_ms >= st->fsm.hold_start_target_ms) {
                             st->fsm.phase = decltype(st->fsm.phase)::SEEK_STOP; st->fsm.hold_stop_ms = 0;
                             fprintf(stderr, "[FSM] START confirmed (%.3fs). Now seeking STOP...\n", st->fsm.hold_start_ms/1000.0);
+                            // NEW: UI = green (START confirmed) — only for cam1
+                            if (st->controls.section() == std::string("cam1")) {
+                                emit_ui_indicator_json(1, "green");
+                            }
                         }
                     }
                     break;
@@ -567,14 +594,19 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                             mqtt_publish(st->mqtt, payload);
                             fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n", action);
 
-                            // ---- Audio feedback (non-blocking)
                             if (next_rec) {
                                 speak_async("Recording started");
                             } else {
                                 speak_async("Recording stopped");
                             }
 
-                            st->fsm.recording = next_rec; st->fsm.reset_phase_to_start();
+                            st->fsm.recording = next_rec;
+                            st->fsm.reset_phase_to_start();
+
+                            // NEW: UI = yellow (back to seeking START) — only for cam1
+                            if (st->controls.section() == std::string("cam1")) {
+                                emit_ui_indicator_json(1, "yellow");
+                            }
                         }
                     }
                     break;
