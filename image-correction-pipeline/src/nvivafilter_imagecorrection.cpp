@@ -492,26 +492,35 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
         }
     }
 
-    // 2.8) Gesture pipeline setup (cam1 only)
-    ensure_gesture_loaded_for_cam1(st);
-    if (st->gesture.engine) {
-        bool tv_range = false; if (const char* e = std::getenv("TRT_TV_RANGE")) tv_range = (*e=='1');
-        // [DECPL] Acquire a slot and write the 96x96 tensor on the VIDEO stream
-        int slot_idx = acquire_free_slot(st); auto &slot = st->slots[slot_idx];
-        slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed); // ensure known base state
-        if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch,
-                                                 slot.dTensor,
-                                                 st->gesture.inputIsFP16,
-                                                 tv_range,
-                                                 st->video_stream)) {
-            fprintf(stderr, "[gesture] preprocess enqueue failed\n");
-        } else {
-            cudaEventRecord(slot.ev_ready, st->video_stream);
-            slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
-            st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
+    // =====================================================================
+    // NEW: AI enable gate — run gesture pipeline ONLY if ai_enabled == 1
+    // =====================================================================
+    const bool ai_on = st->controls.ai_enabled();
+
+    // 2.8) Gesture pipeline setup (cam1 only) — guarded by ai_on
+    if (ai_on) {
+        ensure_gesture_loaded_for_cam1(st);
+        if (st->gesture.engine) {
+            bool tv_range = false; if (const char* e = std::getenv("TRT_TV_RANGE")) tv_range = (*e=='1');
+            // [DECPL] Acquire a slot and write the 96x96 tensor on the VIDEO stream
+            int slot_idx = acquire_free_slot(st); auto &slot = st->slots[slot_idx];
+            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed); // ensure known base state
+            if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch,
+                                                     slot.dTensor,
+                                                     st->gesture.inputIsFP16,
+                                                     tv_range,
+                                                     st->video_stream)) {
+                fprintf(stderr, "[gesture] preprocess enqueue failed\n");
+            } else {
+                cudaEventRecord(slot.ev_ready, st->video_stream);
+                slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
+                st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
+            }
+            // [DECPL] Kick TRT consumption for any READY slot(s)
+            kick_trt_for_ready_slots(st);
         }
-        // [DECPL] Kick TRT consumption for any READY slot(s)
-        kick_trt_for_ready_slots(st);
+    } else {
+        // AI disabled: skip gesture preprocessing + TRT scheduling entirely.
     }
 
     // 3) Tone + color (hot-reload)
@@ -521,8 +530,8 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     // Fence the per-frame VIDEO work (not the TRT stream)
     cudaStreamSynchronize(st->video_stream);
 
-    // ---- FSM + MQTT if a fresh result is available ----
-    if (st->gesture.engine && st->gesture.try_commit_host_output()) {
+    // ---- FSM + MQTT if a fresh result is available AND AI is enabled ----
+    if (ai_on && st->gesture.engine && st->gesture.try_commit_host_output()) {
         ensure_mqtt_and_fsm_config(st);
         if (const char* dumpEI = std::getenv("TRT_DUMP_EI_RAW"); dumpEI && *dumpEI=='1'){
             const float v_start = st->gesture.hostOut[st->gesture.idx_start];
@@ -558,7 +567,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                             mqtt_publish(st->mqtt, payload);
                             fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n", action);
 
-                            // ---- Audio feedback (non-blocking)  <-- ADDED
+                            // ---- Audio feedback (non-blocking)
                             if (next_rec) {
                                 speak_async("Recording started");
                             } else {
