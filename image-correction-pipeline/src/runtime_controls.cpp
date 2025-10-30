@@ -35,6 +35,7 @@ static bool json_extract_object(const std::string& s, const std::string& key, st
 template<typename T>
 static bool json_get_number(const std::string& s, const char* key, T& out)
 {
+    // Matches integers or floats, optionally in scientific notation.
     std::regex re(std::string("\"") + key + R"("\s*:\s*([-+]?\d+(\.\d+)?([eE][-+]?\d+)?))");
     std::smatch m; if (std::regex_search(s, m, re)) { out = static_cast<T>(std::stod(m[1])); return true; }
     return false;
@@ -79,6 +80,7 @@ bool RuntimeControls::reload()
     std::string txt;
     if (!read_text(path_, txt)) return false;
 
+    // Scope used for camera color parameters (cam section or flat JSON)
     std::string scope = txt;
     if (!section_.empty()) {
         std::string sub;
@@ -86,8 +88,10 @@ bool RuntimeControls::reload()
         // else: no section found -> keep using full text as a fallback
     }
 
-    ColorParams p = cached_; // start from current; override selectively
+    // Start from cached values; override selectively
+    ColorParams p = cached_;
 
+    // --- Camera (scoped) parameters ---
     json_get_bool(scope,  "enable",      p.enable);
     json_get_bool(scope,  "tv_range",    p.tv_range);
 
@@ -104,6 +108,27 @@ bool RuntimeControls::reload()
     json_get_number(scope, "brilliance",  p.brilliance);
     json_get_number(scope, "sharpness",   p.sharpness);
 
+    // --- Global (root) AI flag ---
+    // Read from the full JSON text (root), not from the camera section.
+    // Accept both numeric 0/1 and boolean true/false for robustness.
+    bool ai_ok = false;
+    {
+        int ai_num = 0;
+        if (json_get_number(txt, "ai_enabled", ai_num)) {
+            cached_ai_enabled_ = (ai_num != 0);
+            ai_ok = true;
+        } else {
+            bool ai_bool = false;
+            if (json_get_bool(txt, "ai_enabled", ai_bool)) {
+                cached_ai_enabled_ = ai_bool;
+                ai_ok = true;
+            }
+        }
+        // If neither numeric nor boolean found, keep previous cached_ai_enabled_
+        // (default remains false until the key appears).
+        (void)ai_ok;
+    }
+
     cached_ = p;
     return true;
 }
@@ -112,7 +137,7 @@ ColorParams RuntimeControls::current()
 {
     MTime mt;
     if (exists_and_mtime(mt)) {
-        if (last_mtime_.sec == 0 && last_mtime_.nsec == 0 || mt != last_mtime_) {
+        if ((last_mtime_.sec == 0 && last_mtime_.nsec == 0) || mt != last_mtime_) {
             if (reload()) last_mtime_ = mt;
         }
     }
