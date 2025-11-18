@@ -35,7 +35,8 @@ set(CUDA_SOURCES
     src/kernel_rectify.cu
     src/wire_lineremoval.cu
     src/color_ops.cu
-    src/ei_gesture_infer.cu
+    #src/ei_gesture_infer.cu
+    src/kernel_crop_nv12.cu
 )
 
 set(CPP_SOURCES

@@ -32,7 +32,8 @@
 #include "wire_lineremoval.cuh"
 
 #include "trt_gesture.hpp"
-#include "ei_gesture_infer.cuh"
+//#include "ei_gesture_infer.cuh"
+#include "kernel_crop_nv12.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -522,17 +523,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
             bool tv_range = false; if (const char* e = std::getenv("TRT_TV_RANGE")) tv_range = (*e=='1');
             int slot_idx = acquire_free_slot(st); auto &slot = st->slots[slot_idx];
             slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
-            if (!ei::enqueue_preprocess_to_trt_input(dY, W, H, pitch,
-                                                     slot.dTensor,
-                                                     st->gesture.inputIsFP16,
-                                                     tv_range,
-                                                     st->video_stream)) {
-                fprintf(stderr, "[gesture] preprocess enqueue failed\n");
-            } else {
-                cudaEventRecord(slot.ev_ready, st->video_stream);
-                slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
-                st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
-            }
+            // --- Replace Edge Impulse preprocess with crop kernel ---
+            const int roiX = 1067, roiY = 1230, roiW = 1567, roiH = 930;
+            crop::launch_crop_nv12(dY, dUV, W, H, pitch, roiX, roiY, roiW, roiH, st->video_stream);
+            fprintf(stderr, "[ic][crop_nv12] ROI applied (x=%d y=%d w=%d h=%d)\n", roiX, roiY, roiW, roiH);
+            cudaEventRecord(slot.ev_ready, st->video_stream);
+            slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
+            st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
             kick_trt_for_ready_slots(st);
         }
     } else {
