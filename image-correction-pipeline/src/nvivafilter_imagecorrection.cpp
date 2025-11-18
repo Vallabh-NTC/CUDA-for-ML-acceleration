@@ -517,16 +517,35 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     const bool ai_on = st->controls.ai_enabled();
 
     // 2.8) Gesture pipeline setup (cam1 only) — guarded by ai_on
-    if (ai_on) {
+    //if (ai_on) {
+    if (true) {
         ensure_gesture_loaded_for_cam1(st);
-        if (st->gesture.engine) {
-            bool tv_range = false; if (const char* e = std::getenv("TRT_TV_RANGE")) tv_range = (*e=='1');
-            int slot_idx = acquire_free_slot(st); auto &slot = st->slots[slot_idx];
+        //if (st->gesture.engine) {
+        if (true) {
+            bool tv_range = false;
+            if (const char* e = std::getenv("TRT_TV_RANGE"))
+                tv_range = (*e == '1');
+
+            int slot_idx = acquire_free_slot(st);
+            auto& slot = st->slots[slot_idx];
             slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
+
             // --- Replace Edge Impulse preprocess with crop kernel ---
-            const int roiX = 1067, roiY = 1230, roiW = 1567, roiH = 930;
-            crop::launch_crop_nv12(dY, dUV, W, H, pitch, roiX, roiY, roiW, roiH, st->video_stream);
-            fprintf(stderr, "[ic][crop_nv12] ROI applied (x=%d y=%d w=%d h=%d)\n", roiX, roiY, roiW, roiH);
+            const int roiX = 1008, roiY = 1062, roiW = 1600, roiH = 1200;
+
+            // 🔧 Add detailed debug prints around crop launch
+            //fprintf(stderr,
+            //        "[crop][debug] ROI(%d,%d,%d,%d) pitch=%d → launching crop_nv12 kernel\n",
+            //        roiX, roiY, roiW, roiH, pitch);
+
+            crop::launch_crop_nv12(dY, dUV, W, H, pitch,
+                                roiX, roiY, roiW, roiH,
+                                st->video_stream);
+
+            //fprintf(stderr,
+            //        "[ic][crop_nv12] ROI applied (x=%d y=%d w=%d h=%d)\n",
+            //        roiX, roiY, roiW, roiH);
+
             cudaEventRecord(slot.ev_ready, st->video_stream);
             slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
             st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
@@ -535,6 +554,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     } else {
         // AI disabled: skip gesture
     }
+
 
     // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();
