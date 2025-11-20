@@ -1,5 +1,6 @@
 /**
- * @file nvivafilter_imagecorrection.cpp (decoupled TRT stream + device FIFO + UI indicator JSON)
+ * @file nvivafilter_imagecorrection.cpp
+ * (decoupled TRT stream + device FIFO + UI indicator JSON + ROI preprocess)
  */
 
 #include <cstdio>
@@ -32,23 +33,18 @@
 #include "wire_lineremoval.cuh"
 
 #include "trt_gesture.hpp"
-//#include "ei_gesture_infer.cuh"
-#include "kernel_crop_nv12.cuh"
+#include "ei_gesture_infer.cuh"
 
-#include <NvInfer.h>
-#include <fstream>
-#include <vector>
-#include "nv12_to_rgb_chw.cuh"
+// ⭐ nuovo: draw box su NV12
 #include "kernel_draw_box_nv12.cuh"
-
-
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 constexpr float M_PI_F = static_cast<float>(M_PI);
 
-static const char* kGestureEnginePath = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp32_xavier.engine";
+// 🔹 path del modello mano (come da tuoi log)
+static const char* kGestureEnginePath = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp16.engine";
 
 // ============================================================================
 // Global CUDA primary context (shared across instances)
@@ -129,24 +125,53 @@ static std::string mask_meta_path_for(int cam_idx) {
 // ============================================================================
 // MQTT helpers (unchanged, elided except for declarations)
 // ============================================================================
-struct MqttCfg { std::string host; int port=1883; std::string topic="jetson/stream/cmd"; std::string user; std::string pass; bool valid=false; };
-static std::string shell_quote(const std::string& s){ std::string o; o.reserve(s.size()+8); o.push_back('\''); for(char c: s){ if(c=='\'') o += "'\"'\"'"; else o.push_back(c);} o.push_back('\''); return o; }
+struct MqttCfg {
+    std::string host;
+    int port=1883;
+    std::string topic="jetson/stream/cmd";
+    std::string user;
+    std::string pass;
+    bool valid=false;
+};
+
+static std::string shell_quote(const std::string& s){
+    std::string o;
+    o.reserve(s.size()+8);
+    o.push_back('\'');
+    for(char c: s){
+        if(c=='\'') o += "'\"'\"'";
+        else o.push_back(c);
+    }
+    o.push_back('\'');
+    return o;
+}
+
 static void parse_mqtt_env(MqttCfg& out){
     const char* url = std::getenv("MQTT_URL");
     if (url && *url) {
-        std::string u(url); auto pos = u.find("://"); std::string rest = (pos==std::string::npos)? u : u.substr(pos+3);
-        auto colon = rest.find(':'); if (colon!=std::string::npos){ out.host = rest.substr(0, colon); try { out.port = std::stoi(rest.substr(colon+1)); } catch(...) {} }
-        else { out.host = rest; }
+        std::string u(url);
+        auto pos = u.find("://");
+        std::string rest = (pos==std::string::npos)? u : u.substr(pos+3);
+        auto colon = rest.find(':');
+        if (colon!=std::string::npos){
+            out.host = rest.substr(0, colon);
+            try { out.port = std::stoi(rest.substr(colon+1)); } catch(...) {}
+        } else {
+            out.host = rest;
+        }
     }
     if (const char* h = std::getenv("MQTT_HOST"); h && *h) out.host = h;
-    if (const char* p = std::getenv("MQTT_PORT"); p && *p){ try{ out.port = std::stoi(p);}catch(...){} }
+    if (const char* p = std::getenv("MQTT_PORT"); p && *p){
+        try{ out.port = std::stoi(p);}catch(...){} }
     if (const char* t = std::getenv("MQTT_TOPIC"); t && *t) out.topic = t;
     if (const char* u = std::getenv("MQTT_USER");  u && *u) out.user  = u;
     if (const char* pw= std::getenv("MQTT_PASS");  pw&& *pw) out.pass  = pw;
     out.valid = !out.host.empty();
 }
+
 static void mqtt_publish(const MqttCfg& c, const std::string& payload){
-    if (!c.valid) return; const char* bin = "/usr/bin/mosquitto_pub";
+    if (!c.valid) return;
+    const char* bin = "/usr/bin/mosquitto_pub";
     std::string cmd = std::string(bin) + " -h " + shell_quote(c.host)
                     + " -p " + std::to_string(c.port)
                     + " -t " + shell_quote(c.topic)
@@ -158,7 +183,7 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
 }
 
 // ============================================================================
-// Audio TTS helper (pico2wave + paplay)  <-- unchanged
+// Audio TTS helper (pico2wave + paplay)
 // ============================================================================
 static void speak_async(const std::string& phrase) {
     const char* pico_bin = std::getenv("PICOWAVE_BIN");
@@ -185,7 +210,7 @@ static void speak_async(const std::string& phrase) {
 }
 
 // ============================================================================
-// NEW: UI indicator helper — atomic JSON to /dev/shm with logs
+// UI indicator helper — atomic JSON to /dev/shm con log
 // ============================================================================
 static void emit_ui_indicator_json(int cam, const char* indicator) {
     if (cam != 1) return; // Only cam1 surfaces this UI (can be generalized later)
@@ -193,9 +218,11 @@ static void emit_ui_indicator_json(int cam, const char* indicator) {
     const char* tmp_path   = "/dev/shm/ui_cam1.tmp";
 
     char buf[128];
-    int n = snprintf(buf, sizeof(buf), "{ \"cam\": %d, \"indicator\": \"%s\" }\n", cam, indicator ? indicator : "off");
+    int n = snprintf(buf, sizeof(buf), "{ \"cam\": %d, \"indicator\": \"%s\" }\n",
+                     cam, indicator ? indicator : "off");
     if (n <= 0 || n >= (int)sizeof(buf)) {
-        fprintf(stderr, "[UI] snprintf failed for indicator='%s'\n", indicator ? indicator : "(null)");
+        fprintf(stderr, "[UI] snprintf failed for indicator='%s'\n",
+                indicator ? indicator : "(null)");
         return;
     }
 
@@ -225,9 +252,9 @@ static void emit_ui_indicator_json(int cam, const char* indicator) {
 // ============================================================================
 struct ICPState {
     CUcontext     ctx   = nullptr;
-    cudaStream_t  video_stream = nullptr;   // [DECPL] renamed from stream
+    cudaStream_t  video_stream = nullptr;   // main video stream
 
-    // [DECPL] Separate TRT stream for inference
+    // Separate TRT stream for inference
     cudaStream_t  trt_stream   = nullptr;
 
     // Scratch (NV12) for rectification
@@ -241,18 +268,28 @@ struct ICPState {
 
     float crop_frac = 0.0f;
 
-    struct DeviceMask { CUdeviceptr dMask=0; size_t pitch=0; int W=0,H=0; float dx=0.f,dy=0.f; bool valid=false; int cam_index=-1; } mask{};
+    struct DeviceMask {
+        CUdeviceptr dMask=0;
+        size_t pitch=0;
+        int W=0,H=0;
+        float dx=0.f,dy=0.f;
+        bool valid=false;
+        int cam_index=-1;
+    } mask{};
     bool mask_checked_once = false;
 
     // Gesture NN (TensorRT), only used on cam1
     trt::Engine gesture;
     bool gesture_loaded_once = false;
 
-    // [DECPL] Device FIFO of preprocessed 1x1x96x96 tensors
+    // bytes dell’input tensor (1x3x244x244 fp32/fp16)
+    size_t gesture_input_bytes = 0;
+
+    // Device FIFO of preprocessed tensors
     static constexpr int kSlots = 4; // small ring to keep latency bounded
     enum class SlotState : int { FREE=0, READY=1, INFLIGHT=2 };
     struct Slot {
-        void*      dTensor = nullptr;   // FP16 or FP32 matching engine input
+        void*      dTensor = nullptr;   // FP16 o FP32 matching engine input
         cudaEvent_t ev_ready = nullptr; // signaled on video_stream when tensor is written
         cudaEvent_t ev_done  = nullptr; // signaled on trt_stream when TRT+D2H queued
         std::atomic<int> state{(int)SlotState::FREE};
@@ -271,16 +308,39 @@ struct ICPState {
         std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point t_cycle_start = std::chrono::steady_clock::now();
         int hold_start_ms = 0; int hold_stop_ms = 0; bool recording = false;
-        void reset_phase_to_start(){ phase=Phase::SEEK_START; hold_start_ms=hold_stop_ms=0; t_cycle_start=std::chrono::steady_clock::now(); }
+        void reset_phase_to_start(){
+            phase=Phase::SEEK_START;
+            hold_start_ms=hold_stop_ms=0;
+            t_cycle_start=std::chrono::steady_clock::now();
+        }
     } fsm;
 };
 
-static std::mutex              g_instances_mtx; static std::vector<ICPState*>  g_instances;
-static std::mutex              g_hint_mtx;      static std::deque<std::string> g_next_section_hints;
+static std::mutex              g_instances_mtx;
+static std::vector<ICPState*>  g_instances;
+static std::mutex              g_hint_mtx;
+static std::deque<std::string> g_next_section_hints;
 
-extern "C" void ic_bind_next_instance_to(const char* section){ if(!section||!*section) return; std::string s=to_lower(section); if (s!="cam0"&&s!="cam1"&&s!="cam2") return; std::lock_guard<std::mutex> lk(g_hint_mtx); g_next_section_hints.push_back(std::move(s)); }
-extern "C" void ic_clear_instance_hints(){ std::lock_guard<std::mutex> lk(g_hint_mtx); g_next_section_hints.clear(); }
-extern "C" int ic_has_instance_for(const char* section){ if(!section||!*section) return 0; std::lock_guard<std::mutex> lk(g_instances_mtx); for(auto* st:g_instances){ if(!st) continue; if(st->controls.section()==section) return 1; } return 0; }
+extern "C" void ic_bind_next_instance_to(const char* section){
+    if(!section||!*section) return;
+    std::string s=to_lower(section);
+    if (s!="cam0"&&s!="cam1"&&s!="cam2") return;
+    std::lock_guard<std::mutex> lk(g_hint_mtx);
+    g_next_section_hints.push_back(std::move(s));
+}
+extern "C" void ic_clear_instance_hints(){
+    std::lock_guard<std::mutex> lk(g_hint_mtx);
+    g_next_section_hints.clear();
+}
+extern "C" int ic_has_instance_for(const char* section){
+    if(!section||!*section) return 0;
+    std::lock_guard<std::mutex> lk(g_instances_mtx);
+    for(auto* st:g_instances){
+        if(!st) continue;
+        if(st->controls.section()==section) return 1;
+    }
+    return 0;
+}
 
 // ----------------------------------------------------------------------------
 // Alloc helpers
@@ -299,159 +359,185 @@ static void copy_to_scratch_async(ICPState* st,
                                   size_t pitchY,size_t pitchUV,
                                   int W,int H)
 {
-    CUDA_MEMCPY2D c{}; c.srcMemoryType=CU_MEMORYTYPE_DEVICE; c.dstMemoryType=CU_MEMORYTYPE_DEVICE;
-    c.srcDevice=(CUdeviceptr)dY; c.srcPitch=pitchY; c.dstDevice=st->sY; c.dstPitch=st->pY;
-    c.WidthInBytes=(size_t)W; c.Height=(size_t)H;
-    CUDA_MEMCPY2D c2{}; c2.srcMemoryType=CU_MEMORYTYPE_DEVICE; c2.dstMemoryType=CU_MEMORYTYPE_DEVICE;
-    c2.srcDevice=(CUdeviceptr)dUV; c2.srcPitch=pitchUV; c2.dstDevice=st->sUV; c2.dstPitch=st->pUV;
-    c2.WidthInBytes=(size_t)W; c2.Height=(size_t)(H/2);
+    CUDA_MEMCPY2D c{};
+    c.srcMemoryType=CU_MEMORYTYPE_DEVICE;
+    c.dstMemoryType=CU_MEMORYTYPE_DEVICE;
+    c.srcDevice=(CUdeviceptr)dY;  c.srcPitch=pitchY;
+    c.dstDevice=st->sY;           c.dstPitch=st->pY;
+    c.WidthInBytes=(size_t)W;     c.Height=(size_t)H;
+
+    CUDA_MEMCPY2D c2{};
+    c2.srcMemoryType=CU_MEMORYTYPE_DEVICE;
+    c2.dstMemoryType=CU_MEMORYTYPE_DEVICE;
+    c2.srcDevice=(CUdeviceptr)dUV; c2.srcPitch=pitchUV;
+    c2.dstDevice=st->sUV;          c2.dstPitch=st->pUV;
+    c2.WidthInBytes=(size_t)W;     c2.Height=(size_t)(H/2);
+
     CUstream s = reinterpret_cast<CUstream>(st->video_stream);
-    cuMemcpy2DAsync(&c,  s); cuMemcpy2DAsync(&c2, s);
+    cuMemcpy2DAsync(&c,  s);
+    cuMemcpy2DAsync(&c2, s);
 }
 
 // ----------------------------------------------------------------------------
-// Mask loader (unchanged)
+// Mask loader
 // ----------------------------------------------------------------------------
 static bool load_mask_from_cpu_once(ICPState* st){
-    const std::string sec = st->controls.section(); const int my_idx = section_to_index(sec);
-    if (my_idx < 0) { fprintf(stderr, "[ic] mask: unknown section '%s'\n", sec.c_str()); return false; }
-    const std::string meta = mask_meta_path_for(my_idx); const std::string raw  = mask_raw_path_for(my_idx);
-    FILE* fm = fopen(meta.c_str(), "r"); if (!fm) { fprintf(stderr, "[ic] mask: meta not found for %s (skipping)\n", sec.c_str()); return false; }
-    int W=0,H=0; float dx=0.f,dy=0.f; int n = fscanf(fm, "%d %d %f %f", &W, &H, &dx, &dy); fclose(fm);
-    if (n!=4 || W<=0 || H<=0) { fprintf(stderr, "[ic] mask: bad meta format for %s (skipping)\n", sec.c_str()); return false; }
-    const size_t bytes = (size_t)W*(size_t)H; std::vector<uint8_t> hostMask(bytes);
-    FILE* fr = fopen(raw.c_str(), "rb"); if (!fr) { fprintf(stderr, "[ic] mask: raw not found for %s (skipping)\n", sec.c_str()); return false; }
-    size_t rd=fread(hostMask.data(),1,bytes,fr); fclose(fr); if (rd!=bytes){ fprintf(stderr,"[ic] mask: raw size mismatch for %s (%zu vs %zu)\n", sec.c_str(), rd, bytes); return false; }
-    if (!st->mask.dMask || st->mask.W!=W || st->mask.H!=H){ if (st->mask.dMask) { cuMemFree(st->mask.dMask); st->mask.dMask=0; }
-        CUdeviceptr dptr=0; size_t pitch=0; CUresult rc = cuMemAllocPitch(&dptr,&pitch,(size_t)W,(size_t)H,4);
-        if (rc!=CUDA_SUCCESS){ fprintf(stderr, "[ic] mask: cuMemAllocPitch failed (%d)\n", (int)rc); return false; }
+    const std::string sec = st->controls.section();
+    const int my_idx = section_to_index(sec);
+    if (my_idx < 0) {
+        fprintf(stderr, "[ic] mask: unknown section '%s'\n", sec.c_str());
+        return false;
+    }
+
+    const std::string meta = mask_meta_path_for(my_idx);
+    const std::string raw  = mask_raw_path_for(my_idx);
+
+    FILE* fm = fopen(meta.c_str(), "r");
+    if (!fm) {
+        fprintf(stderr, "[ic] mask: meta not found for %s (skipping)\n", sec.c_str());
+        return false;
+    }
+
+    int W=0,H=0; float dx=0.f,dy=0.f;
+    int n = fscanf(fm, "%d %d %f %f", &W, &H, &dx, &dy);
+    fclose(fm);
+    if (n!=4 || W<=0 || H<=0) {
+        fprintf(stderr, "[ic] mask: bad meta format for %s (skipping)\n", sec.c_str());
+        return false;
+    }
+
+    const size_t bytes = (size_t)W*(size_t)H;
+    std::vector<uint8_t> hostMask(bytes);
+
+    FILE* fr = fopen(raw.c_str(), "rb");
+    if (!fr) {
+        fprintf(stderr, "[ic] mask: raw not found for %s (skipping)\n", sec.c_str());
+        return false;
+    }
+    size_t rd=fread(hostMask.data(),1,bytes,fr);
+    fclose(fr);
+    if (rd!=bytes){
+        fprintf(stderr,"[ic] mask: raw size mismatch for %s (%zu vs %zu)\n",
+                sec.c_str(), rd, bytes);
+        return false;
+    }
+
+    if (!st->mask.dMask || st->mask.W!=W || st->mask.H!=H){
+        if (st->mask.dMask) { cuMemFree(st->mask.dMask); st->mask.dMask=0; }
+        CUdeviceptr dptr=0; size_t pitch=0;
+        CUresult rc = cuMemAllocPitch(&dptr,&pitch,(size_t)W,(size_t)H,4);
+        if (rc!=CUDA_SUCCESS){
+            fprintf(stderr, "[ic] mask: cuMemAllocPitch failed (%d)\n", (int)rc);
+            return false;
+        }
         st->mask.dMask=dptr; st->mask.pitch=pitch; st->mask.W=W; st->mask.H=H;
     }
-    CUDA_MEMCPY2D c{}; c.srcMemoryType=CU_MEMORYTYPE_HOST; c.srcHost=hostMask.data(); c.srcPitch=(size_t)W;
-    c.dstMemoryType=CU_MEMORYTYPE_DEVICE; c.dstDevice=st->mask.dMask; c.dstPitch=st->mask.pitch;
-    c.WidthInBytes=(size_t)W; c.Height=(size_t)H; cuMemcpy2D(&c);
-    st->mask.dx=dx; st->mask.dy=dy; st->mask.cam_index=my_idx; st->mask.valid=true;
-    fprintf(stderr, "[ic] mask: loaded for %s (W=%d H=%d, dx=%.2f dy=%.2f)\n", sec.c_str(), W,H,dx,dy);
+
+    CUDA_MEMCPY2D c{};
+    c.srcMemoryType=CU_MEMORYTYPE_HOST;
+    c.srcHost=hostMask.data();
+    c.srcPitch=(size_t)W;
+    c.dstMemoryType=CU_MEMORYTYPE_DEVICE;
+    c.dstDevice=st->mask.dMask;
+    c.dstPitch=st->mask.pitch;
+    c.WidthInBytes=(size_t)W;
+    c.Height=(size_t)H;
+    cuMemcpy2D(&c);
+
+    st->mask.dx=dx;
+    st->mask.dy=dy;
+    st->mask.cam_index=my_idx;
+    st->mask.valid=true;
+
+    fprintf(stderr, "[ic] mask: loaded for %s (W=%d H=%d, dx=%.2f dy=%.2f)\n",
+            sec.c_str(), W,H,dx,dy);
     return true;
 }
-
-// ----------------------------------------------------------------------------
-// TensorRT engine deserialization test (hand_pose_resnet18_fp16.engine)
-// ----------------------------------------------------------------------------
-static void try_load_handpose_engine_once() {
-    static bool attempted = false;
-    static bool success   = false;
-    if (attempted) return;
-    attempted = true;
-
-    const char* path = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp16_xavier.engine";
-    std::ifstream file(path, std::ios::binary);
-    if (!file.good()) {
-        fprintf(stderr, "[trt-check] Engine file not found: %s\n", path);
-        return;
-    }
-
-    file.seekg(0, std::ifstream::end);
-    size_t size = file.tellg();
-    file.seekg(0, std::ifstream::beg);
-    std::vector<char> engineData(size);
-    file.read(engineData.data(), size);
-    file.close();
-
-    class Logger : public nvinfer1::ILogger {
-        void log(Severity severity, const char* msg) noexcept override {
-            if (severity <= Severity::kWARNING)
-                fprintf(stderr, "[TRT] %s\n", msg);
-        }
-    };
-    static Logger gLogger;
-
-    nvinfer1::IRuntime* runtime = nvinfer1::createInferRuntime(gLogger);
-    if (!runtime) {
-        fprintf(stderr, "[trt-check] Failed to create TensorRT runtime\n");
-        return;
-    }
-
-    nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(engineData.data(), size);
-    if (!engine) {
-        fprintf(stderr, "[trt-check] ❌ Failed to deserialize engine — version or corruption mismatch\n");
-        runtime->destroy();
-        return;
-    }
-
-    int nb = engine->getNbBindings();
-    fprintf(stderr, "[trt-check] ✅ Engine loaded OK from %s (bindings=%d)\n", path, nb);
-    for (int i = 0; i < nb; ++i) {
-        const char* name = engine->getBindingName(i);
-        nvinfer1::Dims dims = engine->getBindingDimensions(i);
-        fprintf(stderr, "   [%d] %s (%s): ", i, name,
-                engine->bindingIsInput(i) ? "input" : "output");
-        for (int j = 0; j < dims.nbDims; ++j)
-            fprintf(stderr, "%d%s", dims.d[j], (j < dims.nbDims - 1 ? "x" : ""));
-        fprintf(stderr, "\n");
-    }
-
-    engine->destroy();
-    runtime->destroy();
-    success = true;
-}
-
-
 
 // ----------------------------------------------------------------------------
 // Gesture helper: lazy-load engine only for cam1 + allocate slots/streams
 // ----------------------------------------------------------------------------
 static void ensure_gesture_loaded_for_cam1(ICPState* st){
-    if (st->gesture_loaded_once) return; st->gesture_loaded_once = true;
+    if (st->gesture_loaded_once) return;
+    st->gesture_loaded_once = true;
+
     if (st->controls.section() != std::string("cam1")) {
-        fprintf(stderr, "[ic] gesture: skipped (section is '%s', only cam1 runs it)\n", st->controls.section().c_str());
+        fprintf(stderr, "[ic] gesture: skipped (section is '%s', only cam1 runs it)\n",
+                st->controls.section().c_str());
         return;
     }
+
     if (!st->gesture.load_from_file(kGestureEnginePath, st->video_stream)) {
         fprintf(stderr, "[ic] gesture: load failed (path=%s)\n", kGestureEnginePath);
         return;
     }
-    // [DECPL] Create trt_stream with lower priority than video_stream
-    int leastPri=0, greatestPri=0; cudaDeviceGetStreamPriorityRange(&leastPri,&greatestPri);
+
+    // Create trt_stream with lower priority than video_stream
+    int leastPri=0, greatestPri=0;
+    cudaDeviceGetStreamPriorityRange(&leastPri,&greatestPri);
 #if CUDART_VERSION >= 11000
-    //cudaStreamCreateWithPriority(&st->trt_stream, cudaStreamNonBlocking, /*medium*/ (leastPri+greatestPri)/2);
-    st->trt_stream = st->video_stream;
+    cudaStreamCreateWithPriority(&st->trt_stream, cudaStreamNonBlocking,
+                                 (leastPri+greatestPri)/2);
 #else
     cudaStreamCreateWithFlags(&st->trt_stream, cudaStreamNonBlocking);
 #endif
-    // [DECPL] Allocate device FIFO slots (dtype matches engine input)
-    const bool fp16 = st->gesture.inputIsFP16; const int OW=96, OH=96; size_t elemBytes = fp16? sizeof(__half): sizeof(float);
-    size_t tensorBytes = (size_t)OW*OH*elemBytes;
-    for (int i=0;i<ICPState::kSlots;++i){
+
+    // Hardcode: input 1x3x244x244
+    const bool fp16 = st->gesture.inputIsFP16;
+    const int  C = 3;
+    const int  H = 244;
+    const int  W = 244;
+
+    size_t elemBytes   = fp16 ? sizeof(__half) : sizeof(float);
+    size_t tensorBytes = (size_t)C * H * W * elemBytes;
+
+    st->gesture_input_bytes = tensorBytes;
+
+    for (int i=0; i<ICPState::kSlots; ++i) {
         cudaMalloc(&st->slots[i].dTensor, tensorBytes);
         cudaEventCreateWithFlags(&st->slots[i].ev_ready, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&st->slots[i].ev_done,  cudaEventDisableTiming);
         st->slots[i].state.store((int)ICPState::SlotState::FREE);
     }
-    fprintf(stderr, "[ic] gesture: ready (path=%s) with %d slots, dtype=%s\n",
-            kGestureEnginePath, ICPState::kSlots, fp16?"fp16":"fp32");
-    
-    fprintf(stderr,
-    "[DEBUG][ALLOC] gesture.dIn=%p bytes=%zu (expected=%zu)\n",
-    st->gesture.dIn,
-    st->gesture.inBytes,
-    (size_t)(1*3*244*244*sizeof(float)));
 
+    fprintf(stderr,
+        "[ic] gesture: input shape 1x%dx%dx%d bytes/elem=%zu tensorBytes=%zu (fp16=%d)\n",
+        C, H, W, elemBytes, tensorBytes, fp16?1:0);
+
+    fprintf(stderr,
+        "[ic] gesture: ready (path=%s) with %d slots, dtype=%s (input 1x%dx%dx%d, %zu bytes)\n",
+        kGestureEnginePath,
+        ICPState::kSlots,
+        fp16 ? "fp16" : "fp32",
+        C, H, W,
+        tensorBytes);
 }
 
 // ----------------------------------------------------------------------------
-// FSM helper: init MQTT + durations from env (unchanged)
+// FSM helper: init MQTT + durations from env
 // ----------------------------------------------------------------------------
 static void ensure_mqtt_and_fsm_config(ICPState* st){
-    if (!st->mqtt_checked_once){ st->mqtt_checked_once = true; parse_mqtt_env(st->mqtt);
-        if (const char* v = std::getenv("GESTURE_HOLD_START_MS"); v && *v) st->fsm.hold_start_target_ms = std::max(100, atoi(v));
-        if (const char* v = std::getenv("GESTURE_HOLD_STOP_MS"); v && *v)  st->fsm.hold_stop_target_ms  = std::max(100, atoi(v));
-        if (const char* v = std::getenv("GESTURE_CYCLE_RESET_MS"); v && *v) st->fsm.cycle_reset_ms = std::max(1000, atoi(v));
-        if (const char* v = std::getenv("GESTURE_START_P"); v && *v) st->fsm.start_prob_thresh = clamp01(strtof(v, nullptr));
-        if (const char* v = std::getenv("GESTURE_STOP_P");  v && *v) st->fsm.stop_prob_thresh  = clamp01(strtof(v, nullptr));
-        fprintf(stderr, "[FSM] hold_start=%dms hold_stop=%dms cycle_reset=%dms p_thresh(start=%.2f stop=%.2f) mqtt=%s:%d topic=%s\n",
-            st->fsm.hold_start_target_ms, st->fsm.hold_stop_target_ms, st->fsm.cycle_reset_ms,
-            st->fsm.start_prob_thresh, st->fsm.stop_prob_thresh,
+    if (!st->mqtt_checked_once){
+        st->mqtt_checked_once = true;
+        parse_mqtt_env(st->mqtt);
+        if (const char* v = std::getenv("GESTURE_HOLD_START_MS"); v && *v)
+            st->fsm.hold_start_target_ms = std::max(100, atoi(v));
+        if (const char* v = std::getenv("GESTURE_HOLD_STOP_MS"); v && *v)
+            st->fsm.hold_stop_target_ms  = std::max(100, atoi(v));
+        if (const char* v = std::getenv("GESTURE_CYCLE_RESET_MS"); v && *v)
+            st->fsm.cycle_reset_ms = std::max(1000, atoi(v));
+        if (const char* v = std::getenv("GESTURE_START_P"); v && *v)
+            st->fsm.start_prob_thresh = clamp01(strtof(v, nullptr));
+        if (const char* v = std::getenv("GESTURE_STOP_P");  v && *v)
+            st->fsm.stop_prob_thresh  = clamp01(strtof(v, nullptr));
+        fprintf(stderr,
+            "[FSM] hold_start=%dms hold_stop=%dms cycle_reset=%dms "
+            "p_thresh(start=%.2f stop=%.2f) mqtt=%s:%d topic=%s\n",
+            st->fsm.hold_start_target_ms,
+            st->fsm.hold_stop_target_ms,
+            st->fsm.cycle_reset_ms,
+            st->fsm.start_prob_thresh,
+            st->fsm.stop_prob_thresh,
             st->mqtt.host.c_str(), st->mqtt.port, st->mqtt.topic.c_str());
     }
 }
@@ -461,38 +547,54 @@ static void ensure_mqtt_and_fsm_config(ICPState* st){
 // ----------------------------------------------------------------------------
 static ICPState* create_instance(){
     std::call_once(g_ctx_once, retain_primary_context_once);
-    auto* st = new ICPState(); st->ctx = g_primary_ctx; cuCtxSetCurrent(st->ctx);
+    auto* st = new ICPState();
+    st->ctx = g_primary_ctx;
+    cuCtxSetCurrent(st->ctx);
 #if CUDART_VERSION >= 11000
     cudaStreamCreateWithPriority(&st->video_stream, cudaStreamNonBlocking, /*high*/ 0);
 #else
     cudaStreamCreateWithFlags(&st->video_stream, cudaStreamNonBlocking);
 #endif
-    std::string sec; { std::lock_guard<std::mutex> lk(g_hint_mtx); if (!g_next_section_hints.empty()){ sec = std::move(g_next_section_hints.front()); g_next_section_hints.pop_front(); } }
-    if (sec.empty()) sec = section_from_loaded_name(); st->controls.set_section(sec);
+    std::string sec;
+    {
+        std::lock_guard<std::mutex> lk(g_hint_mtx);
+        if (!g_next_section_hints.empty()){
+            sec = std::move(g_next_section_hints.front());
+            g_next_section_hints.pop_front();
+        }
+    }
+    if (sec.empty()) sec = section_from_loaded_name();
+    st->controls.set_section(sec);
     fprintf(stderr, "[ic] Instance bound to section '%s'\n", sec.c_str());
 
-    // NEW: seed UI for cam1 as "yellow" (FSM starts in SEEK_START)
+    // seed UI for cam1 as "yellow" (FSM starts in SEEK_START)
     if (sec == "cam1") {
         emit_ui_indicator_json(1, "yellow");
     }
 
-    { std::lock_guard<std::mutex> lk(g_instances_mtx); g_instances.push_back(st);} return st;
+    {
+        std::lock_guard<std::mutex> lk(g_instances_mtx);
+        g_instances.push_back(st);
+    }
+    return st;
 }
 
 static void destroy_instance(ICPState* st){
-    if (!st) return; cuCtxSetCurrent(st->ctx);
+    if (!st) return;
+    cuCtxSetCurrent(st->ctx);
     if (st->sY)  { cuMemFree(st->sY);  st->sY  = 0; }
     if (st->sUV) { cuMemFree(st->sUV); st->sUV = 0; }
     if (st->mask.dMask) { cuMemFree(st->mask.dMask); st->mask.dMask = 0; }
-    for (int i=0;i<ICPState::kSlots;++i){ if (st->slots[i].dTensor) cudaFree(st->slots[i].dTensor);
+    for (int i=0;i<ICPState::kSlots;++i){
+        if (st->slots[i].dTensor) cudaFree(st->slots[i].dTensor);
         if (st->slots[i].ev_ready) cudaEventDestroy(st->slots[i].ev_ready);
-        if (st->slots[i].ev_done)  cudaEventDestroy(st->slots[i].ev_done); }
+        if (st->slots[i].ev_done)  cudaEventDestroy(st->slots[i].ev_done);
+    }
     st->gesture.destroy();
     if (st->trt_stream)   { cudaStreamDestroy(st->trt_stream);   st->trt_stream=nullptr; }
     if (st->video_stream) { cudaStreamDestroy(st->video_stream); st->video_stream=nullptr; }
-    st->ctx=nullptr; delete st;
-    //if (dYcrop)  { cuMemFree(dYcrop);  dYcrop  = 0; }
-    //if (dUVcrop) { cuMemFree(dUVcrop); dUVcrop = 0; }
+    st->ctx=nullptr;
+    delete st;
 }
 
 // ----------------------------------------------------------------------------
@@ -501,14 +603,16 @@ static void destroy_instance(ICPState* st){
 static void pre_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*, ColorFormat*, unsigned int, void **){}
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*, ColorFormat*, unsigned int, void **){}
 
-// [DECPL] Helper: advance to a FREE slot, dropping oldest if needed
+// Helper: advance to a FREE slot, dropping oldest if needed
 static int acquire_free_slot(ICPState* st){
     for (int tries=0; tries<ICPState::kSlots; ++tries){
         int idx = st->prod_idx;
         auto s = (ICPState::SlotState) st->slots[idx].state.load(std::memory_order_relaxed);
         if (s == ICPState::SlotState::FREE) return idx;
-        if (s == ICPState::SlotState::INFLIGHT && cudaEventQuery(st->slots[idx].ev_done) == cudaSuccess){
-            st->slots[idx].state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
+        if (s == ICPState::SlotState::INFLIGHT &&
+            cudaEventQuery(st->slots[idx].ev_done) == cudaSuccess){
+            st->slots[idx].state.store((int)ICPState::SlotState::FREE,
+                                       std::memory_order_relaxed);
             return idx;
         }
         st->prod_idx = (st->prod_idx + 1) % ICPState::kSlots;
@@ -516,33 +620,87 @@ static int acquire_free_slot(ICPState* st){
     return st->prod_idx;
 }
 
+// manda in TRT gli slot READY, usa tutti i binding (input+outputs)
 static void kick_trt_for_ready_slots(ICPState* st){
     if (!st->gesture.engine || !st->trt_stream) return;
-    for (int i=0;i<ICPState::kSlots;++i){
-        auto &slot = st->slots[i];
-        auto s = (ICPState::SlotState) slot.state.load(std::memory_order_acquire);
+
+    // cerca un READY da mandare in TRT
+    for (int i = 0; i < ICPState::kSlots; ++i) {
+        auto& slot = st->slots[i];
+        auto s = (ICPState::SlotState)slot.state.load(std::memory_order_acquire);
         if (s != ICPState::SlotState::READY) continue;
+
+        // aspetta preprocess su video_stream
         cudaStreamWaitEvent(st->trt_stream, slot.ev_ready, 0);
-        void* bindings[2];
-        bindings[st->gesture.inIdx]  = slot.dTensor;
-        bindings[st->gesture.outIdx] = st->gesture.dOut;
-        if (!st->gesture.context->enqueueV2(bindings, st->trt_stream, nullptr)){
+
+        if (st->gesture.nbBindings <= 0) {
+            fprintf(stderr, "[gesture] nbBindings invalid (%d)\n", st->gesture.nbBindings);
+            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
+            continue;
+        }
+
+        // riempiamo TUTTI i binding: input viene dallo slot, outputs da devBindings
+        std::vector<void*> bindings(st->gesture.nbBindings, nullptr);
+        for (int b = 0; b < st->gesture.nbBindings; ++b) {
+            if (b == st->gesture.inIdx) {
+                bindings[b] = slot.dTensor; // input (ROI pre-processata)
+            } else {
+                if (b >= 0 && b < (int)st->gesture.devBindings.size()) {
+                    bindings[b] = st->gesture.devBindings[b];
+                }
+            }
+        }
+
+        // sanity check
+        if (!bindings[st->gesture.inIdx] || !bindings[st->gesture.outIdx]) {
+            fprintf(stderr, "[gesture] bindings for inIdx(%d) or outIdx(%d) are null\n",
+                    st->gesture.inIdx, st->gesture.outIdx);
+            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
+            continue;
+        }
+
+        (void)cudaGetLastError();
+
+        if (!st->gesture.context->enqueueV2(bindings.data(), st->trt_stream, nullptr)) {
             fprintf(stderr, "[gesture] enqueueV2 failed\n");
             slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
             continue;
         }
-        const size_t dbytes = st->gesture.outElems * (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float));
-        cudaMemcpyAsync(st->gesture.hostOutPinnedRaw, st->gesture.dOut, dbytes, cudaMemcpyDeviceToHost, st->trt_stream);
+
+        const size_t dbytes = st->gesture.outElems *
+                              (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float));
+        cudaError_t mrc = cudaMemcpyAsync(
+            st->gesture.hostOutPinnedRaw,
+            st->gesture.dOut,
+            dbytes,
+            cudaMemcpyDeviceToHost,
+            st->trt_stream
+        );
+        if (mrc != cudaSuccess) {
+            fprintf(stderr, "[gesture] cudaMemcpyAsync D2H failed: %d (%s)\n",
+                    (int)mrc, cudaGetErrorString(mrc));
+            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
+            continue;
+        }
+
         cudaEventRecord(slot.ev_done, st->trt_stream);
         cudaEventRecord(st->gesture.ev_trt_done, st->trt_stream);
         slot.state.store((int)ICPState::SlotState::INFLIGHT, std::memory_order_release);
-        break;
+        break; // uno per ciclo basta
     }
-    for (int i=0;i<ICPState::kSlots;++i){
-        auto &slot = st->slots[i];
-        if ((ICPState::SlotState)slot.state.load(std::memory_order_relaxed) == ICPState::SlotState::INFLIGHT){
-            if (cudaEventQuery(slot.ev_done) == cudaSuccess){
-                slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
+
+    // prova a liberare INFLIGHT completati
+    for (int i = 0; i < ICPState::kSlots; ++i) {
+        auto& slot = st->slots[i];
+        if ((ICPState::SlotState)slot.state.load(std::memory_order_relaxed)
+                == ICPState::SlotState::INFLIGHT) {
+            cudaError_t q = cudaEventQuery(slot.ev_done);
+            if (q == cudaSuccess) {
+                slot.state.store((int)ICPState::SlotState::FREE,
+                                 std::memory_order_release);
+            } else if (q != cudaErrorNotReady && q != cudaSuccess) {
+                fprintf(stderr, "[gesture] cudaEventQuery(slot.ev_done) error: %d (%s)\n",
+                        (int)q, cudaGetErrorString(q));
             }
         }
     }
@@ -553,62 +711,74 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     if (!st) { st = create_instance(); *userPtr = st; }
     cuCtxSetCurrent(st->ctx);
 
-    // --- Temporary cropped output surfaces for visualization ---
-    static CUdeviceptr dYcrop = 0, dUVcrop = 0;
-    static size_t pYcrop = 0, pUVcrop = 0;
-    static const int cropW = 1600; // same as your ROI width
-    static const int cropH = 1200; // same as your ROI height
-
-    if (!dYcrop) {
-        cuMemAllocPitch(&dYcrop, &pYcrop, cropW, cropH, 4);
-        cuMemAllocPitch(&dUVcrop, &pUVcrop, cropW, cropH / 2, 4);
-        fprintf(stderr, "[crop-debug] allocated NV12 crop surface %dx%d (pitch=%zu)\n",
-                cropW, cropH, pYcrop);
+    if (!st->mask_checked_once) {
+        st->mask_checked_once = true;
+        (void)load_mask_from_cpu_once(st);
     }
 
-
-    // Run TensorRT engine deserialization test (only once)
-    try_load_handpose_engine_once();
-
-    if (!st->mask_checked_once) { st->mask_checked_once = true; (void)load_mask_from_cpu_once(st); }
-
     // Map EGLImage → CUDA (expect NV12, pitched)
-    CUgraphicsResource res=nullptr; if(cuGraphicsEGLRegisterImage(&res,image,CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE)!=CUDA_SUCCESS) return;
-    CUeglFrame f{}; if(cuGraphicsResourceGetMappedEglFrame(&f,res,0,0)!=CUDA_SUCCESS){ cuGraphicsUnregisterResource(res); return; }
-    if(f.frameType!=CU_EGL_FRAME_TYPE_PITCH || f.planeCount<2){ cuGraphicsUnregisterResource(res); return; }
+    CUgraphicsResource res=nullptr;
+    if(cuGraphicsEGLRegisterImage(&res,image,CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE)!=CUDA_SUCCESS) return;
+    CUeglFrame f{};
+    if(cuGraphicsResourceGetMappedEglFrame(&f,res,0,0)!=CUDA_SUCCESS){
+        cuGraphicsUnregisterResource(res);
+        return;
+    }
+    if(f.frameType!=CU_EGL_FRAME_TYPE_PITCH || f.planeCount<2){
+        cuGraphicsUnregisterResource(res);
+        return;
+    }
 
     uint8_t* dY  = static_cast<uint8_t*>(f.frame.pPitch[0]);
     uint8_t* dUV = static_cast<uint8_t*>(f.frame.pPitch[1]);
-    int W = (int)f.width;
-    int H = (int)f.height;
-    int pitch = (int)f.pitch;
+    const int W = (int)f.width;
+    const int H = (int)f.height;
+    const int pitch = (int)f.pitch;
 
+    // debug: log per i primi 20 frame globali
+    static int dbg_frame = 0;
+    if (dbg_frame < 20) {
+        fprintf(stderr,
+                "[gpu_process][%s] frame=%d size=%dx%d pitch=%d ptrY=%p ptrUV=%p\n",
+                st->controls.section().c_str(),
+                dbg_frame, W, H, pitch, (void*)dY, (void*)dUV);
+        dbg_frame++;
+    }
 
     ensure_scratch(st, W, H);
 
     // -------------------- Rectification geometry --------------------
     icp::RectifyConfig cfg = st->cfg;
     constexpr float REF_W_1080 = 1920.f, REF_H_1080 = 1080.f;
-    const float sx_1080 = (float)W / REF_W_1080; const float sy_1080 = (float)H / REF_H_1080;
-    const float cx_f = cfg.cx_f * sx_1080; const float cy_f = cfg.cy_f * sy_1080; const float r_f = cfg.r_f * 0.5f * (sx_1080 + sy_1080);
-    constexpr float K_PX_PER_DEG_CENTER = 32.38f; const float f_fish = K_PX_PER_DEG_CENTER * (180.0f / (float)M_PI_F);
-    const float fx = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI_F / 360.f); const float cx_rect = W * 0.5f; const float cy_rect = H * 0.5f;
+    const float sx_1080 = (float)W / REF_W_1080;
+    const float sy_1080 = (float)H / REF_H_1080;
+    const float cx_f = cfg.cx_f * sx_1080;
+    const float cy_f = cfg.cy_f * sy_1080;
+    const float r_f  = cfg.r_f  * 0.5f * (sx_1080 + sy_1080);
+
+    constexpr float K_PX_PER_DEG_CENTER = 32.38f;
+    const float f_fish = K_PX_PER_DEG_CENTER * (180.0f / (float)M_PI_F);
+    const float fx = (W * 0.5f) / tanf(cfg.out_hfov_deg * (float)M_PI_F / 360.f);
+    const float cx_rect = W * 0.5f;
+    const float cy_rect = H * 0.5f;
 
     // 1) Rectification
     copy_to_scratch_async(st, dY, dUV, pitch, pitch, W, H);
-    icp::launch_rectify_nv12((const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
-                             (const uint8_t*)(uintptr_t)st->sUV,(int)st->pUV,
-                             dY, W,H,pitch,
-                             dUV, pitch,
-                             cx_f, cy_f, r_f,
-                             f_fish, fx, cx_rect, cy_rect,
-                             st->video_stream);
+    icp::launch_rectify_nv12(
+        (const uint8_t*)(uintptr_t)st->sY,  W,H,(int)st->pY,
+        (const uint8_t*)(uintptr_t)st->sUV,(int)st->pUV,
+        dY, W,H,pitch,
+        dUV, pitch,
+        cx_f, cy_f, r_f,
+        f_fish, fx, cx_rect, cy_rect,
+        st->video_stream);
 
     // 2) Wire removal
     if (st->mask.valid && st->mask.W==W && st->mask.H==H){
         const int my_idx = section_to_index(st->controls.section());
         if (my_idx == st->mask.cam_index){
-            wire::apply_mask_shift_nv12(dY, pitch, dUV, pitch, W, H,
+            wire::apply_mask_shift_nv12(
+                dY, pitch, dUV, pitch, W, H,
                 (const uint8_t*)(uintptr_t)st->mask.dMask, (int)st->mask.pitch,
                 st->mask.dx, st->mask.dy, st->video_stream);
         }
@@ -616,78 +786,82 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
 
     // AI gate
     const bool ai_on = st->controls.ai_enabled();
-    
-    // ------------------------------------------------------------------
-    // Define ROI for gesture recognition
-    // ------------------------------------------------------------------
-    const int roiX = 1008, roiY = 1062, roiW = 1600, roiH = 1200;
 
-    // 2.8) Gesture pipeline setup (cam1 only)
-    if (true) {
+    // -------------------- ROI comune a AI + BOX --------------------
+    int roiX = 1008;
+    int roiY = 1000;
+    int roiW = 1600;
+    int roiH = 1200;
+
+    // clamp ROI dentro al frame
+    if (roiX < 0) roiX = 0;
+    if (roiY < 0) roiY = 0;
+    if (roiX + roiW > W) roiW = W - roiX;
+    if (roiY + roiH > H) roiH = H - roiY;
+
+    // 2.8) Gesture pipeline setup (cam1 only) — ora con ROI reale
+    if (ai_on) {
         ensure_gesture_loaded_for_cam1(st);
+        if (st->gesture.engine && st->trt_stream && st->gesture_input_bytes > 0) {
 
-        if (true) {
-            bool tv_range = false;
-            if (const char* e = std::getenv("TRT_TV_RANGE"))
-                tv_range = (*e == '1');
-
-            int slot_idx = acquire_free_slot(st);
-            auto& slot = st->slots[slot_idx];
-            slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
-
-            fprintf(stderr,
-                "[gesture-ROI] Using ROI=(%d,%d,%d,%d) on full frame %dx%d\n",
-                roiX, roiY, roiW, roiH, W, H);
-
-            // ------------------------------------------------------------------
-            // Preprocess: directly sample ROI from full-frame NV12 → model tensor
-            // ------------------------------------------------------------------
-            const int netW = 244, netH = 244; // model input
-            preprocess::launch_nv12_to_chw(
-                dY, dUV,          // full frame
-                W, H, pitch,
-                roiX, roiY, netW, netH,  // ROI region
-                st->gesture.inputDevicePtr(),
-                st->gesture.inputIsFP16,
-                st->video_stream
-            );
-
-            // ------------------------------------------------------------------
-            // TensorRT inference on ROI
-            // ------------------------------------------------------------------
-            if (st->gesture.engine && st->gesture.context)
-            {
-                void* bindings[3];
-                bindings[st->gesture.inIdx]  = st->gesture.dIn;
-                bindings[st->gesture.outIdx] = st->gesture.dOut;
-
-                CUcontext currentCtx = nullptr;
-                cuCtxGetCurrent(&currentCtx);
-                fprintf(stderr,
-                    "[gesture-infer] enqueue ROI(%d,%d,%d,%d)\n",
-                    roiX, roiY, roiW, roiH);
-
-                if (!st->gesture.context->enqueueV2(bindings, st->video_stream, nullptr)) {
-                    fprintf(stderr, "[gesture-infer] enqueueV2 FAILED\n");
-                } else {
-                    cudaStreamSynchronize(st->video_stream);
-                    fprintf(stderr, "[gesture-infer] enqueueV2 OK\n");
+            if (st->gesture.inputIsFP16) {
+                static bool s_once = false;
+                if (!s_once) {
+                    fprintf(stderr,
+                        "[AI-ERROR][%s] Engine input is FP16, ma preprocess genera FP32. "
+                        "Serve un path FP16 se cambi model.\n",
+                        st->controls.section().c_str());
+                    s_once = true;
                 }
+            } else {
+                int slot_idx = acquire_free_slot(st);
+                auto &slot = st->slots[slot_idx];
+
+                slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
+
+                // Preprocess NV12 ROI → CHW FP32 (1x3x244x244) nel dTensor
+                ei::preprocess_nv12_roi_to_chw_fp32(
+                    dY, dUV,
+                    W, H, pitch,
+                    roiX, roiY, roiW, roiH,
+                    reinterpret_cast<float*>(slot.dTensor),
+                    st->video_stream
+                );
+
+                cudaEventRecord(slot.ev_ready, st->video_stream);
+                slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
+                st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
+
+                // manda avanti TRT sugli slot READY
+                kick_trt_for_ready_slots(st);
             }
-
-            cudaEventRecord(slot.ev_ready, st->video_stream);
-            slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
-            st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
         }
+    } else {
+        // AI disabled: skip gesture
     }
-
-    draw::launch_draw_box_nv12(dY, dUV, W, H, pitch,
-                           roiX, roiY, roiW, roiH,
-                           st->video_stream);
 
     // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(dY, W, H, pitch, dUV, pitch, cp, st->video_stream);
+
+    // 4) BOX DEBUG: disegniamo la stessa ROI del preprocess (solo cam1)
+    {
+        if (st->controls.section() == std::string("cam1")) {
+            // if (dbg_frame < 100) {
+            //     fprintf(stderr,
+            //             "[draw-box-debug][%s] ROI=(%d,%d,%d,%d) frame=%dx%d pitch=%d\n",
+            //             st->controls.section().c_str(),
+            //             roiX, roiY, roiW, roiH, W, H, pitch);
+            // }
+
+            draw::launch_draw_box_nv12(
+                dY, dUV,
+                W, H, pitch,
+                roiX, roiY, roiW, roiH,
+                st->video_stream
+            );
+        }
+    }
 
     // Fence VIDEO work
     cudaStreamSynchronize(st->video_stream);
@@ -695,36 +869,50 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     // ---- FSM + MQTT if a fresh result is available AND AI is enabled ----
     if (ai_on && st->gesture.engine && st->gesture.try_commit_host_output()) {
         ensure_mqtt_and_fsm_config(st);
+
         if (const char* dumpEI = std::getenv("TRT_DUMP_EI_RAW"); dumpEI && *dumpEI=='1'){
             const float v_start = st->gesture.hostOut[st->gesture.idx_start];
             const float v_stop  = st->gesture.hostOut[st->gesture.idx_stop];
-            fprintf(stderr, "[gesture][%s] raw: start=%.3f stop=%.3f\n", st->controls.section().c_str(), v_start, v_stop);
+            fprintf(stderr, "[gesture][%s] raw: start=%.3f stop=%.3f\n",
+                    st->controls.section().c_str(), v_start, v_stop);
         }
+
         float sL=0.f, tL=0.f, ps=0.f, pt=0.f; int top=-1;
         if (st->gesture.get_start_stop(sL, tL, ps, pt, top)) {
             const bool start_ok = (top == 0) && (ps >= st->fsm.start_prob_thresh);
             const bool stop_ok  = (top == 1) && (pt >= st->fsm.stop_prob_thresh);
-            using clk = std::chrono::steady_clock; auto now = clk::now();
-            int dms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - st->fsm.t_last).count();
-            if (dms < 0 || dms > 1000) dms = 0; st->fsm.t_last = now;
-            if (st->fsm.hold_start_ms==0 && st->fsm.hold_stop_ms==0 && st->fsm.phase==decltype(st->fsm.phase)::SEEK_START) st->fsm.t_cycle_start = now;
-            int cycle_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - st->fsm.t_cycle_start).count();
+
+            using clk = std::chrono::steady_clock;
+            auto now = clk::now();
+            int dms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - st->fsm.t_last).count();
+            if (dms < 0 || dms > 1000) dms = 0;
+            st->fsm.t_last = now;
+
+            if (st->fsm.hold_start_ms==0 && st->fsm.hold_stop_ms==0 &&
+                st->fsm.phase==decltype(st->fsm.phase)::SEEK_START)
+                st->fsm.t_cycle_start = now;
+
+            int cycle_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - st->fsm.t_cycle_start).count();
             if (cycle_elapsed_ms > st->fsm.cycle_reset_ms) {
-                fprintf(stderr, "[FSM] cycle watchdog (%d ms) → reset to SEEK_START\n", cycle_elapsed_ms);
+                fprintf(stderr, "[FSM] cycle watchdog (%d ms) → reset to SEEK_START\n",
+                        cycle_elapsed_ms);
                 st->fsm.reset_phase_to_start();
-                // NEW: UI = yellow (seeking START) — only for cam1
                 if (st->controls.section() == std::string("cam1")) {
                     emit_ui_indicator_json(1, "yellow");
                 }
             }
+
             switch (st->fsm.phase) {
                 case decltype(st->fsm.phase)::SEEK_START:
                     if (start_ok) {
                         st->fsm.hold_start_ms += dms;
                         if (st->fsm.hold_start_ms >= st->fsm.hold_start_target_ms) {
-                            st->fsm.phase = decltype(st->fsm.phase)::SEEK_STOP; st->fsm.hold_stop_ms = 0;
-                            fprintf(stderr, "[FSM] START confirmed (%.3fs). Now seeking STOP...\n", st->fsm.hold_start_ms/1000.0);
-                            // NEW: UI = green (START confirmed) — only for cam1
+                            st->fsm.phase = decltype(st->fsm.phase)::SEEK_STOP;
+                            st->fsm.hold_stop_ms = 0;
+                            fprintf(stderr, "[FSM] START confirmed (%.3fs). Now seeking STOP...\n",
+                                    st->fsm.hold_start_ms/1000.0);
                             if (st->controls.section() == std::string("cam1")) {
                                 emit_ui_indicator_json(1, "green");
                             }
@@ -735,21 +923,19 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                     if (stop_ok) {
                         st->fsm.hold_stop_ms += dms;
                         if (st->fsm.hold_stop_ms >= st->fsm.hold_stop_target_ms) {
-                            bool next_rec = !st->fsm.recording; const char* action = next_rec ? "start" : "stop";
-                            std::string payload = std::string("{\"value\":{\"recording\":\"") + action + "\"}}";
+                            bool next_rec = !st->fsm.recording;
+                            const char* action = next_rec ? "start" : "stop";
+                            std::string payload =
+                                std::string("{\"value\":{\"recording\":\"") + action + "\"}}";
                             mqtt_publish(st->mqtt, payload);
-                            fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n", action);
+                            fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n",
+                                    action);
 
-                            if (next_rec) {
-                                speak_async("Recording started");
-                            } else {
-                                speak_async("Recording stopped");
-                            }
+                            if (next_rec) speak_async("Recording started");
+                            else          speak_async("Recording stopped");
 
                             st->fsm.recording = next_rec;
                             st->fsm.reset_phase_to_start();
-
-                            // NEW: UI = yellow (back to seeking START) — only for cam1
                             if (st->controls.section() == std::string("cam1")) {
                                 emit_ui_indicator_json(1, "yellow");
                             }
@@ -759,7 +945,8 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
             }
         } else {
             float p=0.f; int cls = st->gesture.top1(&p);
-            fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n", st->controls.section().c_str(), cls, p);
+            fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
+                    st->controls.section().c_str(), cls, p);
         }
     }
 
@@ -770,13 +957,23 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
 // init / deinit
 // ----------------------------------------------------------------------------
 extern "C" void init(CustomerFunction* f){
-    if(!f) return; f->fPreProcess=pre_process; f->fGPUProcess=gpu_process; f->fPostProcess=post_process;
+    if(!f) return;
+    f->fPreProcess=pre_process;
+    f->fGPUProcess=gpu_process;
+    f->fPostProcess=post_process;
     std::call_once(g_ctx_once, retain_primary_context_once);
-    fprintf(stderr, "[ic] imagecorrection initialized (gesture runs only on cam1; decoupled TRT stream)\n");
+    fprintf(stderr,
+        "[ic] imagecorrection initialized (gesture runs only on cam1; "
+        "decoupled TRT stream + ROI preprocess)\n");
 }
 
 extern "C" void deinit(void){
-    std::vector<ICPState*> to_free; { std::lock_guard<std::mutex> lk(g_instances_mtx); to_free.swap(g_instances); }
+    std::vector<ICPState*> to_free;
+    {
+        std::lock_guard<std::mutex> lk(g_instances_mtx);
+        to_free.swap(g_instances);
+    }
     for (auto* st : to_free) destroy_instance(st);
-    release_primary_context(); ic_clear_instance_hints();
+    release_primary_context();
+    ic_clear_instance_hints();
 }

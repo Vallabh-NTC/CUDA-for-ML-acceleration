@@ -1,96 +1,80 @@
 #pragma once
-/**
- * @file trt_gesture.hpp
- * @brief Minimal TensorRT wrapper for a single .engine used for gesture recognition,
- *        instrumented for debugging.
- *
- * Two-class head (no "OK"):
- *  - Classes: START and STOP (indices configurable via env).
- *  - Output size: 2 values. If they already look like probabilities ([0,1], sum≈1),
- *    we do NOT apply softmax again; otherwise we softmax once.
- *
- * Env override:
- *   TRT_LABEL_MAP="start=0,stop=1"
- *
- * Input:
- *  - One input binding 1x1x96x96 (FP16 or FP32).
- * Output:
- *  - One output binding with 2 elements (FP16 or FP32).
- */
 
-#include <NvInfer.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-
-#include <memory>
-#include <string>
 #include <vector>
+#include <string>
+#include <mutex>
 #include <cstdint>
+
+#include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
+#include <NvInfer.h>
 
 namespace trt {
 
-struct Logger final : public nvinfer1::ILogger {
-    void log(Severity s, const char* msg) noexcept override {
-        if (s <= Severity::kWARNING) fprintf(stderr, "[trt] %s\n", msg);
-    }
-};
-
 struct Engine {
-    // TRT objects
-    std::unique_ptr<nvinfer1::IRuntime>            runtime;
-    std::unique_ptr<nvinfer1::ICudaEngine>         engine;
-    std::unique_ptr<nvinfer1::IExecutionContext>   context;
+    // --- oggetti TensorRT grezzi ---
+    nvinfer1::IRuntime*          runtime  = nullptr;
+    nvinfer1::ICudaEngine*       engine   = nullptr;
+    nvinfer1::IExecutionContext* context  = nullptr;
 
-    // Bindings
-    int inIdx  = -1;
-    int outIdx = -1;
+    // --- binding info ---
+    int inIdx      = -1;
+    int outIdx     = -1;
+    int nbBindings = 0;    // numero totale di binding dell'engine
 
-    // IO properties
-    bool   inputIsFP16   = false;
-    bool   outputIsFP16  = false;
-    size_t inBytes       = 0;
-    size_t outElems      = 0;    // number of floats in output (expect 2)
-    size_t outBytesDev   = 0;    // device bytes (depends on dtype)
+    bool inputIsFP16  = false;
+    bool outputIsFP16 = false;
 
-    // Device buffers
-    void* dIn  = nullptr;
-    void* dOut = nullptr;
+    // --- output buffer lato device/host (per l'output "principale") ---
+    void*  dOut             = nullptr;   // device output buffer per outIdx
+    void*  hostOutPinnedRaw = nullptr;   // pinned host buffer (FP16 o FP32)
+    size_t outElems         = 0;         // numero elementi scalari in output tensor (outIdx)
 
-    inline void* inputDevicePtr() const noexcept { return dIn; }
+    // altri binding di output hanno i propri buffer device qui
+    std::vector<void*> devBindings;      // size = nbBindings; nullptr per gli input, non-null per outputs
 
-    // Host buffers
-    // - hostOutPinnedRaw matches device dtype (fp16 or fp32) and is filled by async D2H.
-    // - hostOut is a float view we commit into for logging & math.
-    void*              hostOutPinnedRaw = nullptr;
+    // buffer comodo in float (sempre) per la logica gesture (solo outIdx)
     std::vector<float> hostOut;
 
-    // Event set by the caller when D2H has been enqueued; polled via try_commit_host_output()
+    // indice classi nel vettore hostOut
+    int idx_start = 0;  // default: 0, override con env GESTURE_IDX_START
+    int idx_stop  = 1;  // default: 1, override con env GESTURE_IDX_STOP
+
+    // evento che segnala che l'ultimo memcpy D2H è finito (per outIdx)
     cudaEvent_t ev_trt_done = nullptr;
 
-    // Label mapping (default: start=0, stop=1)
-    int idx_start = 0;
-    int idx_stop  = 1;
+    // stato interno di commit
+    std::mutex mtx;
+    bool hasPending   = false;
+    bool hasCommitted = false;
 
-    // API
-    bool load_from_file(const std::string& path, cudaStream_t video_stream /*unused*/);
-    bool ensure_binding_dims_96x96();
+    // ------------------------------------------------------------------
+    // API pubblica
+    // ------------------------------------------------------------------
 
-    // Commit new output if ev_trt_done has fired (convert fp16→fp32 if needed).
+    // Carica un engine da file e inizializza runtime, engine, context, buffer.
+    bool load_from_file(const char* path, cudaStream_t videoStreamForDebug);
+
+    // Rilascia tutte le risorse (da chiamare in destroy_instance)
+    void destroy();
+
+    // Controlla se l'evento ev_trt_done è completo e, se sì,
+    // copia/converti hostOutPinnedRaw -> hostOut (float).
+    // Ritorna true se c'è un nuovo risultato pronto.
     bool try_commit_host_output();
 
-    // Top-1 index (returns argmax; if probOut!=nullptr returns the winning prob).
-    int  top1(float* probOut = nullptr) const;
+    // Estrae le probabilità per gesture start/stop + top class.
+    // sLogit / tLogit: valori grezzi (logit) di start/stop.
+    // pStart / pStop: probabilità softmax (su tutto il vettore).
+    // top: indice della classe più probabile.
+    bool get_start_stop(float& sLogit,
+                        float& tLogit,
+                        float& pStart,
+                        float& pStop,
+                        int&   top);
 
-    // 2-class helper in logical order (START/STOP via idx_* mapping).
-    bool get_start_stop(float& start_score, float& stop_score,
-                        float& p_start, float& p_stop, int& top_class) const;
-
-    // Mapping helpers
-    void set_label_map(int start_idx, int stop_idx);
-    bool load_label_map_from_env();
-
-    // Cleanup
-    void destroy();
+    // Ritorna top-1 class + "probabilità" (qui il valore grezzo hostOut[top]).
+    int top1(float* probOut = nullptr) const;
 };
 
 } // namespace trt
