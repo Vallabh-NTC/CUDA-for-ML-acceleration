@@ -3,40 +3,45 @@
 
 namespace crop {
 
-__global__ void crop_nv12_kernel(uint8_t* dY, uint8_t* dUV,
-                                 int W, int H, int pitch,
-                                 int roiX, int roiY, int roiW, int roiH)
+__global__ void crop_nv12_kernel(const uint8_t* srcY, const uint8_t* srcUV,
+                                 int srcW, int srcH, int srcPitch,
+                                 int roiX, int roiY, int roiW, int roiH,
+                                 uint8_t* dstY, uint8_t* dstUV,
+                                 int dstPitchY, int dstPitchUV)
 {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= W || y >= H) return;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    const bool inside = (x >= roiX && x < roiX + roiW &&
-                         y >= roiY && y < roiY + roiH);
+    // Copy Y plane
+    if (x < roiW && y < roiH)
+        dstY[y * dstPitchY + x] = srcY[(roiY + y) * srcPitch + (roiX + x)];
 
-    if (!inside) {
-        dY[y * pitch + x] = 0;
-        if ((y % 2 == 0) && (x % 2 == 0)) {
-            const int uv_idx = (y / 2) * pitch + x;
-            dUV[uv_idx]     = 128;
-            dUV[uv_idx + 1] = 128;
-        }
+    // Copy UV plane (interleaved, every 2x2 block)
+    int uvX = x & ~1;
+    int uvY = y >> 1;
+    if (uvX < roiW && uvY < roiH / 2) {
+        const uint8_t* srcPtr = srcUV + (roiY / 2 + uvY) * srcPitch + roiX + uvX;
+        uint8_t* dstPtr       = dstUV + uvY * dstPitchUV + uvX;
+        dstPtr[0] = srcPtr[0];
+        dstPtr[1] = srcPtr[1];
     }
 }
 
-void launch_crop_nv12(uint8_t* dY, uint8_t* dUV,
-                      int W, int H, int pitch,
+void launch_crop_nv12(const uint8_t* srcY, const uint8_t* srcUV,
+                      int srcW, int srcH, int srcPitch,
                       int roiX, int roiY, int roiW, int roiH,
+                      uint8_t* dstY, uint8_t* dstUV,
+                      int dstPitchY, int dstPitchUV,
                       cudaStream_t stream)
 {
-    dim3 block(32, 16);
-    dim3 grid((W + block.x - 1) / block.x,
-              (H + block.y - 1) / block.y);
+    dim3 block(32, 8);
+    dim3 grid((roiW + block.x - 1) / block.x,
+              (roiH + block.y - 1) / block.y);
 
-    //fprintf(stderr, "[crop][debug] ROI(%d,%d,%d,%d) pitch=%d → black fill top=%d rows, left=%d cols\n",
-    //        roiX, roiY, roiW, roiH, pitch, roiY, roiX);
-
-    crop_nv12_kernel<<<grid, block, 0, stream>>>(dY, dUV, W, H, pitch, roiX, roiY, roiW, roiH);
+    crop_nv12_kernel<<<grid, block, 0, stream>>>(
+        srcY, srcUV, srcW, srcH, srcPitch,
+        roiX, roiY, roiW, roiH,
+        dstY, dstUV, dstPitchY, dstPitchUV);
 }
 
 } // namespace crop

@@ -39,6 +39,8 @@
 #include <fstream>
 #include <vector>
 #include "nv12_to_rgb_chw.cuh"
+#include "kernel_draw_box_nv12.cuh"
+
 
 
 #ifndef M_PI
@@ -489,6 +491,8 @@ static void destroy_instance(ICPState* st){
     if (st->trt_stream)   { cudaStreamDestroy(st->trt_stream);   st->trt_stream=nullptr; }
     if (st->video_stream) { cudaStreamDestroy(st->video_stream); st->video_stream=nullptr; }
     st->ctx=nullptr; delete st;
+    //if (dYcrop)  { cuMemFree(dYcrop);  dYcrop  = 0; }
+    //if (dUVcrop) { cuMemFree(dUVcrop); dUVcrop = 0; }
 }
 
 // ----------------------------------------------------------------------------
@@ -549,6 +553,20 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     if (!st) { st = create_instance(); *userPtr = st; }
     cuCtxSetCurrent(st->ctx);
 
+    // --- Temporary cropped output surfaces for visualization ---
+    static CUdeviceptr dYcrop = 0, dUVcrop = 0;
+    static size_t pYcrop = 0, pUVcrop = 0;
+    static const int cropW = 1600; // same as your ROI width
+    static const int cropH = 1200; // same as your ROI height
+
+    if (!dYcrop) {
+        cuMemAllocPitch(&dYcrop, &pYcrop, cropW, cropH, 4);
+        cuMemAllocPitch(&dUVcrop, &pUVcrop, cropW, cropH / 2, 4);
+        fprintf(stderr, "[crop-debug] allocated NV12 crop surface %dx%d (pitch=%zu)\n",
+                cropW, cropH, pYcrop);
+    }
+
+
     // Run TensorRT engine deserialization test (only once)
     try_load_handpose_engine_once();
 
@@ -561,7 +579,10 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
 
     uint8_t* dY  = static_cast<uint8_t*>(f.frame.pPitch[0]);
     uint8_t* dUV = static_cast<uint8_t*>(f.frame.pPitch[1]);
-    const int W = (int)f.width, H=(int)f.height, pitch=(int)f.pitch;
+    int W = (int)f.width;
+    int H = (int)f.height;
+    int pitch = (int)f.pitch;
+
 
     ensure_scratch(st, W, H);
 
@@ -595,12 +616,16 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
 
     // AI gate
     const bool ai_on = st->controls.ai_enabled();
+    
+    // ------------------------------------------------------------------
+    // Define ROI for gesture recognition
+    // ------------------------------------------------------------------
+    const int roiX = 1008, roiY = 1062, roiW = 1600, roiH = 1200;
 
-    // 2.8) Gesture pipeline setup (cam1 only) — guarded by ai_on
-    //if (ai_on) {
+    // 2.8) Gesture pipeline setup (cam1 only)
     if (true) {
         ensure_gesture_loaded_for_cam1(st);
-        //if (st->gesture.engine) {
+
         if (true) {
             bool tv_range = false;
             if (const char* e = std::getenv("TRT_TV_RANGE"))
@@ -610,122 +635,55 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
             auto& slot = st->slots[slot_idx];
             slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
 
-            // --- Replace Edge Impulse preprocess with crop kernel ---
-            const int roiX = 1008, roiY = 1062, roiW = 1600, roiH = 1200;
+            fprintf(stderr,
+                "[gesture-ROI] Using ROI=(%d,%d,%d,%d) on full frame %dx%d\n",
+                roiX, roiY, roiW, roiH, W, H);
 
-            // 🔧 Add detailed debug prints around crop launch
-            //fprintf(stderr,
-            //        "[crop][debug] ROI(%d,%d,%d,%d) pitch=%d → launching crop_nv12 kernel\n",
-            //        roiX, roiY, roiW, roiH, pitch);
-
-            crop::launch_crop_nv12(dY, dUV, W, H, pitch,
-                                roiX, roiY, roiW, roiH,
-                                st->video_stream);
-
-            //fprintf(stderr,
-            //        "[ic][crop_nv12] ROI applied (x=%d y=%d w=%d h=%d)\n",
-            //        roiX, roiY, roiW, roiH);
-
+            // ------------------------------------------------------------------
+            // Preprocess: directly sample ROI from full-frame NV12 → model tensor
+            // ------------------------------------------------------------------
             const int netW = 244, netH = 244; // model input
-            preprocess::launch_nv12_to_chw(dY, dUV,
-                                        W, H, pitch,
-                                        roiX, roiY, netW, netH,
-                                        st->gesture.inputDevicePtr(),
-                                        st->gesture.inputIsFP16,
-                                        st->video_stream);
+            preprocess::launch_nv12_to_chw(
+                dY, dUV,          // full frame
+                W, H, pitch,
+                roiX, roiY, netW, netH,  // ROI region
+                st->gesture.inputDevicePtr(),
+                st->gesture.inputIsFP16,
+                st->video_stream
+            );
 
-            // =====================================================================
-            // Stage 2: TensorRT inference test (no visualization)
-            // =====================================================================
+            // ------------------------------------------------------------------
+            // TensorRT inference on ROI
+            // ------------------------------------------------------------------
             if (st->gesture.engine && st->gesture.context)
             {
                 void* bindings[3];
                 bindings[st->gesture.inIdx]  = st->gesture.dIn;
                 bindings[st->gesture.outIdx] = st->gesture.dOut;
 
-                // 🔍 Debug context + pointers before enqueue
                 CUcontext currentCtx = nullptr;
                 cuCtxGetCurrent(&currentCtx);
                 fprintf(stderr,
-                    "\n[DEBUG][TRT] ====== Inference sanity check ======\n"
-                    "[DEBUG] st->ctx            = %p\n"
-                    "[DEBUG] current CUDA ctx    = %p\n"
-                    "[DEBUG] dIn                = %p\n"
-                    "[DEBUG] dOut               = %p\n"
-                    "[DEBUG] st->video_stream   = %p\n"
-                    "[DEBUG] st->trt_stream     = %p\n"
-                    "[DEBUG] engine name        = %s\n"
-                    "[DEBUG] inIdx=%d outIdx=%d elems=%zu bytes=%zu dtype(in=%s,out=%s)\n"
-                    "===============================================\n",
-                    (void*)st->ctx, (void*)currentCtx,
-                    st->gesture.dIn, st->gesture.dOut,
-                    (void*)st->video_stream, (void*)st->trt_stream,
-                    kGestureEnginePath,
-                    st->gesture.inIdx, st->gesture.outIdx,
-                    st->gesture.outElems,
-                    st->gesture.outElems * (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float)),
-                    st->gesture.inputIsFP16 ? "fp16" : "fp32",
-                    st->gesture.outputIsFP16 ? "fp16" : "fp32"
-                );
+                    "[gesture-infer] enqueue ROI(%d,%d,%d,%d)\n",
+                    roiX, roiY, roiW, roiH);
 
-                cudaError_t syncErr = cudaDeviceSynchronize();
-                fprintf(stderr, "[DEBUG][CUDA] Device sync before enqueue → %s\n",
-                        cudaGetErrorString(syncErr));
-
-                // 🔍 Dry-run check: ensure pointers point to valid device memory
-                cudaPointerAttributes attrIn{}, attrOut{};
-                cudaError_t attrErrIn  = cudaPointerGetAttributes(&attrIn,  st->gesture.dIn);
-                cudaError_t attrErrOut = cudaPointerGetAttributes(&attrOut, st->gesture.dOut);
-                fprintf(stderr,
-                    "[DEBUG][CUDA] ptr attr IN:  type=%d device=%d err=%d\n"
-                    "[DEBUG][CUDA] ptr attr OUT: type=%d device=%d err=%d\n",
-                    (int)attrIn.type,  attrIn.device,  (int)attrErrIn,
-                    (int)attrOut.type, attrOut.device, (int)attrErrOut);
-                
-                fprintf(stderr,
-                "[DEBUG][SIZE] inBytes=%zu outBytes=%zu\n",
-                st->gesture.inBytes,
-                st->gesture.outElems * (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float)));
-
-                // Now try inference
                 if (!st->gesture.context->enqueueV2(bindings, st->video_stream, nullptr)) {
                     fprintf(stderr, "[gesture-infer] enqueueV2 FAILED\n");
                 } else {
                     cudaStreamSynchronize(st->video_stream);
-
-                    // Copy output to host
-                    size_t bytes = st->gesture.outElems *
-                                (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float));
-                    cudaMemcpy(st->gesture.hostOutPinnedRaw,
-                            st->gesture.dOut, bytes, cudaMemcpyDeviceToHost);
-
-                    // Compute top-2 probabilities
-                    int top1 = -1, top2 = -1;
-                    float p1 = 0.f, p2 = 0.f;
-                    const float* probs = st->gesture.hostOut.data();
-                    int num_classes = static_cast<int>(st->gesture.hostOut.size());
-
-                    for (int i = 0; i < num_classes; ++i) {
-                        float p = probs[i];
-                        if (p > p1) { p2 = p1; top2 = top1; p1 = p; top1 = i; }
-                        else if (p > p2) { p2 = p; top2 = i; }
-                    }
-
-                    fprintf(stderr,
-                        "[gesture-infer] top1=%d (p=%.3f) top2=%d (p=%.3f)\n",
-                        top1, p1, top2, p2);
+                    fprintf(stderr, "[gesture-infer] enqueueV2 OK\n");
                 }
             }
 
             cudaEventRecord(slot.ev_ready, st->video_stream);
             slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
             st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
-            //kick_trt_for_ready_slots(st);
         }
-    } else {
-        // AI disabled: skip gesture
     }
 
+    draw::launch_draw_box_nv12(dY, dUV, W, H, pitch,
+                           roiX, roiY, roiW, roiH,
+                           st->video_stream);
 
     // 3) Tone + color (hot-reload)
     icp::ColorParams cp = st->controls.current();

@@ -3,11 +3,11 @@
 #include <cstdint>
 
 namespace crop {
-
-// Launches a simple black-fill crop on NV12
-void launch_crop_nv12(uint8_t* dY, uint8_t* dUV,
-                      int W, int H, int pitch,
+void launch_crop_nv12(const uint8_t* srcY, const uint8_t* srcUV,
+                      int srcW, int srcH, int srcPitch,
                       int roiX, int roiY, int roiW, int roiH,
+                      uint8_t* dstY, uint8_t* dstUV,
+                      int dstPitchY, int dstPitchUV,
                       cudaStream_t stream);
+}
 
-} // namespace crop
