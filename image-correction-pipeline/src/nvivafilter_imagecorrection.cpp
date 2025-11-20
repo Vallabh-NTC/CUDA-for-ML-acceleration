@@ -35,12 +35,18 @@
 //#include "ei_gesture_infer.cuh"
 #include "kernel_crop_nv12.cuh"
 
+#include <NvInfer.h>
+#include <fstream>
+#include <vector>
+#include "nv12_to_rgb_chw.cuh"
+
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 constexpr float M_PI_F = static_cast<float>(M_PI);
 
-static const char* kGestureEnginePath = "/home/moviemaker/gesture_recog.engine";
+static const char* kGestureEnginePath = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp32_xavier.engine";
 
 // ============================================================================
 // Global CUDA primary context (shared across instances)
@@ -328,6 +334,69 @@ static bool load_mask_from_cpu_once(ICPState* st){
 }
 
 // ----------------------------------------------------------------------------
+// TensorRT engine deserialization test (hand_pose_resnet18_fp16.engine)
+// ----------------------------------------------------------------------------
+static void try_load_handpose_engine_once() {
+    static bool attempted = false;
+    static bool success   = false;
+    if (attempted) return;
+    attempted = true;
+
+    const char* path = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp16_xavier.engine";
+    std::ifstream file(path, std::ios::binary);
+    if (!file.good()) {
+        fprintf(stderr, "[trt-check] Engine file not found: %s\n", path);
+        return;
+    }
+
+    file.seekg(0, std::ifstream::end);
+    size_t size = file.tellg();
+    file.seekg(0, std::ifstream::beg);
+    std::vector<char> engineData(size);
+    file.read(engineData.data(), size);
+    file.close();
+
+    class Logger : public nvinfer1::ILogger {
+        void log(Severity severity, const char* msg) noexcept override {
+            if (severity <= Severity::kWARNING)
+                fprintf(stderr, "[TRT] %s\n", msg);
+        }
+    };
+    static Logger gLogger;
+
+    nvinfer1::IRuntime* runtime = nvinfer1::createInferRuntime(gLogger);
+    if (!runtime) {
+        fprintf(stderr, "[trt-check] Failed to create TensorRT runtime\n");
+        return;
+    }
+
+    nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(engineData.data(), size);
+    if (!engine) {
+        fprintf(stderr, "[trt-check] ❌ Failed to deserialize engine — version or corruption mismatch\n");
+        runtime->destroy();
+        return;
+    }
+
+    int nb = engine->getNbBindings();
+    fprintf(stderr, "[trt-check] ✅ Engine loaded OK from %s (bindings=%d)\n", path, nb);
+    for (int i = 0; i < nb; ++i) {
+        const char* name = engine->getBindingName(i);
+        nvinfer1::Dims dims = engine->getBindingDimensions(i);
+        fprintf(stderr, "   [%d] %s (%s): ", i, name,
+                engine->bindingIsInput(i) ? "input" : "output");
+        for (int j = 0; j < dims.nbDims; ++j)
+            fprintf(stderr, "%d%s", dims.d[j], (j < dims.nbDims - 1 ? "x" : ""));
+        fprintf(stderr, "\n");
+    }
+
+    engine->destroy();
+    runtime->destroy();
+    success = true;
+}
+
+
+
+// ----------------------------------------------------------------------------
 // Gesture helper: lazy-load engine only for cam1 + allocate slots/streams
 // ----------------------------------------------------------------------------
 static void ensure_gesture_loaded_for_cam1(ICPState* st){
@@ -343,7 +412,8 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st){
     // [DECPL] Create trt_stream with lower priority than video_stream
     int leastPri=0, greatestPri=0; cudaDeviceGetStreamPriorityRange(&leastPri,&greatestPri);
 #if CUDART_VERSION >= 11000
-    cudaStreamCreateWithPriority(&st->trt_stream, cudaStreamNonBlocking, /*medium*/ (leastPri+greatestPri)/2);
+    //cudaStreamCreateWithPriority(&st->trt_stream, cudaStreamNonBlocking, /*medium*/ (leastPri+greatestPri)/2);
+    st->trt_stream = st->video_stream;
 #else
     cudaStreamCreateWithFlags(&st->trt_stream, cudaStreamNonBlocking);
 #endif
@@ -358,6 +428,13 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st){
     }
     fprintf(stderr, "[ic] gesture: ready (path=%s) with %d slots, dtype=%s\n",
             kGestureEnginePath, ICPState::kSlots, fp16?"fp16":"fp32");
+    
+    fprintf(stderr,
+    "[DEBUG][ALLOC] gesture.dIn=%p bytes=%zu (expected=%zu)\n",
+    st->gesture.dIn,
+    st->gesture.inBytes,
+    (size_t)(1*3*244*244*sizeof(float)));
+
 }
 
 // ----------------------------------------------------------------------------
@@ -472,6 +549,9 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     if (!st) { st = create_instance(); *userPtr = st; }
     cuCtxSetCurrent(st->ctx);
 
+    // Run TensorRT engine deserialization test (only once)
+    try_load_handpose_engine_once();
+
     if (!st->mask_checked_once) { st->mask_checked_once = true; (void)load_mask_from_cpu_once(st); }
 
     // Map EGLImage → CUDA (expect NV12, pitched)
@@ -546,10 +626,101 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
             //        "[ic][crop_nv12] ROI applied (x=%d y=%d w=%d h=%d)\n",
             //        roiX, roiY, roiW, roiH);
 
+            const int netW = 244, netH = 244; // model input
+            preprocess::launch_nv12_to_chw(dY, dUV,
+                                        W, H, pitch,
+                                        roiX, roiY, netW, netH,
+                                        st->gesture.inputDevicePtr(),
+                                        st->gesture.inputIsFP16,
+                                        st->video_stream);
+
+            // =====================================================================
+            // Stage 2: TensorRT inference test (no visualization)
+            // =====================================================================
+            if (st->gesture.engine && st->gesture.context)
+            {
+                void* bindings[3];
+                bindings[st->gesture.inIdx]  = st->gesture.dIn;
+                bindings[st->gesture.outIdx] = st->gesture.dOut;
+
+                // 🔍 Debug context + pointers before enqueue
+                CUcontext currentCtx = nullptr;
+                cuCtxGetCurrent(&currentCtx);
+                fprintf(stderr,
+                    "\n[DEBUG][TRT] ====== Inference sanity check ======\n"
+                    "[DEBUG] st->ctx            = %p\n"
+                    "[DEBUG] current CUDA ctx    = %p\n"
+                    "[DEBUG] dIn                = %p\n"
+                    "[DEBUG] dOut               = %p\n"
+                    "[DEBUG] st->video_stream   = %p\n"
+                    "[DEBUG] st->trt_stream     = %p\n"
+                    "[DEBUG] engine name        = %s\n"
+                    "[DEBUG] inIdx=%d outIdx=%d elems=%zu bytes=%zu dtype(in=%s,out=%s)\n"
+                    "===============================================\n",
+                    (void*)st->ctx, (void*)currentCtx,
+                    st->gesture.dIn, st->gesture.dOut,
+                    (void*)st->video_stream, (void*)st->trt_stream,
+                    kGestureEnginePath,
+                    st->gesture.inIdx, st->gesture.outIdx,
+                    st->gesture.outElems,
+                    st->gesture.outElems * (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float)),
+                    st->gesture.inputIsFP16 ? "fp16" : "fp32",
+                    st->gesture.outputIsFP16 ? "fp16" : "fp32"
+                );
+
+                cudaError_t syncErr = cudaDeviceSynchronize();
+                fprintf(stderr, "[DEBUG][CUDA] Device sync before enqueue → %s\n",
+                        cudaGetErrorString(syncErr));
+
+                // 🔍 Dry-run check: ensure pointers point to valid device memory
+                cudaPointerAttributes attrIn{}, attrOut{};
+                cudaError_t attrErrIn  = cudaPointerGetAttributes(&attrIn,  st->gesture.dIn);
+                cudaError_t attrErrOut = cudaPointerGetAttributes(&attrOut, st->gesture.dOut);
+                fprintf(stderr,
+                    "[DEBUG][CUDA] ptr attr IN:  type=%d device=%d err=%d\n"
+                    "[DEBUG][CUDA] ptr attr OUT: type=%d device=%d err=%d\n",
+                    (int)attrIn.type,  attrIn.device,  (int)attrErrIn,
+                    (int)attrOut.type, attrOut.device, (int)attrErrOut);
+                
+                fprintf(stderr,
+                "[DEBUG][SIZE] inBytes=%zu outBytes=%zu\n",
+                st->gesture.inBytes,
+                st->gesture.outElems * (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float)));
+
+                // Now try inference
+                if (!st->gesture.context->enqueueV2(bindings, st->video_stream, nullptr)) {
+                    fprintf(stderr, "[gesture-infer] enqueueV2 FAILED\n");
+                } else {
+                    cudaStreamSynchronize(st->video_stream);
+
+                    // Copy output to host
+                    size_t bytes = st->gesture.outElems *
+                                (st->gesture.outputIsFP16 ? sizeof(__half) : sizeof(float));
+                    cudaMemcpy(st->gesture.hostOutPinnedRaw,
+                            st->gesture.dOut, bytes, cudaMemcpyDeviceToHost);
+
+                    // Compute top-2 probabilities
+                    int top1 = -1, top2 = -1;
+                    float p1 = 0.f, p2 = 0.f;
+                    const float* probs = st->gesture.hostOut.data();
+                    int num_classes = static_cast<int>(st->gesture.hostOut.size());
+
+                    for (int i = 0; i < num_classes; ++i) {
+                        float p = probs[i];
+                        if (p > p1) { p2 = p1; top2 = top1; p1 = p; top1 = i; }
+                        else if (p > p2) { p2 = p; top2 = i; }
+                    }
+
+                    fprintf(stderr,
+                        "[gesture-infer] top1=%d (p=%.3f) top2=%d (p=%.3f)\n",
+                        top1, p1, top2, p2);
+                }
+            }
+
             cudaEventRecord(slot.ev_ready, st->video_stream);
             slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
             st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
-            kick_trt_for_ready_slots(st);
+            //kick_trt_for_ready_slots(st);
         }
     } else {
         // AI disabled: skip gesture

@@ -33,8 +33,8 @@ void launch_crop_nv12(uint8_t* dY, uint8_t* dUV,
     dim3 grid((W + block.x - 1) / block.x,
               (H + block.y - 1) / block.y);
 
-    fprintf(stderr, "[crop][debug] ROI(%d,%d,%d,%d) pitch=%d → black fill top=%d rows, left=%d cols\n",
-            roiX, roiY, roiW, roiH, pitch, roiY, roiX);
+    //fprintf(stderr, "[crop][debug] ROI(%d,%d,%d,%d) pitch=%d → black fill top=%d rows, left=%d cols\n",
+    //        roiX, roiY, roiW, roiH, pitch, roiY, roiX);
 
     crop_nv12_kernel<<<grid, block, 0, stream>>>(dY, dUV, W, H, pitch, roiX, roiY, roiW, roiH);
 }

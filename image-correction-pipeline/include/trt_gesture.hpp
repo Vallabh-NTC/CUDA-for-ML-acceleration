@@ -56,6 +56,8 @@ struct Engine {
     void* dIn  = nullptr;
     void* dOut = nullptr;
 
+    inline void* inputDevicePtr() const noexcept { return dIn; }
+
     // Host buffers
     // - hostOutPinnedRaw matches device dtype (fp16 or fp32) and is filled by async D2H.
     // - hostOut is a float view we commit into for logging & math.
