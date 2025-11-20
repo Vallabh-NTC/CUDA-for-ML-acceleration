@@ -3,10 +3,14 @@
 
 namespace ei {
 
+// NOTE: these must match the input resolution expected by your network.
+// For the original trt_pose_hand ResNet18 models, the default is often 224x224,
+// but here we use 244x244 because that is what the rest of your pipeline expects.
+// If you rebuild the engine with a different input size, update these values.
 constexpr int GESTURE_W = 244;
 constexpr int GESTURE_H = 244;
 
-// mean/std come torchvision (RGB, 0..1)
+// torchvision-style mean/std for RGB in range [0,1]
 __constant__ float kMean[3] = {0.485f, 0.456f, 0.406f};
 __constant__ float kStd[3]  = {0.229f, 0.224f, 0.225f};
 
@@ -14,7 +18,11 @@ __device__ inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Bilinear su Y (piano 0)
+// -----------------------------------------------------------------------------
+// NV12 sampling helpers
+// -----------------------------------------------------------------------------
+
+// Bilinear sampling on the Y plane
 __device__ float sampleY_bilinear(const uint8_t* dY, int pitch,
                                   int W, int H, float x, float y) {
     x = clampf(x, 0.0f, (float)(W - 1));
@@ -41,11 +49,12 @@ __device__ float sampleY_bilinear(const uint8_t* dY, int pitch,
     return v0 + dy * (v1 - v0);
 }
 
-// Legge U,V da NV12 (UV interleaved, 4:2:0)
+// Load U,V from NV12 (UV interleaved, 4:2:0) with bilinear interpolation.
+// U and V are subsampled 2x2 → we operate in half-resolution coordinates.
 __device__ void loadUV_nv12(const uint8_t* dUV, int pitch,
                             int W, int H, float x, float y,
                             float& U, float& V) {
-    // UV subsampled 2x2 → coord nella UV half-res
+    // Map full-res (x,y) into UV half-res space
     float ux = clampf(x * 0.5f, 0.0f, (float)(W/2 - 1));
     float uy = clampf(y * 0.5f, 0.0f, (float)(H/2 - 1));
 
@@ -55,12 +64,12 @@ __device__ void loadUV_nv12(const uint8_t* dUV, int pitch,
     int y1 = y0 + 1 < (H/2) ? y0 + 1 : y0;
 
     float dx = ux - (float)x0;
-    float dy = uy - (float)y0;
+    float dy = uy - (float)uy;
 
     const uint8_t* row0 = dUV + y0 * pitch;
     const uint8_t* row1 = dUV + y1 * pitch;
 
-    // in NV12: UVUVUV... (U = even, V = odd)
+    // In NV12: UVUVUV... (U at even indices, V at odd indices)
     auto sampleUV = [&](const uint8_t* row, int xx, float& u, float& v) {
         int idx = xx * 2;
         u = (float)row[idx + 0];
@@ -82,7 +91,7 @@ __device__ void loadUV_nv12(const uint8_t* dUV, int pitch,
     V = v0 + dy * (v1 - v0);
 }
 
-// Conversione YUV → RGB (BT.601 approx, 0..255)
+// YUV (BT.601 approx) → RGB, output clamped to [0,255]
 __device__ void yuv_to_rgb(float Y, float U, float V,
                            float& R, float& G, float& B) {
     float C = Y - 16.0f;
@@ -98,20 +107,30 @@ __device__ void yuv_to_rgb(float Y, float U, float V,
     B = clampf(b, 0.0f, 255.0f);
 }
 
+// -----------------------------------------------------------------------------
+// Main preprocessing kernel
+// -----------------------------------------------------------------------------
+
 __global__ void k_preprocess_nv12_roi_to_chw_fp32(
     const uint8_t* __restrict__ dY,
     const uint8_t* __restrict__ dUV,
-    int srcW, int srcH, int srcPitch,
-    int roiX, int roiY, int roiW, int roiH,
+    int srcW,
+    int srcH,
+    int srcPitch,
+    int roiX,
+    int roiY,
+    int roiW,
+    int roiH,
     float* __restrict__ dst
 ) {
     int ox = blockIdx.x * blockDim.x + threadIdx.x;
     int oy = blockIdx.y * blockDim.y + threadIdx.y;
     if (ox >= GESTURE_W || oy >= GESTURE_H) return;
 
-    // mappa (ox,oy) nello spazio ROI
-    float sx = roiX + ( (ox + 0.5f) / (float)GESTURE_W ) * roiW;
-    float sy = roiY + ( (oy + 0.5f) / (float)GESTURE_H ) * roiH;
+    // Map output pixel (ox,oy) into ROI coordinates in the source image.
+    // We sample at pixel centers: (ox + 0.5f) / GESTURE_W.
+    float sx = roiX + ((ox + 0.5f) / (float)GESTURE_W) * roiW;
+    float sy = roiY + ((oy + 0.5f) / (float)GESTURE_H) * roiH;
 
     float Y = sampleY_bilinear(dY, srcPitch, srcW, srcH, sx, sy);
     float U, V;
@@ -125,7 +144,7 @@ __global__ void k_preprocess_nv12_roi_to_chw_fp32(
     G *= (1.0f / 255.0f);
     B *= (1.0f / 255.0f);
 
-    // normalizzazione tipo torchvision
+    // torchvision-style normalization
     R = (R - kMean[0]) / kStd[0];
     G = (G - kMean[1]) / kStd[1];
     B = (B - kMean[2]) / kStd[2];
@@ -133,7 +152,7 @@ __global__ void k_preprocess_nv12_roi_to_chw_fp32(
     int idx = oy * GESTURE_W + ox;
     int planeSize = GESTURE_W * GESTURE_H;
 
-    // CHW: [0]=R, [1]=G, [2]=B
+    // CHW layout: [0]=R, [1]=G, [2]=B
     dst[0 * planeSize + idx] = R;
     dst[1 * planeSize + idx] = G;
     dst[2 * planeSize + idx] = B;
@@ -142,12 +161,20 @@ __global__ void k_preprocess_nv12_roi_to_chw_fp32(
 void preprocess_nv12_roi_to_chw_fp32(
     const uint8_t* dY,
     const uint8_t* dUV,
-    int srcW, int srcH, int srcPitch,
-    int roiX, int roiY, int roiW, int roiH,
+    int srcW,
+    int srcH,
+    int srcPitch,
+    int roiX,
+    int roiY,
+    int roiW,
+    int roiH,
     float* dstCHW,
     cudaStream_t stream
 ) {
-    if (roiW <= 0 || roiH <= 0) return;
+    if (roiW <= 0 || roiH <= 0) {
+        // Invalid ROI, nothing to do
+        return;
+    }
 
     dim3 block(16, 16);
     dim3 grid(

@@ -9,7 +9,7 @@ using namespace nvinfer1;
 
 namespace {
 
-// Logger minimo per TensorRT
+// Minimal TensorRT logger
 class TrtLogger : public ILogger {
 public:
     Severity minSeverity = Severity::kWARNING;
@@ -32,7 +32,7 @@ public:
 
 TrtLogger gLogger;
 
-// helper: volume di un Dims
+// Compute the total number of elements in a TensorRT Dims
 static size_t volume(const Dims& d) {
     size_t v = 1;
     for (int i = 0; i < d.nbDims; ++i) {
@@ -41,7 +41,7 @@ static size_t volume(const Dims& d) {
     return v;
 }
 
-// helper: leggi intero da env con default
+// Read integer from environment with default value fallback
 static int env_int(const char* name, int defVal) {
     const char* v = std::getenv(name);
     if (!v || !*v) return defVal;
@@ -49,6 +49,31 @@ static int env_int(const char* name, int defVal) {
         return std::stoi(v);
     } catch (...) {
         return defVal;
+    }
+}
+
+// Interpret a Dims as CHW (or NCHW) and extract C, H, W.
+// This is a heuristic that works for common layouts.
+static void dims_to_CHW(const Dims& d, int& C, int& H, int& W) {
+    C = H = W = 0;
+
+    if (d.nbDims == 4) {
+        // Typical NCHW: [N, C, H, W]
+        C = d.d[1];
+        H = d.d[2];
+        W = d.d[3];
+    } else if (d.nbDims == 3) {
+        // Typical CHW: [C, H, W]
+        C = d.d[0];
+        H = d.d[1];
+        W = d.d[2];
+    } else {
+        // Fallback: try to interpret as 1D
+        if (d.nbDims == 1) {
+            C = d.d[0];
+            H = 1;
+            W = 1;
+        }
     }
 }
 
@@ -62,13 +87,13 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
         return false;
     }
 
-    // evita doppio load
+    // Avoid double load if already initialized
     if (engine) {
         std::cerr << "[trt_gesture] engine already loaded, skipping\n";
         return true;
     }
 
-    // leggi file in memoria
+    // Read serialized engine from file
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
         std::cerr << "[trt_gesture] failed to open engine: " << path << "\n";
@@ -82,7 +107,7 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
         return false;
     }
 
-    // crea runtime + engine
+    // Create runtime and deserialize engine
     runtime = createInferRuntime(gLogger);
     if (!runtime) {
         std::cerr << "[trt_gesture] createInferRuntime failed\n";
@@ -101,7 +126,7 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
         return false;
     }
 
-    // numero totale di binding
+    // Number of total bindings (inputs + outputs)
     nbBindings = engine->getNbBindings();
     if (nbBindings < 2) {
         std::cerr << "[trt_gesture] nbBindings=" << nbBindings
@@ -112,14 +137,17 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
     devBindings.clear();
     devBindings.resize(nbBindings, nullptr);
 
-    inIdx      = -1;
-    outIdx     = -1;
-    inputIsFP16  = false;
+    inIdx       = -1;
+    outIdx      = -1;
+    inputIsFP16 = false;
     outputIsFP16 = false;
     outElems     = 0;
     dOut         = nullptr;
 
-    // loop su tutti i binding: troviamo input/output e allochiamo buffer per TUTTI gli output
+    outDims = Dims{};
+    outC = outH = outW = 0;
+
+    // Iterate over all bindings, find input and outputs and allocate device buffers
     for (int i = 0; i < nbBindings; ++i) {
         bool isInput = engine->bindingIsInput(i);
         DataType dt  = engine->getBindingDataType(i);
@@ -127,18 +155,20 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
         size_t elems = volume(dims);
 
         if (isInput) {
+            // First input is considered the primary one
             if (inIdx < 0) {
                 inIdx = i;
                 inputIsFP16 = (dt == DataType::kHALF);
             } else {
-                // modello con più input: per ora non supportiamo, ma logghiamo
-                std::cerr << "[trt_gesture] WARNING: multiple input bindings, only the first will be used (idx="
+                // Engine with multiple inputs: log a warning and ignore the rest.
+                std::cerr << "[trt_gesture] WARNING: multiple input bindings, "
+                             "only the first will be used (inIdx="
                           << inIdx << ")\n";
             }
-            continue; // niente alloc: l'input viene da fuori (slot.dTensor)
+            continue; // Input memory is provided externally (no alloc here).
         }
 
-        // è un OUTPUT binding → alloc device buffer
+        // Output binding → allocate device buffer
         size_t elemBytes = (dt == DataType::kHALF) ? sizeof(__half) : sizeof(float);
         size_t bytes     = elems * elemBytes;
 
@@ -150,15 +180,23 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
         }
         devBindings[i] = devPtr;
 
-        // il PRIMO output lo consideriamo "principale" (da copiare a hostOut)
+        // The first output is considered the "primary" one (e.g. heatmaps)
         if (outIdx < 0) {
             outIdx       = i;
             outputIsFP16 = (dt == DataType::kHALF);
             outElems     = elems;
             dOut         = devPtr;
 
-            if (outElems == 0) {
-                std::cerr << "[trt_gesture] primary output tensor has zero elements\n";
+            outDims = dims;
+            dims_to_CHW(outDims, outC, outH, outW);
+
+            if (outElems == 0 || outC <= 0 || outH <= 0 || outW <= 0) {
+                std::cerr << "[trt_gesture] primary output tensor has invalid shape "
+                          << "(elems=" << outElems
+                          << " C=" << outC
+                          << " H=" << outH
+                          << " W=" << outW
+                          << ")\n";
                 return false;
             }
 
@@ -184,7 +222,7 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
         return false;
     }
 
-    // indici classi start/stop da env (default 0,1)
+    // Legacy indices for "start/stop" classifier mode (still available if needed).
     idx_start = env_int("GESTURE_IDX_START", 0);
     idx_stop  = env_int("GESTURE_IDX_STOP", 1);
 
@@ -195,6 +233,9 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
               << " outElems=" << outElems
               << " inFP16=" << (inputIsFP16 ? 1 : 0)
               << " outFP16=" << (outputIsFP16 ? 1 : 0)
+              << " outC=" << outC
+              << " outH=" << outH
+              << " outW=" << outW
               << " idx_start=" << idx_start
               << " idx_stop="  << idx_stop
               << std::endl;
@@ -205,7 +246,7 @@ bool Engine::load_from_file(const char* path, cudaStream_t /*videoStreamForDebug
 }
 
 void Engine::destroy() {
-    // libera tutti i buffer device degli output
+    // Free all device buffers for outputs
     for (void* p : devBindings) {
         if (p) cudaFree(p);
     }
@@ -244,12 +285,15 @@ void Engine::destroy() {
     outputIsFP16 = false;
     hasPending   = false;
     hasCommitted = false;
+
+    outDims = Dims{};
+    outC = outH = outW = 0;
 }
 
-// viene chiamata dal tuo gpu_process dopo che il cudaMemcpyAsync è stato
-// lanciato e l'evento ev_trt_done registrato sul trt_stream.
-// Qui controlliamo se l'evento è completato, e se sì, copiamo/convertiamo
-// hostOutPinnedRaw -> hostOut (float).
+// This is called from gpu_process() after cudaMemcpyAsync(dOut -> hostOutPinnedRaw)
+// is enqueued and ev_trt_done is recorded on the TRT stream.
+// Here we check whether the event has completed and, if so, copy/convert from
+// hostOutPinnedRaw into hostOut (float).
 bool Engine::try_commit_host_output() {
     if (!ev_trt_done || !hostOutPinnedRaw || outElems == 0) {
         return false;
@@ -271,7 +315,7 @@ bool Engine::try_commit_host_output() {
 
     std::lock_guard<std::mutex> lk(mtx);
 
-    // converte sempre in float (hostOut)
+    // Always convert to float into hostOut
     if (outputIsFP16) {
         const __half* src = reinterpret_cast<const __half*>(hostOutPinnedRaw);
         hostOut.resize(outElems);
@@ -287,6 +331,10 @@ bool Engine::try_commit_host_output() {
     hasCommitted = true;
     return true;
 }
+
+// ----------------------------------------------------------------------
+// Legacy classifier-style helpers (still available if needed).
+// ----------------------------------------------------------------------
 
 bool Engine::get_start_stop(float& sLogit,
                             float& tLogit,
@@ -304,11 +352,11 @@ bool Engine::get_start_stop(float& sLogit,
         return false;
     }
 
-    // logit grezzi
+    // Raw logits
     sLogit = hostOut[idx_start];
     tLogit = hostOut[idx_stop];
 
-    // softmax su tutto il vettore
+    // Softmax over the entire vector
     float maxv = hostOut[0];
     for (size_t i = 1; i < outElems; ++i) {
         if (hostOut[i] > maxv) maxv = hostOut[i];
@@ -358,9 +406,71 @@ int Engine::top1(float* probOut) const {
     }
 
     if (probOut) {
-        *probOut = bestVal;  // se lo vuoi come "probabilità" puoi poi applicare softmax fuori
+        // Note: this is the raw logit/value, not a softmax probability.
+        *probOut = bestVal;
     }
     return bestIdx;
+}
+
+// ----------------------------------------------------------------------
+// New pose-oriented helpers (heatmaps -> keypoints).
+// ----------------------------------------------------------------------
+
+bool Engine::get_heatmap_shape(int& C, int& H, int& W) const {
+    if (!outElems || outC <= 0 || outH <= 0 || outW <= 0) {
+        C = H = W = 0;
+        return false;
+    }
+    C = outC;
+    H = outH;
+    W = outW;
+    return true;
+}
+
+// Decode one keypoint per channel by taking argmax over each heatmap plane.
+// This is a simple and robust approach for single-hand pose when you don't
+// need multi-person parsing or PAFs.
+bool Engine::decode_argmax_keypoints(std::vector<Keypoint2D>& kpts) {
+    std::lock_guard<std::mutex> lk(mtx);
+
+    if (!hasCommitted || hostOut.empty() || outC <= 0 || outH <= 0 || outW <= 0) {
+        return false;
+    }
+
+    const int planeSize = outH * outW;
+    if (static_cast<int>(hostOut.size()) < outC * planeSize) {
+        std::cerr << "[trt_gesture] decode_argmax_keypoints: hostOut size mismatch "
+                  << "(hostOut.size=" << hostOut.size()
+                  << " vs C*H*W=" << (outC * planeSize) << ")\n";
+        return false;
+    }
+
+    kpts.resize(outC);
+
+    for (int c = 0; c < outC; ++c) {
+        float maxv = -1e30f;
+        int maxx = 0, maxy = 0;
+
+        const int base = c * planeSize;
+
+        for (int y = 0; y < outH; ++y) {
+            const int rowBase = base + y * outW;
+            for (int x = 0; x < outW; ++x) {
+                float v = hostOut[rowBase + x];
+                if (v > maxv) {
+                    maxv = v;
+                    maxx = x;
+                    maxy = y;
+                }
+            }
+        }
+
+        kpts[c].u    = static_cast<float>(maxx);
+        kpts[c].v    = static_cast<float>(maxy);
+        kpts[c].conf = maxv;  // raw heatmap peak value
+    }
+
+    return true;
 }
 
 } // namespace trt

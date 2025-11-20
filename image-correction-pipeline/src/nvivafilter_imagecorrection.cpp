@@ -1,6 +1,6 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * (decoupled TRT stream + device FIFO + UI indicator JSON + ROI preprocess)
+ * (decoupled TRT stream + device FIFO + hand pose keypoints overlay)
  */
 
 #include <cstdio>
@@ -35,16 +35,18 @@
 #include "trt_gesture.hpp"
 #include "ei_gesture_infer.cuh"
 
-// ⭐ nuovo: draw box su NV12
+// Debug ROI box on NV12
 #include "kernel_draw_box_nv12.cuh"
+// New: draw hand keypoints on NV12
+#include "kernel_draw_hand_points_nv12.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 constexpr float M_PI_F = static_cast<float>(M_PI);
 
-// 🔹 path del modello mano (come da tuoi log)
-static const char* kGestureEnginePath = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp16.engine";
+// Path of the hand pose TensorRT engine (same as before)
+static const char* kGestureEnginePath = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp32.engine";
 
 // ============================================================================
 // Global CUDA primary context (shared across instances)
@@ -123,7 +125,7 @@ static std::string mask_meta_path_for(int cam_idx) {
 }
 
 // ============================================================================
-// MQTT helpers (unchanged, elided except for declarations)
+// MQTT helpers (kept for compatibility, but no longer used for gesture)
 // ============================================================================
 struct MqttCfg {
     std::string host;
@@ -183,7 +185,7 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
 }
 
 // ============================================================================
-// Audio TTS helper (pico2wave + paplay)
+// Audio TTS helper (pico2wave + paplay) - not used by hand pose, kept for compatibility
 // ============================================================================
 static void speak_async(const std::string& phrase) {
     const char* pico_bin = std::getenv("PICOWAVE_BIN");
@@ -210,10 +212,10 @@ static void speak_async(const std::string& phrase) {
 }
 
 // ============================================================================
-// UI indicator helper — atomic JSON to /dev/shm con log
+// UI indicator helper — atomic JSON to /dev/shm (still used to seed cam1 state)
 // ============================================================================
 static void emit_ui_indicator_json(int cam, const char* indicator) {
-    if (cam != 1) return; // Only cam1 surfaces this UI (can be generalized later)
+    if (cam != 1) return; // Only cam1 uses this UI
     const char* final_path = "/dev/shm/ui_cam1.json";
     const char* tmp_path   = "/dev/shm/ui_cam1.tmp";
 
@@ -282,21 +284,21 @@ struct ICPState {
     trt::Engine gesture;
     bool gesture_loaded_once = false;
 
-    // bytes dell’input tensor (1x3x244x244 fp32/fp16)
+    // bytes of the input tensor (1x3x244x244 fp32/fp16)
     size_t gesture_input_bytes = 0;
 
     // Device FIFO of preprocessed tensors
     static constexpr int kSlots = 4; // small ring to keep latency bounded
     enum class SlotState : int { FREE=0, READY=1, INFLIGHT=2 };
     struct Slot {
-        void*      dTensor = nullptr;   // FP16 o FP32 matching engine input
+        void*      dTensor = nullptr;   // FP16 or FP32 matching engine input
         cudaEvent_t ev_ready = nullptr; // signaled on video_stream when tensor is written
         cudaEvent_t ev_done  = nullptr; // signaled on trt_stream when TRT+D2H queued
         std::atomic<int> state{(int)SlotState::FREE};
     } slots[kSlots];
     int prod_idx = 0; // producer writes here
 
-    // MQTT + FSM
+    // MQTT + FSM kept for compatibility but no longer used for gesture
     MqttCfg mqtt{}; bool mqtt_checked_once = false;
     struct {
         int   hold_start_target_ms = 800;
@@ -482,7 +484,7 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st){
     cudaStreamCreateWithFlags(&st->trt_stream, cudaStreamNonBlocking);
 #endif
 
-    // Hardcode: input 1x3x244x244
+    // Hardcoded: input 1x3x244x244 (matches preprocess and engine)
     const bool fp16 = st->gesture.inputIsFP16;
     const int  C = 3;
     const int  H = 244;
@@ -514,7 +516,7 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st){
 }
 
 // ----------------------------------------------------------------------------
-// FSM helper: init MQTT + durations from env
+// FSM helper: init MQTT + durations from env (kept but no longer used)
 // ----------------------------------------------------------------------------
 static void ensure_mqtt_and_fsm_config(ICPState* st){
     if (!st->mqtt_checked_once){
@@ -531,7 +533,7 @@ static void ensure_mqtt_and_fsm_config(ICPState* st){
         if (const char* v = std::getenv("GESTURE_STOP_P");  v && *v)
             st->fsm.stop_prob_thresh  = clamp01(strtof(v, nullptr));
         fprintf(stderr,
-            "[FSM] hold_start=%dms hold_stop=%dms cycle_reset=%dms "
+            "[FSM] (legacy) hold_start=%dms hold_stop=%dms cycle_reset=%dms "
             "p_thresh(start=%.2f stop=%.2f) mqtt=%s:%d topic=%s\n",
             st->fsm.hold_start_target_ms,
             st->fsm.hold_stop_target_ms,
@@ -567,7 +569,7 @@ static ICPState* create_instance(){
     st->controls.set_section(sec);
     fprintf(stderr, "[ic] Instance bound to section '%s'\n", sec.c_str());
 
-    // seed UI for cam1 as "yellow" (FSM starts in SEEK_START)
+    // Seed UI for cam1 as "yellow" (legacy indicator)
     if (sec == "cam1") {
         emit_ui_indicator_json(1, "yellow");
     }
@@ -620,17 +622,17 @@ static int acquire_free_slot(ICPState* st){
     return st->prod_idx;
 }
 
-// manda in TRT gli slot READY, usa tutti i binding (input+outputs)
+// Launch TRT inference for READY slots; use all bindings (input+outputs)
 static void kick_trt_for_ready_slots(ICPState* st){
     if (!st->gesture.engine || !st->trt_stream) return;
 
-    // cerca un READY da mandare in TRT
+    // Find one READY slot to send into TRT
     for (int i = 0; i < ICPState::kSlots; ++i) {
         auto& slot = st->slots[i];
         auto s = (ICPState::SlotState)slot.state.load(std::memory_order_acquire);
         if (s != ICPState::SlotState::READY) continue;
 
-        // aspetta preprocess su video_stream
+        // Wait for preprocessing on video_stream
         cudaStreamWaitEvent(st->trt_stream, slot.ev_ready, 0);
 
         if (st->gesture.nbBindings <= 0) {
@@ -639,11 +641,11 @@ static void kick_trt_for_ready_slots(ICPState* st){
             continue;
         }
 
-        // riempiamo TUTTI i binding: input viene dallo slot, outputs da devBindings
+        // Fill all bindings: input from slot.dTensor, outputs from devBindings
         std::vector<void*> bindings(st->gesture.nbBindings, nullptr);
         for (int b = 0; b < st->gesture.nbBindings; ++b) {
             if (b == st->gesture.inIdx) {
-                bindings[b] = slot.dTensor; // input (ROI pre-processata)
+                bindings[b] = slot.dTensor; // input tensor (ROI preprocessed)
             } else {
                 if (b >= 0 && b < (int)st->gesture.devBindings.size()) {
                     bindings[b] = st->gesture.devBindings[b];
@@ -651,7 +653,7 @@ static void kick_trt_for_ready_slots(ICPState* st){
             }
         }
 
-        // sanity check
+        // Sanity check for primary bindings
         if (!bindings[st->gesture.inIdx] || !bindings[st->gesture.outIdx]) {
             fprintf(stderr, "[gesture] bindings for inIdx(%d) or outIdx(%d) are null\n",
                     st->gesture.inIdx, st->gesture.outIdx);
@@ -686,10 +688,10 @@ static void kick_trt_for_ready_slots(ICPState* st){
         cudaEventRecord(slot.ev_done, st->trt_stream);
         cudaEventRecord(st->gesture.ev_trt_done, st->trt_stream);
         slot.state.store((int)ICPState::SlotState::INFLIGHT, std::memory_order_release);
-        break; // uno per ciclo basta
+        break; // process one per frame for simplicity
     }
 
-    // prova a liberare INFLIGHT completati
+    // Try to free INFLIGHT slots that have completed
     for (int i = 0; i < ICPState::kSlots; ++i) {
         auto& slot = st->slots[i];
         if ((ICPState::SlotState)slot.state.load(std::memory_order_relaxed)
@@ -735,7 +737,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     const int H = (int)f.height;
     const int pitch = (int)f.pitch;
 
-    // debug: log per i primi 20 frame globali
+    // Debug: log the first few frames to validate geometry
     static int dbg_frame = 0;
     if (dbg_frame < 20) {
         fprintf(stderr,
@@ -773,7 +775,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
         f_fish, fx, cx_rect, cy_rect,
         st->video_stream);
 
-    // 2) Wire removal
+    // 2) Wire removal mask (if available)
     if (st->mask.valid && st->mask.W==W && st->mask.H==H){
         const int my_idx = section_to_index(st->controls.section());
         if (my_idx == st->mask.cam_index){
@@ -784,42 +786,64 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
         }
     }
 
-    // AI gate
+    // AI on/off gate
     const bool ai_on = st->controls.ai_enabled();
 
-    // -------------------- ROI comune a AI + BOX --------------------
-    int roiX = 1008;
-    int roiY = 1000;
-    int roiW = 1600;
-    int roiH = 1200;
+    // -------------------- ROI shared by AI + debug box --------------------
+    // Define ROI in normalized coordinates (fractions of W,H)
+    // tuned to focus on the hand area, not the full driver body.
 
-    // clamp ROI dentro al frame
+    // Size of ROI as fraction of the frame
+    const float roi_w_frac = 0.42f;  // ~35% of frame width
+    const float roi_h_frac = 0.58f;  // ~50% of frame height
+
+    // Center of ROI as fraction of the frame.
+    // Shifted a bit to the left and lower, where the hand usually appears.
+    const float roi_cx_frac = 0.38f; // 0 = left, 1 = right
+    const float roi_cy_frac = 0.65f; // 0 = top, 1 = bottom
+
+    int roiW = static_cast<int>(roi_w_frac * W);
+    int roiH = static_cast<int>(roi_h_frac * H);
+
+    int cx = static_cast<int>(roi_cx_frac * W);
+    int cy = static_cast<int>(roi_cy_frac * H);
+
+    int roiX = cx - roiW / 2;
+    int roiY = cy - roiH / 2;
+
+    // Clamp ROI to frame boundaries
     if (roiX < 0) roiX = 0;
     if (roiY < 0) roiY = 0;
     if (roiX + roiW > W) roiW = W - roiX;
     if (roiY + roiH > H) roiH = H - roiY;
 
-    // 2.8) Gesture pipeline setup (cam1 only) — ora con ROI reale
+    // 2.x) Gesture pipeline setup (cam1 only) — now using pose heatmaps
     if (ai_on) {
         ensure_gesture_loaded_for_cam1(st);
         if (st->gesture.engine && st->trt_stream && st->gesture_input_bytes > 0) {
 
             if (st->gesture.inputIsFP16) {
+                // IMPORTANT:
+                // If the engine input is FP16 but your preprocess writes FP32,
+                // you either need:
+                //   - a FP32 engine, or
+                //   - a FP32->FP16 conversion kernel before sending to TRT.
                 static bool s_once = false;
                 if (!s_once) {
                     fprintf(stderr,
-                        "[AI-ERROR][%s] Engine input is FP16, ma preprocess genera FP32. "
-                        "Serve un path FP16 se cambi model.\n",
+                        "[AI-ERROR][%s] Engine input is FP16, but preprocess generates FP32. "
+                        "You need either a FP32 engine or a FP32->FP16 conversion path.\n",
                         st->controls.section().c_str());
                     s_once = true;
                 }
             } else {
+                // Acquire a free slot in the device FIFO
                 int slot_idx = acquire_free_slot(st);
                 auto &slot = st->slots[slot_idx];
 
                 slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_relaxed);
 
-                // Preprocess NV12 ROI → CHW FP32 (1x3x244x244) nel dTensor
+                // Preprocess NV12 ROI → CHW FP32 (1x3x244x244) into dTensor
                 ei::preprocess_nv12_roi_to_chw_fp32(
                     dY, dUV,
                     W, H, pitch,
@@ -828,11 +852,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                     st->video_stream
                 );
 
+                // Signal that the slot is READY for TRT
                 cudaEventRecord(slot.ev_ready, st->video_stream);
                 slot.state.store((int)ICPState::SlotState::READY, std::memory_order_release);
                 st->prod_idx = (slot_idx + 1) % ICPState::kSlots;
 
-                // manda avanti TRT sugli slot READY
+                // Trigger TRT on READY slots (async on trt_stream)
                 kick_trt_for_ready_slots(st);
             }
         }
@@ -844,16 +869,9 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(dY, W, H, pitch, dUV, pitch, cp, st->video_stream);
 
-    // 4) BOX DEBUG: disegniamo la stessa ROI del preprocess (solo cam1)
+    // 4) Debug: draw ROI box on cam1 to visualize the region used for hand pose
     {
         if (st->controls.section() == std::string("cam1")) {
-            // if (dbg_frame < 100) {
-            //     fprintf(stderr,
-            //             "[draw-box-debug][%s] ROI=(%d,%d,%d,%d) frame=%dx%d pitch=%d\n",
-            //             st->controls.section().c_str(),
-            //             roiX, roiY, roiW, roiH, W, H, pitch);
-            // }
-
             draw::launch_draw_box_nv12(
                 dY, dUV,
                 W, H, pitch,
@@ -863,90 +881,59 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
         }
     }
 
-    // Fence VIDEO work
+    // Fence VIDEO work (rectify, wire removal, tone, ROI box)
     cudaStreamSynchronize(st->video_stream);
 
-    // ---- FSM + MQTT if a fresh result is available AND AI is enabled ----
+    // ---- Hand pose visualization: decode heatmaps and draw keypoints ----
     if (ai_on && st->gesture.engine && st->gesture.try_commit_host_output()) {
-        ensure_mqtt_and_fsm_config(st);
+        // Get heatmap tensor shape (C x H x W)
+        int C = 0, hmH = 0, hmW = 0;
+        if (!st->gesture.get_heatmap_shape(C, hmH, hmW)) {
+            fprintf(stderr, "[gesture][%s] invalid heatmap shape\n",
+                    st->controls.section().c_str());
+        } else {
+            std::vector<trt::Keypoint2D> kpts;
+            if (st->gesture.decode_argmax_keypoints(kpts)) {
+                // Map keypoints from heatmap space → ROI → image space
+                std::vector<draw::Point2D> pts;
+                pts.reserve(kpts.size());
 
-        if (const char* dumpEI = std::getenv("TRT_DUMP_EI_RAW"); dumpEI && *dumpEI=='1'){
-            const float v_start = st->gesture.hostOut[st->gesture.idx_start];
-            const float v_stop  = st->gesture.hostOut[st->gesture.idx_stop];
-            fprintf(stderr, "[gesture][%s] raw: start=%.3f stop=%.3f\n",
-                    st->controls.section().c_str(), v_start, v_stop);
-        }
+                for (int i = 0; i < C; ++i) {
+                    const auto& kp = kpts[i];
 
-        float sL=0.f, tL=0.f, ps=0.f, pt=0.f; int top=-1;
-        if (st->gesture.get_start_stop(sL, tL, ps, pt, top)) {
-            const bool start_ok = (top == 0) && (ps >= st->fsm.start_prob_thresh);
-            const bool stop_ok  = (top == 1) && (pt >= st->fsm.stop_prob_thresh);
+                    // Convert (u,v) in heatmap to normalized [0,1] within the ROI
+                    float nx = (kp.u + 0.5f) / (float)hmW;
+                    float ny = (kp.v + 0.5f) / (float)hmH;
 
-            using clk = std::chrono::steady_clock;
-            auto now = clk::now();
-            int dms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - st->fsm.t_last).count();
-            if (dms < 0 || dms > 1000) dms = 0;
-            st->fsm.t_last = now;
+                    // Clamp normalized coordinates
+                    if (nx < 0.0f) nx = 0.0f;
+                    if (nx > 1.0f) nx = 1.0f;
+                    if (ny < 0.0f) ny = 0.0f;
+                    if (ny > 1.0f) ny = 1.0f;
 
-            if (st->fsm.hold_start_ms==0 && st->fsm.hold_stop_ms==0 &&
-                st->fsm.phase==decltype(st->fsm.phase)::SEEK_START)
-                st->fsm.t_cycle_start = now;
+                    int x_img = roiX + (int)(nx * roiW);
+                    int y_img = roiY + (int)(ny * roiH);
 
-            int cycle_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - st->fsm.t_cycle_start).count();
-            if (cycle_elapsed_ms > st->fsm.cycle_reset_ms) {
-                fprintf(stderr, "[FSM] cycle watchdog (%d ms) → reset to SEEK_START\n",
-                        cycle_elapsed_ms);
-                st->fsm.reset_phase_to_start();
-                if (st->controls.section() == std::string("cam1")) {
-                    emit_ui_indicator_json(1, "yellow");
+                    draw::Point2D p;
+                    p.x    = x_img;
+                    p.y    = y_img;
+                    // For now we always draw the point; you can filter by kp.conf if needed.
+                    p.conf = 1.0f;
+                    pts.push_back(p);
+                }
+
+                if (!pts.empty() && st->controls.section() == std::string("cam1")) {
+                    // Draw keypoints (small white dots) on NV12
+                    draw::launch_draw_hand_points_nv12(
+                        dY, dUV,
+                        W, H, pitch,
+                        pts.data(), (int)pts.size(),
+                        st->video_stream
+                    );
+                    // Synchronize to make sure overlay is visible before unmapping
+                    cudaStreamSynchronize(st->video_stream);
                 }
             }
-
-            switch (st->fsm.phase) {
-                case decltype(st->fsm.phase)::SEEK_START:
-                    if (start_ok) {
-                        st->fsm.hold_start_ms += dms;
-                        if (st->fsm.hold_start_ms >= st->fsm.hold_start_target_ms) {
-                            st->fsm.phase = decltype(st->fsm.phase)::SEEK_STOP;
-                            st->fsm.hold_stop_ms = 0;
-                            fprintf(stderr, "[FSM] START confirmed (%.3fs). Now seeking STOP...\n",
-                                    st->fsm.hold_start_ms/1000.0);
-                            if (st->controls.section() == std::string("cam1")) {
-                                emit_ui_indicator_json(1, "green");
-                            }
-                        }
-                    }
-                    break;
-                case decltype(st->fsm.phase)::SEEK_STOP:
-                    if (stop_ok) {
-                        st->fsm.hold_stop_ms += dms;
-                        if (st->fsm.hold_stop_ms >= st->fsm.hold_stop_target_ms) {
-                            bool next_rec = !st->fsm.recording;
-                            const char* action = next_rec ? "start" : "stop";
-                            std::string payload =
-                                std::string("{\"value\":{\"recording\":\"") + action + "\"}}";
-                            mqtt_publish(st->mqtt, payload);
-                            fprintf(stderr, "[TRIGGER] recording %s (after START→STOP sequence)\n",
-                                    action);
-
-                            if (next_rec) speak_async("Recording started");
-                            else          speak_async("Recording stopped");
-
-                            st->fsm.recording = next_rec;
-                            st->fsm.reset_phase_to_start();
-                            if (st->controls.section() == std::string("cam1")) {
-                                emit_ui_indicator_json(1, "yellow");
-                            }
-                        }
-                    }
-                    break;
-            }
-        } else {
-            float p=0.f; int cls = st->gesture.top1(&p);
-            fprintf(stderr, "[gesture][%s] top1=%d prob=%.3f\n",
-                    st->controls.section().c_str(), cls, p);
         }
     }
 
@@ -963,7 +950,7 @@ extern "C" void init(CustomerFunction* f){
     f->fPostProcess=post_process;
     std::call_once(g_ctx_once, retain_primary_context_once);
     fprintf(stderr,
-        "[ic] imagecorrection initialized (gesture runs only on cam1; "
+        "[ic] imagecorrection initialized (hand pose overlay on cam1; "
         "decoupled TRT stream + ROI preprocess)\n");
 }
 
