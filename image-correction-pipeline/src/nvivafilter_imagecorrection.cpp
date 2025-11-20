@@ -1,6 +1,6 @@
 /**
  * @file nvivafilter_imagecorrection.cpp
- * (decoupled TRT stream + device FIFO + hand pose keypoints overlay)
+ * (decoupled TRT stream + device FIFO + hand pose keypoints overlay + peace gesture)
  */
 
 #include <cstdio>
@@ -37,16 +37,20 @@
 
 // Debug ROI box on NV12
 #include "kernel_draw_box_nv12.cuh"
-// New: draw hand keypoints on NV12
+// Hand keypoints + skeleton on NV12
 #include "kernel_draw_hand_points_nv12.cuh"
+
+// Gesture classification (peace ✌️)
+#include "gesture_classify.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 constexpr float M_PI_F = static_cast<float>(M_PI);
 
-// Path of the hand pose TensorRT engine (same as before)
-static const char* kGestureEnginePath = "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp32.engine";
+// Path of the hand pose TensorRT engine
+static const char* kGestureEnginePath =
+    "/usr/local/lib/nvivafilter/models/hand_pose_resnet18_fp32.engine";
 
 // ============================================================================
 // Global CUDA primary context (shared across instances)
@@ -527,7 +531,7 @@ static void ensure_mqtt_and_fsm_config(ICPState* st){
         if (const char* v = std::getenv("GESTURE_HOLD_STOP_MS"); v && *v)
             st->fsm.hold_stop_target_ms  = std::max(100, atoi(v));
         if (const char* v = std::getenv("GESTURE_CYCLE_RESET_MS"); v && *v)
-            st->fsm.cycle_reset_ms = std::max(1000, atoi(v));
+            st->fsm.cycle_reset_ms       = std::max(1000, atoi(v));
         if (const char* v = std::getenv("GESTURE_START_P"); v && *v)
             st->fsm.start_prob_thresh = clamp01(strtof(v, nullptr));
         if (const char* v = std::getenv("GESTURE_STOP_P");  v && *v)
@@ -793,12 +797,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     // Define ROI in normalized coordinates (fractions of W,H)
     // tuned to focus on the hand area, not the full driver body.
 
-    // Size of ROI as fraction of the frame
-    const float roi_w_frac = 0.42f;  // ~35% of frame width
-    const float roi_h_frac = 0.58f;  // ~50% of frame height
+    // Size of ROI as fraction of the frame (slightly enlarged)
+    const float roi_w_frac = 0.42f;  // ~42% of frame width
+    const float roi_h_frac = 0.58f;  // ~58% of frame height
 
     // Center of ROI as fraction of the frame.
-    // Shifted a bit to the left and lower, where the hand usually appears.
+    // Shifted to left-lower area where the hand usually appears.
     const float roi_cx_frac = 0.38f; // 0 = left, 1 = right
     const float roi_cy_frac = 0.65f; // 0 = top, 1 = bottom
 
@@ -917,13 +921,22 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                     draw::Point2D p;
                     p.x    = x_img;
                     p.y    = y_img;
-                    // For now we always draw the point; you can filter by kp.conf if needed.
-                    p.conf = 1.0f;
+                    p.conf = 1.0f; // you can use kp.conf if you add it
                     pts.push_back(p);
                 }
 
+                // --- Gesture classification: PEACE (✌️) vs NULL ---
+                gesture::Result gres = gesture::classify_peace(pts);
+                const float kPeaceScoreThresh = 0.8f;
+
+                if (gres.type == gesture::Type::PEACE && gres.score >= kPeaceScoreThresh) {
+                    fprintf(stderr, "[GESTURE] PEACE (score=%.2f)\n", gres.score);
+                } else {
+                    fprintf(stderr, "[GESTURE] NULL (score=%.2f)\n", gres.score);
+                }
+
                 if (!pts.empty() && st->controls.section() == std::string("cam1")) {
-                    // Draw keypoints (small white dots) on NV12
+                    // Draw keypoints + simple skeleton (white dots + lines) on NV12
                     draw::launch_draw_hand_points_nv12(
                         dY, dUV,
                         W, H, pitch,
@@ -950,7 +963,7 @@ extern "C" void init(CustomerFunction* f){
     f->fPostProcess=post_process;
     std::call_once(g_ctx_once, retain_primary_context_once);
     fprintf(stderr,
-        "[ic] imagecorrection initialized (hand pose overlay on cam1; "
+        "[ic] imagecorrection initialized (hand pose overlay + peace gesture on cam1; "
         "decoupled TRT stream + ROI preprocess)\n");
 }
 
