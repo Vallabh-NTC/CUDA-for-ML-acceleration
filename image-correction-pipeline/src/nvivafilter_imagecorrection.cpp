@@ -128,7 +128,7 @@ static std::string mask_meta_path_for(int cam_idx) {
 }
 
 // ============================================================================
-// MQTT helpers (kept for compatibility, but not used for peace gesture)
+// MQTT helpers (kept for compatibility, and now used for PEACE STANDBY trigger)
 // ============================================================================
 struct MqttCfg {
     std::string host;
@@ -185,6 +185,18 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
     if (!c.pass.empty()) cmd += " -P " + shell_quote(c.pass);
     int rc = std::system(cmd.c_str());
     fprintf(stderr, "[MQTT] rc=%d topic=%s payload=%s\n", rc, c.topic.c_str(), payload.c_str());
+}
+
+// Dedicated helper: send photo trigger when cam1 enters STANDBY
+static void send_standby_photo_trigger_cam1() {
+    MqttCfg c;
+    c.host  = "192.168.0.100";
+    c.port  = 1883;
+    c.topic = "jetson/stream/cmd";
+    c.valid = true;
+
+    const std::string payload = R"({ "value": { "photo": "take" } })";
+    mqtt_publish(c, payload);
 }
 
 // ============================================================================
@@ -301,7 +313,7 @@ struct ICPState {
     } slots[kSlots];
     int prod_idx = 0; // producer writes here
 
-    // MQTT + FSM kept for compatibility but no longer used for gesture logic
+    // MQTT + legacy FSM (not used for PEACE logic, kept for compatibility)
     MqttCfg mqtt{}; bool mqtt_checked_once = false;
     struct {
         int   hold_start_target_ms = 800;
@@ -319,6 +331,22 @@ struct ICPState {
             t_cycle_start=std::chrono::steady_clock::now();
         }
     } fsm;
+
+    // ---------------------------------------------------------------------
+    // NEW: PEACE gesture FSM (SLEEP → WAITING → STANDBY → SLEEP)
+    // ---------------------------------------------------------------------
+    struct PeaceFSM {
+        enum class State { SLEEP, WAITING, STANDBY };
+
+        State state = State::SLEEP;
+        bool  initialized = false;
+
+        // Time when we entered the current state
+        std::chrono::steady_clock::time_point t_enter{};
+
+        // Number of PEACE detections while in WAITING (within a fixed window)
+        int detections = 0;
+    } peace_fsm;
 };
 
 static std::mutex              g_instances_mtx;
@@ -666,7 +694,12 @@ static void kick_trt_for_ready_slots(ICPState* st){
 
         (void)cudaGetLastError();
 
-        if (!st->gesture.context->enqueueV2(bindings.data(), st->trt_stream, nullptr)) {
+        #pragma GCC diagnostic push
+        #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        bool ok = st->gesture.context->enqueueV2(bindings.data(), st->trt_stream, nullptr);
+        #pragma GCC diagnostic pop
+
+        if (!ok) {
             fprintf(stderr, "[gesture] enqueueV2 failed\n");
             slot.state.store((int)ICPState::SlotState::FREE, std::memory_order_release);
             continue;
@@ -708,6 +741,117 @@ static void kick_trt_for_ready_slots(ICPState* st){
                         (int)q, cudaGetErrorString(q));
             }
         }
+    }
+}
+
+// Helper: stringify PEACE FSM state
+static const char* peace_state_name(ICPState::PeaceFSM::State s) {
+    using S = ICPState::PeaceFSM::State;
+    switch (s) {
+        case S::SLEEP:   return "SLEEP";
+        case S::WAITING: return "WAITING";
+        case S::STANDBY: return "STANDBY";
+        default:         return "UNKNOWN";
+    }
+}
+
+// Update PEACE FSM given current isPeace flag and wall-clock time
+// WAITING keeps counting detections for 5 seconds.
+// If detections >= threshold within the window -> STANDBY (and send MQTT).
+// If not, after 5s -> SLEEP.
+static void update_peace_fsm(ICPState* st, bool isPeace) {
+    // Only meaningful for cam1 (where gesture runs)
+    if (st->controls.section() != std::string("cam1")) {
+        return;
+    }
+
+    using clk = std::chrono::steady_clock;
+
+    auto& fsm = st->peace_fsm;
+    auto now  = clk::now();
+
+    if (!fsm.initialized) {
+        fsm.initialized   = true;
+        fsm.state         = ICPState::PeaceFSM::State::SLEEP;
+        fsm.t_enter       = now;
+        fsm.detections    = 0;
+        fprintf(stderr, "[PEACE-FSM][cam1] init -> SLEEP\n");
+    }
+
+    using State = ICPState::PeaceFSM::State;
+
+    // Tunables:
+    // - kWaitingWindowMs: how long we stay in WAITING, irrespective of misses
+    // - kPeaceDetectionsThresh: how many PEACE detections in that window
+    const float kWaitingWindowMs       = 5000.0f; // 5 seconds window
+    const int   kPeaceDetectionsThresh = 30;      // adjust as needed
+    const float kStandbyDurationMs     = 6000.0f; // STANDBY duration (6s)
+
+    switch (fsm.state) {
+        case State::SLEEP:
+            // First time we see PEACE → SLEEP -> WAITING
+            if (isPeace) {
+                fsm.state      = State::WAITING;
+                fsm.t_enter    = now;
+                fsm.detections = 1; // count this first detection
+                fprintf(stderr,
+                        "[PEACE-FSM][cam1] SLEEP -> WAITING (detections=%d)\n",
+                        fsm.detections);
+            }
+            break;
+
+        case State::WAITING:
+        {
+            float elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - fsm.t_enter).count();
+
+            // Count detections whenever PEACE is seen (no need to be continuous)
+            if (isPeace) {
+                ++fsm.detections;
+            }
+
+            // If we accumulated enough detections in the 5s window → STANDBY
+            if (fsm.detections >= kPeaceDetectionsThresh) {
+                fprintf(stderr,
+                        "[PEACE-FSM][cam1] WAITING -> STANDBY "
+                        "(detections=%d, elapsed=%.0f ms)\n",
+                        fsm.detections, elapsed_ms);
+
+                // Send MQTT photo trigger once when entering STANDBY
+                send_standby_photo_trigger_cam1();
+
+                fsm.state      = State::STANDBY;
+                fsm.t_enter    = now;
+                fsm.detections = 0; // reset for next cycle
+                break;
+            }
+
+            // If 5s passed and we *didn't* reach the threshold → back to SLEEP
+            if (elapsed_ms >= kWaitingWindowMs) {
+                fprintf(stderr,
+                        "[PEACE-FSM][cam1] WAITING -> SLEEP "
+                        "(timeout, detections=%d, elapsed=%.0f ms)\n",
+                        fsm.detections, elapsed_ms);
+                fsm.state      = State::SLEEP;
+                fsm.t_enter    = now;
+                fsm.detections = 0;
+            }
+        } break;
+
+        case State::STANDBY:
+        {
+            // Stay in STANDBY for a fixed duration, regardless of PEACE
+            float elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - fsm.t_enter).count();
+            if (elapsed_ms >= kStandbyDurationMs) {
+                fsm.state      = State::SLEEP;
+                fsm.t_enter    = now;
+                fsm.detections = 0;
+                fprintf(stderr,
+                        "[PEACE-FSM][cam1] STANDBY -> SLEEP (timeout %.0f ms)\n",
+                        elapsed_ms);
+            }
+        } break;
     }
 }
 
@@ -912,22 +1056,19 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                     pts.push_back(p);
                 }
 
-                // --- Gesture classification: PEACE (✌️) vs NULL ---
+                // --- Gesture classification: PEACE (✌️) vs NONE ---
                 gesture::Result gres = gesture::classify_peace(pts);
                 const float kPeaceScoreThresh = 0.8f;
 
                 bool isPeace =
                     (gres.type == gesture::Type::PEACE && gres.score >= kPeaceScoreThresh);
 
-                if (isPeace) {
-                    fprintf(stderr, "[GESTURE] PEACE (score=%.2f)\n", gres.score);
-                } else {
-                    fprintf(stderr, "[GESTURE] NULL (score=%.2f)\n", gres.score);
-                }
+                // --- NEW: update PEACE FSM (SLEEP → WAITING → STANDBY → SLEEP) ---
+                update_peace_fsm(st, isPeace);
 
                 if (!pts.empty() && st->controls.section() == std::string("cam1")) {
                     // Draw keypoints + simple skeleton (dots + lines) on NV12
-                    // PEACE → green; otherwise white
+                    // PEACE → green + thicker; otherwise white & thin
                     draw::launch_draw_hand_points_nv12(
                         dY, dUV,
                         W, H, pitch,
@@ -956,7 +1097,7 @@ extern "C" void init(CustomerFunction* f){
     std::call_once(g_ctx_once, retain_primary_context_once);
     fprintf(stderr,
         "[ic] imagecorrection initialized (hand pose overlay + peace gesture on cam1; "
-        "decoupled TRT stream + ROI preprocess)\n");
+        "decoupled TRT stream + ROI preprocess + PEACE FSM)\n");
 }
 
 extern "C" void deinit(void){

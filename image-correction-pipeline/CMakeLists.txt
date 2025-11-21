@@ -39,7 +39,7 @@ set(CUDA_SOURCES
     src/kernel_draw_hand_points_nv12.cu
     src/gesture_classify.cpp
     src/kernel_draw_box_nv12.cu
-    #src/nv12_to_rgb_chw.cu
+    
 )
 
 set(CPP_SOURCES
