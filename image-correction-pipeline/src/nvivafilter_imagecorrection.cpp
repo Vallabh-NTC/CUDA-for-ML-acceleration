@@ -187,16 +187,29 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
     fprintf(stderr, "[MQTT] rc=%d topic=%s payload=%s\n", rc, c.topic.c_str(), payload.c_str());
 }
 
-// Dedicated helper: send photo trigger when cam1 enters STANDBY
-static void send_standby_photo_trigger_cam1() {
+// Helper generico: manda "photo: take" a un topic specifico (sincrono)
+static void send_photo_trigger_for_topic_sync(const char* topic) {
+    if (!topic || !*topic) return;
+
     MqttCfg c;
-    c.host  = "192.168.0.100";
+    c.host  = "192.168.0.100";     // broker MQTT
     c.port  = 1883;
-    c.topic = "jetson/stream/cmd";
+    c.topic = topic;
     c.valid = true;
 
     const std::string payload = R"({ "value": { "photo": "take" } })";
-    mqtt_publish(c, payload);
+    mqtt_publish(c, payload);      // sincrono, ma chiamato da thread separato
+}
+
+// Dedicated helper: chiamata quando cam1 entra in STANDBY
+// Lancia l’invio MQTT su un thread separato per NON bloccare il video.
+// Scatta tutte e 3 le camere.
+static void send_standby_photo_trigger_cam1() {
+    std::thread([](){
+        send_photo_trigger_for_topic_sync("jetson/stream/cam0/cmd");
+        send_photo_trigger_for_topic_sync("jetson/stream/cam1/cmd");
+        send_photo_trigger_for_topic_sync("jetson/stream/cam2/cmd");
+    }).detach();
 }
 
 // ============================================================================
@@ -817,7 +830,7 @@ static void update_peace_fsm(ICPState* st, bool isPeace) {
                         "(detections=%d, elapsed=%.0f ms)\n",
                         fsm.detections, elapsed_ms);
 
-                // Send MQTT photo trigger once when entering STANDBY
+                // Send MQTT photo triggers once when entering STANDBY (all cams)
                 send_standby_photo_trigger_cam1();
 
                 fsm.state      = State::STANDBY;
@@ -936,7 +949,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     // AI on/off gate
     const bool ai_on = st->controls.ai_enabled();
 
-    // -------------------- ROI shared by AI + debug box --------------------
+    // -------------------- ROI shared by AI --------------------
     // ROI in normalized coordinates, tuned to focus on the driver's hand.
 
     const float roi_w_frac = 0.42f;  // ~42% of frame width
@@ -1005,22 +1018,22 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     icp::ColorParams cp = st->controls.current();
     icp::launch_tone_saturation_nv12(dY, W, H, pitch, dUV, pitch, cp, st->video_stream);
 
-    // 4) Debug: draw ROI box on cam1 to visualize the region used for hand pose
-    {
-        if (st->controls.section() == std::string("cam1")) {
-            draw::launch_draw_box_nv12(
-                dY, dUV,
-                W, H, pitch,
-                roiX, roiY, roiW, roiH,
-                st->video_stream
-            );
-        }
+    // 4) Debug: draw ROI box on cam1 (DISABLED, kept for debug)
+    /*
+    if (st->controls.section() == std::string("cam1")) {
+        draw::launch_draw_box_nv12(
+            dY, dUV,
+            W, H, pitch,
+            roiX, roiY, roiW, roiH,
+            st->video_stream
+        );
     }
+    */
 
-    // Fence VIDEO work (rectify, wire removal, tone, ROI box)
+    // Fence VIDEO work (rectify, wire removal, tone, [optional ROI box])
     cudaStreamSynchronize(st->video_stream);
 
-    // ---- Hand pose visualization: decode heatmaps and draw keypoints ----
+    // ---- Hand pose visualization: decode heatmaps + gesture ----
     if (ai_on && st->gesture.engine && st->gesture.try_commit_host_output()) {
         int C = 0, hmH = 0, hmW = 0;
         if (!st->gesture.get_heatmap_shape(C, hmH, hmW)) {
@@ -1063,12 +1076,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                 bool isPeace =
                     (gres.type == gesture::Type::PEACE && gres.score >= kPeaceScoreThresh);
 
-                // --- NEW: update PEACE FSM (SLEEP → WAITING → STANDBY → SLEEP) ---
+                // Aggiorna FSM PEACE (SLEEP → WAITING → STANDBY → SLEEP)
                 update_peace_fsm(st, isPeace);
 
+                // Overlay punti mano (DISABILITATO, tenuto per debug)
+                /*
                 if (!pts.empty() && st->controls.section() == std::string("cam1")) {
-                    // Draw keypoints + simple skeleton (dots + lines) on NV12
-                    // PEACE → green + thicker; otherwise white & thin
                     draw::launch_draw_hand_points_nv12(
                         dY, dUV,
                         W, H, pitch,
@@ -1076,9 +1089,9 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                         isPeace,
                         st->video_stream
                     );
-                    // Synchronize to make sure overlay is visible before unmapping
                     cudaStreamSynchronize(st->video_stream);
                 }
+                */
             }
         }
     }
