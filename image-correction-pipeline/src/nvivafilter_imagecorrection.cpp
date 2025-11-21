@@ -39,7 +39,6 @@
 #include "kernel_draw_box_nv12.cuh"
 // Hand keypoints + skeleton on NV12
 #include "kernel_draw_hand_points_nv12.cuh"
-
 // Gesture classification (peace ✌️)
 #include "gesture_classify.hpp"
 
@@ -129,7 +128,7 @@ static std::string mask_meta_path_for(int cam_idx) {
 }
 
 // ============================================================================
-// MQTT helpers (kept for compatibility, but no longer used for gesture)
+// MQTT helpers (kept for compatibility, but not used for peace gesture)
 // ============================================================================
 struct MqttCfg {
     std::string host;
@@ -189,7 +188,7 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
 }
 
 // ============================================================================
-// Audio TTS helper (pico2wave + paplay) - not used by hand pose, kept for compatibility
+// Audio TTS helper (kept for compatibility, not used here)
 // ============================================================================
 static void speak_async(const std::string& phrase) {
     const char* pico_bin = std::getenv("PICOWAVE_BIN");
@@ -216,7 +215,7 @@ static void speak_async(const std::string& phrase) {
 }
 
 // ============================================================================
-// UI indicator helper — atomic JSON to /dev/shm (still used to seed cam1 state)
+// UI indicator helper — atomic JSON to /dev/shm (legacy, used at startup)
 // ============================================================================
 static void emit_ui_indicator_json(int cam, const char* indicator) {
     if (cam != 1) return; // Only cam1 uses this UI
@@ -302,7 +301,7 @@ struct ICPState {
     } slots[kSlots];
     int prod_idx = 0; // producer writes here
 
-    // MQTT + FSM kept for compatibility but no longer used for gesture
+    // MQTT + FSM kept for compatibility but no longer used for gesture logic
     MqttCfg mqtt{}; bool mqtt_checked_once = false;
     struct {
         int   hold_start_target_ms = 800;
@@ -520,7 +519,7 @@ static void ensure_gesture_loaded_for_cam1(ICPState* st){
 }
 
 // ----------------------------------------------------------------------------
-// FSM helper: init MQTT + durations from env (kept but no longer used)
+// FSM helper: init MQTT + durations from env (legacy)
 // ----------------------------------------------------------------------------
 static void ensure_mqtt_and_fsm_config(ICPState* st){
     if (!st->mqtt_checked_once){
@@ -794,17 +793,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     const bool ai_on = st->controls.ai_enabled();
 
     // -------------------- ROI shared by AI + debug box --------------------
-    // Define ROI in normalized coordinates (fractions of W,H)
-    // tuned to focus on the hand area, not the full driver body.
+    // ROI in normalized coordinates, tuned to focus on the driver's hand.
 
-    // Size of ROI as fraction of the frame (slightly enlarged)
     const float roi_w_frac = 0.42f;  // ~42% of frame width
     const float roi_h_frac = 0.58f;  // ~58% of frame height
 
-    // Center of ROI as fraction of the frame.
-    // Shifted to left-lower area where the hand usually appears.
-    const float roi_cx_frac = 0.38f; // 0 = left, 1 = right
-    const float roi_cy_frac = 0.65f; // 0 = top, 1 = bottom
+    const float roi_cx_frac = 0.38f; // x center (0=left, 1=right)
+    const float roi_cy_frac = 0.65f; // y center (0=top, 1=bottom)
 
     int roiW = static_cast<int>(roi_w_frac * W);
     int roiH = static_cast<int>(roi_h_frac * H);
@@ -821,17 +816,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     if (roiX + roiW > W) roiW = W - roiX;
     if (roiY + roiH > H) roiH = H - roiY;
 
-    // 2.x) Gesture pipeline setup (cam1 only) — now using pose heatmaps
+    // 2.x) Gesture pipeline setup (cam1 only) — using pose heatmaps
     if (ai_on) {
         ensure_gesture_loaded_for_cam1(st);
         if (st->gesture.engine && st->trt_stream && st->gesture_input_bytes > 0) {
 
             if (st->gesture.inputIsFP16) {
-                // IMPORTANT:
-                // If the engine input is FP16 but your preprocess writes FP32,
-                // you either need:
-                //   - a FP32 engine, or
-                //   - a FP32->FP16 conversion kernel before sending to TRT.
                 static bool s_once = false;
                 if (!s_once) {
                     fprintf(stderr,
@@ -865,8 +855,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                 kick_trt_for_ready_slots(st);
             }
         }
-    } else {
-        // AI disabled: skip gesture
     }
 
     // 3) Tone + color (hot-reload)
@@ -890,7 +878,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
 
     // ---- Hand pose visualization: decode heatmaps and draw keypoints ----
     if (ai_on && st->gesture.engine && st->gesture.try_commit_host_output()) {
-        // Get heatmap tensor shape (C x H x W)
         int C = 0, hmH = 0, hmW = 0;
         if (!st->gesture.get_heatmap_shape(C, hmH, hmW)) {
             fprintf(stderr, "[gesture][%s] invalid heatmap shape\n",
@@ -921,7 +908,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                     draw::Point2D p;
                     p.x    = x_img;
                     p.y    = y_img;
-                    p.conf = 1.0f; // you can use kp.conf if you add it
+                    p.conf = 1.0f; // you can wire confidence if you extend Keypoint2D
                     pts.push_back(p);
                 }
 
@@ -929,18 +916,23 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                 gesture::Result gres = gesture::classify_peace(pts);
                 const float kPeaceScoreThresh = 0.8f;
 
-                if (gres.type == gesture::Type::PEACE && gres.score >= kPeaceScoreThresh) {
+                bool isPeace =
+                    (gres.type == gesture::Type::PEACE && gres.score >= kPeaceScoreThresh);
+
+                if (isPeace) {
                     fprintf(stderr, "[GESTURE] PEACE (score=%.2f)\n", gres.score);
                 } else {
                     fprintf(stderr, "[GESTURE] NULL (score=%.2f)\n", gres.score);
                 }
 
                 if (!pts.empty() && st->controls.section() == std::string("cam1")) {
-                    // Draw keypoints + simple skeleton (white dots + lines) on NV12
+                    // Draw keypoints + simple skeleton (dots + lines) on NV12
+                    // PEACE → green; otherwise white
                     draw::launch_draw_hand_points_nv12(
                         dY, dUV,
                         W, H, pitch,
                         pts.data(), (int)pts.size(),
+                        isPeace,
                         st->video_stream
                     );
                     // Synchronize to make sure overlay is visible before unmapping

@@ -13,9 +13,7 @@ __device__ inline int clampi(int x, int lo, int hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-// Write a single pixel on the Y plane (luma).
-// For now we only touch the Y plane to avoid unexpected color shifts.
-// You can extend this later to tint the skeleton by modifying UV as well.
+// Write a single pixel on the Y plane (luma) only.
 __device__ inline void set_nv12_luma_pixel(
     uint8_t* dY,
     int W,
@@ -29,9 +27,44 @@ __device__ inline void set_nv12_luma_pixel(
     dY[y * pitch + x] = yVal;
 }
 
-// Simple Bresenham-like line drawer on the Y plane
-__device__ void draw_line_luma(
+// Write a single pixel with luma + chroma, approximating a color.
+// Here we use it to draw a "green-ish" skeleton in NV12.
+__device__ inline void set_nv12_colored_pixel(
     uint8_t* dY,
+    uint8_t* dUV,
+    int W,
+    int H,
+    int pitch,
+    int x,
+    int y,
+    uint8_t yVal,
+    uint8_t uVal,
+    uint8_t vVal
+) {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+
+    // Set luma
+    dY[y * pitch + x] = yVal;
+
+    // NV12: UV is 4:2:0, interleaved, one pair per 2x2 block.
+    // Only update chroma on even x,y to avoid fighting with neighbors too much.
+    if ((x & 1) == 0 && (y & 1) == 0) {
+        int uv_y = y / 2;
+        int uv_x = x;
+        if (uv_y >= 0 && uv_y < H/2 && uv_x >= 0 && uv_x+1 < W) {
+            uint8_t* rowUV = dUV + uv_y * pitch;
+            rowUV[uv_x + 0] = uVal;
+            rowUV[uv_x + 1] = vVal;
+        }
+    }
+}
+
+// Simple Bresenham-like line drawer.
+// If useColor == true, we also write UV to get a green-ish, **thicker** line.
+// Otherwise we only touch Y (white/gray, thin skeleton).
+__device__ void draw_line(
+    uint8_t* dY,
+    uint8_t* dUV,
     int W,
     int H,
     int pitch,
@@ -39,7 +72,7 @@ __device__ void draw_line_luma(
     int y0,
     int x1,
     int y1,
-    uint8_t yVal
+    bool useColor
 ) {
     // Trivial reject for clearly out-of-bounds lines (optional, conservative)
     if ((x0 < 0 && x1 < 0) || (x0 >= W && x1 >= W) ||
@@ -56,8 +89,29 @@ __device__ void draw_line_luma(
     int x = x0;
     int y = y0;
 
+    // White-ish Y and green-ish UV (BT.601 approx for RGB(0,255,0)):
+    const uint8_t yWhite = 255;
+    const uint8_t yGreen = 180;  // slightly lower luma
+    const uint8_t uGreen = 43;
+    const uint8_t vGreen = 21;
+
     while (true) {
-        set_nv12_luma_pixel(dY, W, H, pitch, x, y, yVal);
+        if (useColor) {
+            // Thicker green line: draw a small 3x3 block around the center.
+            for (int oy = -1; oy <= 1; ++oy) {
+                for (int ox = -1; ox <= 1; ++ox) {
+                    set_nv12_colored_pixel(
+                        dY, dUV, W, H, pitch,
+                        x + ox, y + oy,
+                        yGreen, uGreen, vGreen
+                    );
+                }
+            }
+        } else {
+            // Thin white line: single pixel
+            set_nv12_luma_pixel(dY, W, H, pitch, x, y, yWhite);
+        }
+
         if (x == x1 && y == y1) break;
         int e2 = 2 * err;
         if (e2 >= dy) {
@@ -75,15 +129,17 @@ __device__ void draw_line_luma(
 // Kernels
 // -----------------------------------------------------------------------------
 
-// Kernel: for each point, draw a small filled circle on the Y plane.
+// Kernel: for each point, draw a small filled circle.
+// If useColor == true → bigger green circle; otherwise smaller white circle.
 __global__ void k_draw_points_nv12(
     uint8_t* dY,
-    uint8_t* dUV,   // currently unused, kept for future color extensions
+    uint8_t* dUV,
     int W,
     int H,
     int pitch,
     const Point2D* points,
-    int numPoints
+    int numPoints,
+    bool useColor
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numPoints) return;
@@ -93,7 +149,8 @@ __global__ void k_draw_points_nv12(
     // Skip points with non-positive confidence (can be used as a mask)
     if (p.conf <= 0.0f) return;
 
-    const int radius = 4;
+    // Thicker/bigger circles when useColor==true (PEACE)
+    const int radius = useColor ? 7 : 4;
     const int r2 = radius * radius;
 
     int cx = p.x;
@@ -105,14 +162,27 @@ __global__ void k_draw_points_nv12(
     int y0 = clampi(cy - radius, 0, H - 1);
     int y1 = clampi(cy + radius, 0, H - 1);
 
+    // Colors
+    const uint8_t yWhite = 255;
+    const uint8_t yGreen = 180;
+    const uint8_t uGreen = 43;
+    const uint8_t vGreen = 21;
+
     // Simple disk fill
     for (int y = y0; y <= y1; ++y) {
         int dy = y - cy;
         for (int x = x0; x <= x1; ++x) {
             int dx = x - cx;
             if (dx * dx + dy * dy <= r2) {
-                // 255 = bright luma (white-ish dot)
-                set_nv12_luma_pixel(dY, W, H, pitch, x, y, 255);
+                if (useColor) {
+                    set_nv12_colored_pixel(
+                        dY, dUV, W, H, pitch,
+                        x, y,
+                        yGreen, uGreen, vGreen
+                    );
+                } else {
+                    set_nv12_luma_pixel(dY, W, H, pitch, x, y, yWhite);
+                }
             }
         }
     }
@@ -122,12 +192,13 @@ __global__ void k_draw_points_nv12(
 // Edge list: (0-1), (1-2), (2-3), ... (numPoints-2, numPoints-1).
 __global__ void k_draw_skeleton_nv12(
     uint8_t* dY,
-    uint8_t* dUV,   // currently unused
+    uint8_t* dUV,
     int W,
     int H,
     int pitch,
     const Point2D* points,
-    int numPoints
+    int numPoints,
+    bool useColor
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= numPoints - 1) return;
@@ -141,7 +212,18 @@ __global__ void k_draw_skeleton_nv12(
     // Only draw if both endpoints are valid / confident
     if (p0.conf <= 0.0f || p1.conf <= 0.0f) return;
 
-    draw_line_luma(dY, W, H, pitch, p0.x, p0.y, p1.x, p1.y, 255);
+    draw_line(
+        dY,
+        dUV,
+        W,
+        H,
+        pitch,
+        p0.x,
+        p0.y,
+        p1.x,
+        p1.y,
+        useColor
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -156,16 +238,13 @@ void launch_draw_hand_points_nv12(
     int pitch,
     const Point2D* hPoints,
     int numPoints,
+    bool isPeace,          // if true, draw points/skeleton green & thicker
     cudaStream_t stream
 ) {
     if (!dY || !dUV || !hPoints || numPoints <= 0 || W <= 0 || H <= 0 || pitch <= 0) {
         return;
     }
 
-    // NOTE:
-    //  This implementation allocates a temporary device buffer for the points
-    //  on each call. For a high-frequency pipeline, consider storing this
-    //  buffer in your per-instance state and reusing it instead.
     Point2D* dPoints = nullptr;
     size_t bytes = static_cast<size_t>(numPoints) * sizeof(Point2D);
 
@@ -192,7 +271,8 @@ void launch_draw_hand_points_nv12(
             H,
             pitch,
             dPoints,
-            numPoints
+            numPoints,
+            isPeace   // useColor -> green + thick if PEACE, white if not
         );
     }
 
@@ -209,11 +289,11 @@ void launch_draw_hand_points_nv12(
             H,
             pitch,
             dPoints,
-            numPoints
+            numPoints,
+            isPeace   // thicker green if PEACE
         );
     }
 
-    // Free the temporary buffer (for higher performance, keep it persistent).
     cudaFree(dPoints);
 }
 

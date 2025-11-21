@@ -54,7 +54,7 @@ inline bool is_finger_extended(const draw::Point2D& a,
     float a2 = angle_between(v2x, v2y, v3x, v3y);
 
     // Thresholds can be tuned; smaller = stricter "straight" definition.
-    const float kStraightThreshDeg = 35.0f;
+    const float kStraightThreshDeg = 23.0f;
 
     return (a1 < kStraightThreshDeg && a2 < kStraightThreshDeg);
 }
@@ -90,18 +90,28 @@ Result classify_peace(const std::vector<draw::Point2D>& pts)
     bool ring_bent   = !ring_ext;
     bool little_bent = !little_ext;
 
-    // Build a simple score based on how many conditions we satisfy.
-    // Each condition worth 0.25:
-    //   index_ext, middle_ext, ring_bent, little_bent
+    // Build a weighted score:
+    //   - index & middle extended are more important
+    //   - ring & little bent still contribute, but less
+    //
+    // Weights:
+    //   index_ext   → +0.35
+    //   middle_ext  → +0.35
+    //   ring_bent   → +0.15
+    //   little_bent → +0.15
+    //
+    // Max = 1.0 for a "perfect" peace sign.
     float score = 0.0f;
-    if (index_ext)   score += 0.25f;
-    if (middle_ext)  score += 0.25f;
-    if (ring_bent)   score += 0.25f;
-    if (little_bent) score += 0.25f;
+    if (index_ext)   score += 0.35f;
+    if (middle_ext)  score += 0.35f;
+    if (ring_bent)   score += 0.15f;
+    if (little_bent) score += 0.15f;
 
     r.score = score;
 
     // Require all four conditions to be true to call it PEACE.
+    // The external code can then apply a score threshold (e.g. 0.8)
+    // to be even stricter.
     if (index_ext && middle_ext && ring_bent && little_bent) {
         r.type = Type::PEACE;
     } else {

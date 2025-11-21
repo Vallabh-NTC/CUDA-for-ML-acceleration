@@ -37,10 +37,9 @@ set(CUDA_SOURCES
     src/color_ops.cu
     src/ei_gesture_infer.cu
     src/kernel_draw_hand_points_nv12.cu
-    #src/kernel_crop_nv12.cu
     src/gesture_classify.cpp
     src/kernel_draw_box_nv12.cu
-    src/nv12_to_rgb_chw.cu
+    #src/nv12_to_rgb_chw.cu
 )
 
 set(CPP_SOURCES

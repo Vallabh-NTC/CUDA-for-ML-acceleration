@@ -4,7 +4,6 @@
 
 namespace draw {
 
-// Disegna un rettangolo sul frame NV12
 void launch_draw_box_nv12(
     uint8_t* dY, uint8_t* dUV,
     int W, int H, int pitch,
