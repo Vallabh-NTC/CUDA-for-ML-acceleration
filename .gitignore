@@ -1,5 +1,6 @@
 # Build directories
 build/
+build-l4t/
 
 # IDE / Editor stuff
 .vscode/

@@ -797,7 +797,7 @@ static void update_peace_fsm(ICPState* st, bool isPeace) {
     // - kWaitingWindowMs: how long we stay in WAITING, irrespective of misses
     // - kPeaceDetectionsThresh: how many PEACE detections in that window
     const float kWaitingWindowMs       = 5000.0f; // 5 seconds window
-    const int   kPeaceDetectionsThresh = 30;      // adjust as needed
+    const int   kPeaceDetectionsThresh = 8;      // adjust as needed
     const float kStandbyDurationMs     = 6000.0f; // STANDBY duration (6s)
 
     switch (fsm.state) {
