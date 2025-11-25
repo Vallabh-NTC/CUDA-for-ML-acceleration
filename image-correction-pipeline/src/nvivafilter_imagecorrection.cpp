@@ -187,28 +187,26 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
     fprintf(stderr, "[MQTT] rc=%d topic=%s payload=%s\n", rc, c.topic.c_str(), payload.c_str());
 }
 
-// Helper generico: manda "photo: take" a un topic specifico (sincrono)
-static void send_photo_trigger_for_topic_sync(const char* topic) {
-    if (!topic || !*topic) return;
-
+// Helper: send "photo: take" on the *global* topic jetson/stream/cmd (synchronous).
+// The host is aligned with your Windows command:
+//   mosquitto_pub -h 192.168.0.100 -t jetson/stream/cmd -m '{ "value": { "photo": "take" } }'
+static void send_global_photo_trigger_sync() {
     MqttCfg c;
-    c.host  = "192.168.0.100";     // broker MQTT
+    c.host  = "192.168.0.100";       // broker IP used from your PC command
     c.port  = 1883;
-    c.topic = topic;
+    c.topic = "jetson/stream/cmd";    // global command topic
     c.valid = true;
 
     const std::string payload = R"({ "value": { "photo": "take" } })";
-    mqtt_publish(c, payload);      // sincrono, ma chiamato da thread separato
+    mqtt_publish(c, payload);
 }
 
-// Dedicated helper: chiamata quando cam1 entra in STANDBY
-// Lancia l’invio MQTT su un thread separato per NON bloccare il video.
-// Scatta tutte e 3 le camere.
+// Called when cam1 enters STANDBY.
+// It launches a background thread that sends a single global MQTT command
+// instead of publishing on per-camera topics.
 static void send_standby_photo_trigger_cam1() {
     std::thread([](){
-        send_photo_trigger_for_topic_sync("jetson/stream/cam0/cmd");
-        send_photo_trigger_for_topic_sync("jetson/stream/cam1/cmd");
-        send_photo_trigger_for_topic_sync("jetson/stream/cam2/cmd");
+        send_global_photo_trigger_sync();
     }).detach();
 }
 
@@ -797,7 +795,7 @@ static void update_peace_fsm(ICPState* st, bool isPeace) {
     // - kWaitingWindowMs: how long we stay in WAITING, irrespective of misses
     // - kPeaceDetectionsThresh: how many PEACE detections in that window
     const float kWaitingWindowMs       = 5000.0f; // 5 seconds window
-    const int   kPeaceDetectionsThresh = 8;      // adjust as needed
+    const int   kPeaceDetectionsThresh = 8;       // adjust as needed
     const float kStandbyDurationMs     = 6000.0f; // STANDBY duration (6s)
 
     switch (fsm.state) {
@@ -830,7 +828,7 @@ static void update_peace_fsm(ICPState* st, bool isPeace) {
                         "(detections=%d, elapsed=%.0f ms)\n",
                         fsm.detections, elapsed_ms);
 
-                // Send MQTT photo triggers once when entering STANDBY (all cams)
+                // Send MQTT photo trigger once when entering STANDBY (global command)
                 send_standby_photo_trigger_cam1();
 
                 fsm.state      = State::STANDBY;
@@ -951,7 +949,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
 
     // -------------------- ROI shared by AI --------------------
     // ROI in normalized coordinates, tuned to focus on the driver's hand.
-
     const float roi_w_frac = 0.42f;  // ~42% of frame width
     const float roi_h_frac = 0.58f;  // ~58% of frame height
 
@@ -973,7 +970,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
     if (roiX + roiW > W) roiW = W - roiX;
     if (roiY + roiH > H) roiH = H - roiY;
 
-    // 2.x) Gesture pipeline setup (cam1 only) — using pose heatmaps
+    // Gesture pipeline setup (cam1 only) — using pose heatmaps
     if (ai_on) {
         ensure_gesture_loaded_for_cam1(st);
         if (st->gesture.engine && st->trt_stream && st->gesture_input_bytes > 0) {
@@ -1076,10 +1073,10 @@ static void gpu_process(EGLImageKHR image, void **userPtr){
                 bool isPeace =
                     (gres.type == gesture::Type::PEACE && gres.score >= kPeaceScoreThresh);
 
-                // Aggiorna FSM PEACE (SLEEP → WAITING → STANDBY → SLEEP)
+                // Update PEACE FSM (SLEEP → WAITING → STANDBY → SLEEP)
                 update_peace_fsm(st, isPeace);
 
-                // Overlay punti mano (DISABILITATO, tenuto per debug)
+                // Overlay hand points (DISABLED, kept for debug)
                 /*
                 if (!pts.empty() && st->controls.section() == std::string("cam1")) {
                     draw::launch_draw_hand_points_nv12(
