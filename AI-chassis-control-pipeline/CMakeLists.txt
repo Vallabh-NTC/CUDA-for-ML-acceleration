@@ -23,13 +23,14 @@ add_executable(udp_decoder
     src/Lichthinten01.cpp
     src/LWI01.cpp
     src/UdpReceiver.cpp
-    main.cpp
+    src/main.cpp
 )
 
 # set_source_files_properties(src/photo_edit.cu PROPERTIES LANGUAGE CUDA)
 
 # ---- Includes ----
-target_include_directories(photo_edit PRIVATE
+target_include_directories(udp_decoder PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 
     # Sysroot headers (match target)
@@ -55,12 +56,12 @@ if(NOT CUDART_LIBRARY)
     message(FATAL_ERROR "Could not find libcudart.so — check CUDA_TOOLKIT_ROOT_DIR and CMAKE_SYSROOT.")
 endif()
 
-target_link_libraries(photo_edit
+target_link_libraries(udp_decoder
     PRIVATE ${CUDART_LIBRARY}
 )
 
 # ---- Linker options (cross-link against Jetson sysroot) ----
-target_link_options(photo_edit PRIVATE
+target_link_options(udp_decoder PRIVATE
     # Use the target sysroot
     "SHELL:--sysroot=${CMAKE_SYSROOT}"
 
@@ -78,7 +79,7 @@ target_link_options(photo_edit PRIVATE
 )
 
 # ---- Runtime RPATH on the target (optional) ----
-# set_target_properties(photo_edit PROPERTIES
+# set_target_properties(udp_decoder PROPERTIES
 #     BUILD_WITH_INSTALL_RPATH ON
 #     INSTALL_RPATH "/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/lib64"
 # )
@@ -86,9 +87,9 @@ target_link_options(photo_edit PRIVATE
 # ---- Optional: harden ELF after build (if patchelf is available) ----
 # find_program(PATCHELF patchelf)
 # if (PATCHELF)
-#   add_custom_command(TARGET photo_edit POST_BUILD
-#     COMMAND ${PATCHELF} --set-interpreter /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 $<TARGET_FILE:photo_edit>
-#     COMMAND ${PATCHELF} --set-rpath "/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/lib64" $<TARGET_FILE:photo_edit>
+#   add_custom_command(TARGET udp_decoder POST_BUILD
+#     COMMAND ${PATCHELF} --set-interpreter /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 $<TARGET_FILE:udp_decoder>
+#     COMMAND ${PATCHELF} --set-rpath "/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/lib64" $<TARGET_FILE:udp_decoder>
 #     VERBATIM
 #   )
 # endif()

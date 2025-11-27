@@ -7,7 +7,7 @@ int main() {
     UdpReceiver receiver(1500);
     unsigned char buf[4096];
 
-    std::cout << "AAAAAAAAA";
+    std::cout << "AAAAAAAAA" << std::endl;  // oppure: << std::flush;
 
     while(true) {
         int n = receiver.receive(buf, sizeof(buf));
@@ -20,12 +20,10 @@ int main() {
 
         const unsigned char* pdus = buf + 3;
 
-        // Decodifica LWI01
         LWI01 lwi;
         lwi.decode(pdus + 677);
         lwi.print();
 
-        // Decodifica Lichthinten01
         Lichthinten01 lh;
         lh.decode(pdus + 605);
         lh.print();
