@@ -19,7 +19,8 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include <unistd.h>   // getpid(), unlink()
+#include <sstream>     // for std::ostringstream
+#include <unistd.h>    // getpid(), unlink()
 
 #include <cuda.h>
 #include <cudaEGL.h>
@@ -128,7 +129,7 @@ static std::string mask_meta_path_for(int cam_idx) {
 }
 
 // ============================================================================
-// MQTT helpers (kept for compatibility, and now used for PEACE STANDBY trigger)
+// MQTT helpers (kept for compatibility + used for PEACE trigger)
 // ============================================================================
 struct MqttCfg {
     std::string host;
@@ -187,23 +188,22 @@ static void mqtt_publish(const MqttCfg& c, const std::string& payload){
     fprintf(stderr, "[MQTT] rc=%d topic=%s payload=%s\n", rc, c.topic.c_str(), payload.c_str());
 }
 
-// Helper: send "photo: take" on the *global* topic jetson/stream/cmd (synchronous).
-// The host is aligned with your Windows command:
-//   mosquitto_pub -h 192.168.0.100 -t jetson/stream/cmd -m '{ "value": { "photo": "take" } }'
+// Legacy helper: send "photo: take" on the *global* topic jetson/stream/cmd (synchronous).
+// Kept for reference; not used by the new PEACE logic.
 static void send_global_photo_trigger_sync() {
     MqttCfg c;
-    c.host  = "192.168.0.100";       // broker IP used from your PC command
+    c.host  = "192.168.0.100";       // legacy broker IP (not used in new logic)
     c.port  = 1883;
-    c.topic = "jetson/stream/cmd";    // global command topic
+    c.topic = "jetson/stream/cmd";   // global command topic
     c.valid = true;
 
     const std::string payload = R"({ "value": { "photo": "take" } })";
     mqtt_publish(c, payload);
 }
 
-// Called when cam1 enters STANDBY.
-// It launches a background thread that sends a single global MQTT command
-// instead of publishing on per-camera topics.
+// Legacy helper: called when cam1 enters STANDBY (old behavior).
+// It launches a background thread that sends a single global MQTT command.
+// This is now superseded by send_peace_photo_trigger_dynamic().
 static void send_standby_photo_trigger_cam1() {
     std::thread([](){
         send_global_photo_trigger_sync();
@@ -755,6 +755,125 @@ static void kick_trt_for_ready_slots(ICPState* st){
     }
 }
 
+// ---------------------------------------------------------------------------
+// PEACE trigger helper with dynamic "cams" selection
+//
+// This walks all instances, looks at their current ColorParams, and decides
+// which cameras are active or "disabled" based on brightness / saturation.
+//
+// From the logs:
+//   [MQTT][JSON] camX brightness (-100) -> -1 (saved)
+//   [MQTT][JSON] camX saturation (-100) -> 0 (saved)
+//
+// So internally:
+//   brightness ≈ -1  means UI brightness = -100
+//   saturation ≈  0  means UI saturation = -100
+//
+// Rule:
+//  - A camera is considered DISABLED if brightness <= -0.99 AND saturation <= 0.01
+//  - We then build "cams" as all cameras that are NOT disabled.
+//  - If no camera is disabled (size == 3), or if we end up with 0 active
+//    cameras (everything disabled), we send:
+//      { "value": { "photo": "take" } }
+//    (no "cams" field -> take all).
+//  - Otherwise we send:
+//      { "value": { "photo": "take", "cams": [ ... ] } }
+//
+// MQTT host/port/topic are taken from environment via parse_mqtt_env()
+// (MQTT_URL / MQTT_HOST / MQTT_PORT / MQTT_TOPIC), with a fallback to
+// 192.168.0.100:1883 and topic "jetson/stream/cmd".
+// ---------------------------------------------------------------------------
+static void send_peace_photo_trigger_dynamic()
+{
+    std::thread([](){
+        bool disabled[3] = {false, false, false};
+
+        {
+            std::lock_guard<std::mutex> lk(g_instances_mtx);
+            for (auto* st : g_instances) {
+                if (!st) continue;
+                const std::string sec = st->controls.section();
+                int idx = section_to_index(sec);
+                if (idx < 0 || idx > 2) continue;
+
+                icp::ColorParams p = st->controls.current();
+
+                // Internal ranges (deduced from logs):
+                //   brightness: -1 .. +1   (UI: -100 .. +100)
+                //   saturation:  0 .. ~2   (UI: -100 .. +100)
+                //
+                // "Disabled" means: UI brightness = -100 AND UI saturation = -100
+                // ~ brightness ≈ -1 and saturation ≈ 0 internally.
+                const float br = p.brightness;
+                const float sa = p.saturation;
+
+                bool off_brightness = (br <= -0.99f);
+                bool off_saturation = (sa <=  0.01f);
+
+                if (off_brightness && off_saturation) {
+                    disabled[idx] = true;
+                }
+
+                fprintf(stderr,
+                    "[PEACE-MQTT][debug] cam%d sec=%s brightness=%.3f saturation=%.3f -> disabled=%d\n",
+                    idx, sec.c_str(), br, sa, disabled[idx] ? 1 : 0);
+            }
+        }
+
+        // Build the list of active cameras (not disabled)
+        std::vector<int> cams_active;
+        for (int i = 0; i < 3; ++i) {
+            if (!disabled[i]) cams_active.push_back(i);
+        }
+
+        fprintf(stderr,
+            "[PEACE-MQTT][debug] disabled: [%d %d %d], cams_active size=%zu\n",
+            disabled[0] ? 1 : 0,
+            disabled[1] ? 1 : 0,
+            disabled[2] ? 1 : 0,
+            cams_active.size());
+
+        // Decide payload based on the combination:
+        //
+        // - If no camera is disabled (size == 3), or if we ended up with an
+        //   empty list (all disabled), send the base payload without "cams".
+        // - Otherwise, send "photo": "take" with explicit "cams" list.
+        std::string payload;
+        if (cams_active.size() == 3 || cams_active.empty()) {
+            payload = R"({ "value": { "photo": "take" } })";
+        } else {
+            std::ostringstream oss;
+            oss << R"({ "value": { "photo": "take", "cams": [)";
+            for (size_t i = 0; i < cams_active.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << cams_active[i];
+            }
+            oss << "] } }";
+            payload = oss.str();
+        }
+
+        fprintf(stderr, "[PEACE-MQTT] final payload=%s\n", payload.c_str());
+
+        // Use MQTT settings from environment (MQTT_URL / MQTT_HOST / MQTT_PORT / MQTT_TOPIC)
+        MqttCfg c{};
+        parse_mqtt_env(c);
+
+        // If env does not specify anything, fallback to 192.168.0.100:1883
+        if (!c.valid) {
+            c.host  = "192.168.0.100";
+            c.port  = 1883;
+            c.topic = "jetson/stream/cmd";
+            c.valid = true;
+        } else {
+            // Force topic to the command topic used by the rest of the system
+            c.topic = "jetson/stream/cmd";
+        }
+
+        mqtt_publish(c, payload);
+    }).detach();
+}
+
+
 // Helper: stringify PEACE FSM state
 static const char* peace_state_name(ICPState::PeaceFSM::State s) {
     using S = ICPState::PeaceFSM::State;
@@ -828,8 +947,10 @@ static void update_peace_fsm(ICPState* st, bool isPeace) {
                         "(detections=%d, elapsed=%.0f ms)\n",
                         fsm.detections, elapsed_ms);
 
-                // Send MQTT photo trigger once when entering STANDBY (global command)
-                send_standby_photo_trigger_cam1();
+                // NEW behavior:
+                // Decide which cameras must take the photo based on brightness/saturation
+                // of all cameras, then publish MQTT accordingly.
+                send_peace_photo_trigger_dynamic();
 
                 fsm.state      = State::STANDBY;
                 fsm.t_enter    = now;
@@ -1107,7 +1228,7 @@ extern "C" void init(CustomerFunction* f){
     std::call_once(g_ctx_once, retain_primary_context_once);
     fprintf(stderr,
         "[ic] imagecorrection initialized (hand pose overlay + peace gesture on cam1; "
-        "decoupled TRT stream + ROI preprocess + PEACE FSM)\n");
+        "decoupled TRT stream + ROI preprocess + PEACE FSM with dynamic cams MQTT)\n");
 }
 
 extern "C" void deinit(void){
