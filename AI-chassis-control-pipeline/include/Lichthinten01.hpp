@@ -1,15 +1,13 @@
 #pragma once
-#include "PDU.hpp"
-#include "BitExtractor.hpp"
-#include <iostream>
+#include <cstdint>
 
-class Lichthinten01 : public PDU {
+class Lichthinten01 {
 public:
-    uint8_t bremslicht_h_aktiv;
-    uint8_t rueckfahrlicht_aktiv;
-    uint8_t blinker_hl;
-    uint8_t blinker_hr;
+    uint8_t raw[7] = {0};  // 7 bytes message
+    void decode(const unsigned char* data);
 
-    void decode(const unsigned char* data) override;
-    void print() const override;
+    // Build a bitmask summarizing all states
+    uint32_t compute_mask() const;
+
+    void print() const;
 };

@@ -1,15 +1,12 @@
 #pragma once
-#include "PDU.hpp"
-#include "BitExtractor.hpp"
-#include <cmath>
-#include <iostream>
+#include <cstdint>
 
-class LWI01 : public PDU {
+class LWI01 {
 public:
-    uint8_t crc;
-    float angle;
-    float speed;
+    uint8_t crc = 0;
+    float angle = 0;
+    float speed = 0;
 
-    void decode(const unsigned char* data) override;
-    void print() const override;
+    void decode(const unsigned char* data);
+    void print() const;
 };
