@@ -24,9 +24,11 @@ add_executable(udp_decoder
     src/LWI01.cpp
     src/UdpReceiver.cpp
     src/main.cpp
+    src/KernelExec.cu
 )
 
 # set_source_files_properties(src/photo_edit.cu PROPERTIES LANGUAGE CUDA)
+set_source_files_properties(src/KernelExec.cu PROPERTIES LANGUAGE CUDA)
 
 # ---- Includes ----
 target_include_directories(udp_decoder PRIVATE
