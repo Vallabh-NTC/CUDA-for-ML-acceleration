@@ -10,28 +10,35 @@
 #include <cmath>
 #include <ctime>
 #include <sstream>
+#include <chrono>
+#include <iomanip>
+#include <clocale>   // per forzare locale "C"
 
 // GPU launcher function
 extern "C" void launch_kernel(ChassisState* ring, int index);
 
 int main()
 {
+    // ---- Forza il punto come separatore decimale ----
+    std::setlocale(LC_NUMERIC, "C");
+
     CudaMemAssign mem(64);
     int writeIndex = 0;
 
     UdpReceiver receiver(1500);
-
-    // -------------------------
-    // NEW: UDP sender to Windows
-    // -------------------------
-    UdpSender sender("192.168.1.100", 1600);   // <-- CHANGE THIS TO YOUR WINDOWS IP
+    UdpSender sender("192.168.1.180", 1600);  // Windows IP
 
     unsigned char buf[4096];
 
     std::cout << "Start decoder + GPU pipeline\n";
 
+    using Clock = std::chrono::high_resolution_clock;
+
     while (true)
     {
+        auto loop_start = Clock::now();
+
+        // ---- Ricezione UDP ----
         int n = receiver.receive(buf, sizeof(buf));
         if (n <= 0) continue;
         if (n < 700) continue;
@@ -46,7 +53,6 @@ int main()
         lh.decode(pdus + 605);
 
         ChassisState& slot = mem.host_ring[writeIndex];
-
         slot.steering_angle = lwi.angle;
         slot.steering_speed = lwi.speed;
         slot.lights_rear    = lh.compute_mask();
@@ -59,19 +65,23 @@ int main()
         int processedIndex = writeIndex;
         writeIndex = (writeIndex + 1) % mem.capacity;
 
+        // ---- Lancio GPU kernel ----
         launch_kernel(mem.device_ring, processedIndex);
 
-        // ------------------ Debug line ------------------
+        // ---- Invio CSV via UDP (angle,speed) ----
         std::ostringstream ss;
-        ss << "[CPU] Index=" << processedIndex
-           << " | Angle=" << slot.steering_angle
-           << " | Speed=" << slot.steering_speed
-           << " | Mask=0x" << std::hex << slot.lights_rear << std::dec;
+        ss << std::fixed << std::setprecision(3)
+           << slot.steering_angle << "," << slot.steering_speed;
+        std::string msg = ss.str();
+        sender.send(msg);
 
-        std::string debug = ss.str();
+        // ---- Fine loop: calcolo tempo in millisecondi ----
+        auto loop_end = Clock::now();
+        double loop_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
 
-        std::cout << debug << "\n";        // local print
-        sender.send(debug);                // send to Windows
+        std::cout << "[CPU] Index=" << processedIndex
+                  << " | " << msg
+                  << " | Loop time: " << std::fixed << std::setprecision(3) << loop_ms << " ms\n";
     }
 
     return 0;
