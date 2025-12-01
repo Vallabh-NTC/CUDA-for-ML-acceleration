@@ -5,6 +5,7 @@
 #include "ChassisState.hpp"
 #include "CudaMemAssign.hpp"
 #include "SARA.hpp"
+#include "BrakeEV01.hpp"
 
 #include <iostream>
 #include <cuda_runtime.h>
@@ -53,9 +54,12 @@ int main()
         Lichthinten01 lh;
         lh.decode(pdus + 605);
 
-        // ---- Decode SARA signals ----
         SARA sara;
         sara.decode_all(pdus);
+
+        BrakeEV01 brk;
+        brk.decode(pdus + 364);   // your offset
+
 
         ChassisState& slot = mem.host_ring[writeIndex];
         slot.steering_angle = lwi.angle;
@@ -85,7 +89,8 @@ int main()
             << sara.d08.omega_y << ","
             << sara.d10.omega_z << ","
             << sara.d07.nickwinkel << ","
-            << sara.d07.wankwinkel;
+            << sara.d07.wankwinkel << "," 
+            << brk.brake_percent;
 
         std::string msg = ss.str();
         sender.send(msg);
