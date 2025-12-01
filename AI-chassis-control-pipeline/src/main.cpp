@@ -4,6 +4,7 @@
 #include "Lichthinten01.hpp"
 #include "ChassisState.hpp"
 #include "CudaMemAssign.hpp"
+#include "SARA.hpp"
 
 #include <iostream>
 #include <cuda_runtime.h>
