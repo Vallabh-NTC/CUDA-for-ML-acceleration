@@ -94,7 +94,7 @@ int main()
             << sara.d10.omega_z << ","
             << sara.d07.nickwinkel << ","
             << sara.d07.wankwinkel << "," 
-            << brk.brake_percentss << "," 
+            << brk.brake_percent << "," 
             << gas;
 
         std::string msg = ss.str();

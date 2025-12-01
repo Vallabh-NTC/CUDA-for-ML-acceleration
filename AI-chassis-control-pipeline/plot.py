@@ -25,7 +25,7 @@ WINDOW = 2.0  # seconds
 timestamps = deque()
 steer_angle = deque()
 steer_speed = deque()
-gas_pedal = deque()     # placeholder
+gas_pedal = deque()
 brake_pedal = deque()
 
 # Latest IMU vectors
@@ -94,7 +94,7 @@ def update(frame):
 
         try:
             f = data.decode().split(",")
-            if len(f) < 11:
+            if len(f) < 12:
                 continue
 
             ts = time.time()
@@ -103,11 +103,14 @@ def update(frame):
             # CSV fields
             steer_angle.append(float(f[0]))
             steer_speed.append(float(f[1]))
-            gas_pedal.append(float(f[8]))   # placeholder
-            brake_pedal.append(float(f[9]))
 
+            # IMU accel + omega
             accel = np.array([float(f[2]), float(f[3]), float(f[4])])
             omega = np.array([float(f[5]), float(f[6]), float(f[7])])
+
+            # Pedals
+            gas_pedal.append(float(f[10]))      # <-- corrected index
+            brake_pedal.append(float(f[11]))
 
         except:
             continue
@@ -139,8 +142,10 @@ def update(frame):
             ax.set_xlim(0, max(0.1, t[-1]))
 
         # Autoscale Y
-        ax1.set_ylim(min(steer_angle + steer_speed) - 1,
-                     max(steer_angle + steer_speed) + 1)
+        ax1.set_ylim(
+            min(steer_angle + steer_speed) - 1,
+            max(steer_angle + steer_speed) + 1)
+
         ax2.set_ylim(min(gas_pedal) - 1, max(gas_pedal) + 1)
         ax3.set_ylim(min(brake_pedal) - 1, max(brake_pedal) + 1)
 
@@ -152,13 +157,8 @@ def update(frame):
     if omega_quiver:
         omega_quiver.remove()
 
-    acc_quiver = ax_acc.quiver(0, 0, 0,
-                               accel[0], accel[1], accel[2],
-                               color="blue")
-
-    omega_quiver = ax_omega.quiver(0, 0, 0,
-                                   omega[0], omega[1], omega[2],
-                                   color="red")
+    acc_quiver = ax_acc.quiver(0, 0, 0, accel[0], accel[1], accel[2], color="blue")
+    omega_quiver = ax_omega.quiver(0, 0, 0, omega[0], omega[1], omega[2], color="red")
 
     return []
 
