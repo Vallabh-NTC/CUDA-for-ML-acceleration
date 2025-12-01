@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <ctime>
+#include <sstream>
 
 // GPU launcher function
 extern "C" void launch_kernel(ChassisState* ring, int index);
