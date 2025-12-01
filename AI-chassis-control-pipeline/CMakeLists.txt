@@ -25,6 +25,7 @@ add_executable(udp_decoder
     src/UdpReceiver.cpp
     src/main.cpp
     src/KernelExec.cu
+    src/UdpSender.cpp
 )
 
 # set_source_files_properties(src/photo_edit.cu PROPERTIES LANGUAGE CUDA)
