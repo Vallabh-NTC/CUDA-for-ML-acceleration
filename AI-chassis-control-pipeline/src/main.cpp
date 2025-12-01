@@ -52,6 +52,10 @@ int main()
         Lichthinten01 lh;
         lh.decode(pdus + 605);
 
+        // ---- Decode SARA signals ----
+        SARA sara;
+        sara.decode_all(pdus);
+
         ChassisState& slot = mem.host_ring[writeIndex];
         slot.steering_angle = lwi.angle;
         slot.steering_speed = lwi.speed;
@@ -68,10 +72,20 @@ int main()
         // ---- Lancio GPU kernel ----
         launch_kernel(mem.device_ring, processedIndex);
 
-        // ---- Invio CSV via UDP (angle,speed) ----
+        // ---- Build unified CSV ----
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(3)
-           << slot.steering_angle << "," << slot.steering_speed;
+            << slot.steering_angle << ","
+            << slot.steering_speed << ","
+            << sara.d10.accel_x << ","
+            << sara.d10.accel_y << ","
+            << sara.d08.accel_z << ","
+            << sara.d08.omega_x << ","
+            << sara.d08.omega_y << ","
+            << sara.d10.omega_z << ","
+            << sara.d07.nickwinkel << ","
+            << sara.d07.wankwinkel;
+
         std::string msg = ss.str();
         sender.send(msg);
 
@@ -79,9 +93,9 @@ int main()
         auto loop_end = Clock::now();
         double loop_ms = std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
 
-        std::cout << "[CPU] Index=" << processedIndex
-                  << " | " << msg
-                  << " | Loop time: " << std::fixed << std::setprecision(3) << loop_ms << " ms\n";
+        //std::cout << "[CPU] Index=" << processedIndex
+        //          << " | " << msg
+        //          << " | Loop time: " << std::fixed << std::setprecision(3) << loop_ms << " ms\n";
     }
 
     return 0;
