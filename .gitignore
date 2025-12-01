@@ -16,3 +16,5 @@ Thumbs.db
 # Logs
 *.log
 
+# jetpack public sources bsp
+public_sources.tbz2
