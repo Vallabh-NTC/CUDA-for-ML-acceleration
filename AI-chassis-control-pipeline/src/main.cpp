@@ -6,6 +6,7 @@
 #include "CudaMemAssign.hpp"
 #include "SARA.hpp"
 #include "BrakeEV01.hpp"
+#include "Motor20.hpp"
 
 #include <iostream>
 #include <cuda_runtime.h>
@@ -60,6 +61,9 @@ int main()
         BrakeEV01 brk;
         brk.decode(pdus + 364);   // your offset
 
+        Motor20 m20;
+        m20.decode(pdus + 629);
+        float gas = m20.data().gas_percent;
 
         ChassisState& slot = mem.host_ring[writeIndex];
         slot.steering_angle = lwi.angle;
@@ -90,7 +94,8 @@ int main()
             << sara.d10.omega_z << ","
             << sara.d07.nickwinkel << ","
             << sara.d07.wankwinkel << "," 
-            << brk.brake_percent;
+            << brk.brake_percentss << "," 
+            << gas;
 
         std::string msg = ss.str();
         sender.send(msg);
