@@ -27,7 +27,7 @@ UdpReceiver::UdpReceiver(uint16_t port)
     // Bind to explicit Xavier IP first
     // (replace with your actual IP!)
     // -------------------------------
-    const char* xavier_ip = "192.168.1.197";
+    const char* xavier_ip = "192.168.1.20";
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
