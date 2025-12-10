@@ -65,6 +65,11 @@ int main()
         m20.decode(pdus + 629);
         float gas = m20.data().gas_percent;
 
+        ESP21 esp;
+        esp.decode(pdus + 542);
+        float veh_speed = esp.data().vehicle_speed;
+
+
         ChassisState& slot = mem.host_ring[writeIndex];
         slot.steering_angle = lwi.angle;
         slot.steering_speed = lwi.speed;
@@ -95,7 +100,8 @@ int main()
             << sara.d07.nickwinkel << ","
             << sara.d07.wankwinkel << "," 
             << brk.brake_percent << "," 
-            << gas;
+            << gas << ","
+            << veh_speed;
 
         std::string msg = ss.str();
         sender.send(msg);
