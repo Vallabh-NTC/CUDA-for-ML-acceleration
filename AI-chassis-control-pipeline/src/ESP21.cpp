@@ -1,5 +1,6 @@
 #include "ESP21.hpp"
 #include "BitExtractor.hpp"
+#include <cmath> 
 
 void ESP21::decode(const unsigned char* data)
 {
