@@ -29,6 +29,7 @@ add_executable(udp_decoder
     src/SARA.cpp
     src/Motor20.cpp
     src/BrakeEV01.cpp
+    src/ESP21.cpp
 )
 
 # set_source_files_properties(src/photo_edit.cu PROPERTIES LANGUAGE CUDA)
