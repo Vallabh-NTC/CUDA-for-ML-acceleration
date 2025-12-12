@@ -3,7 +3,8 @@
 #include "Lichthinten01.hpp"
 #include "ChassisState.hpp"
 #include "CudaMemAssign.hpp"
-#include "SARA_10.hpp"          
+#include "SARA_10.hpp"
+#include "SARA_08.hpp"
 #include "BrakeEV01.hpp"
 #include "Motor20.hpp"
 #include "ESP21.hpp"
@@ -140,13 +141,21 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
     uint64_t pktCounter = 0;
     int writeIndex      = 0;
 
-    // Offsets for all known SARA10 instances (as requested)
+    // ---- Unique offsets (as agreed) ----
     static constexpr std::array<int, 61> sara10_offsets = {{
         0, 16, 27, 48, 64, 80, 95, 111, 112, 118, 128, 130, 151, 170, 189, 213,
         229, 242, 259, 267, 274, 289, 303, 318, 321, 326, 331, 340, 353, 366,
         367, 373, 380, 385, 402, 408, 412, 420, 436, 457, 468, 489, 518, 520,
         522, 528, 589, 595, 609, 617, 620, 652, 671, 682, 684, 692, 747, 792,
         856, 1187, 1202
+    }};
+
+    static constexpr std::array<int, 60> sara08_offsets = {{
+        0, 25, 32, 45, 70, 73, 77, 86, 108, 110, 121, 125, 150, 153, 158, 161,
+        192, 206, 230, 241, 252, 260, 261, 273, 288, 307, 348, 349, 369, 374,
+        378, 385, 389, 403, 418, 425, 437, 464, 468, 518, 553, 560, 561, 603,
+        614, 654, 656, 661, 680, 698, 759, 813, 820, 838, 849, 855, 866, 1062,
+        1114, 1130
     }};
 
     while (true) {
@@ -237,13 +246,21 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         Lichthinten01 lh;
         lh.decode(pdus + 605);
 
-        // Decode ALL SARA10 instances (one per offset)
+        // ---- Decode ALL unique SARA10 blocks ----
         std::array<SARA_10, sara10_offsets.size()> sara10_all;
         for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
             sara10_all[i].decode(pdus + sara10_offsets[i]);
         }
 
-        // Example: choose one instance to display/use (here: the one at offset 412 if present, else first)
+        // ---- Decode ALL unique SARA08 blocks ----
+        std::array<SARA_08, sara08_offsets.size()> sara08_all;
+        for (std::size_t i = 0; i < sara08_offsets.size(); ++i) {
+            sara08_all[i].decode(pdus + sara08_offsets[i]);
+        }
+
+        // Choose which instance to use for logging/processing:
+        // - SARA10: prefer offset 412 (matches your old fixed-offset decode)
+        // - SARA08: prefer offset 437 (matches your old fixed-offset decode)
         const SARA_10_Data* chosen_sara10 = nullptr;
         for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
             if (sara10_offsets[i] == 412) {
@@ -251,9 +268,16 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
                 break;
             }
         }
-        if (!chosen_sara10) {
-            chosen_sara10 = &sara10_all[0].data();
+        if (!chosen_sara10) chosen_sara10 = &sara10_all[0].data();
+
+        const SARA_08_Data* chosen_sara08 = nullptr;
+        for (std::size_t i = 0; i < sara08_offsets.size(); ++i) {
+            if (sara08_offsets[i] == 437) {
+                chosen_sara08 = &sara08_all[i].data();
+                break;
+            }
         }
+        if (!chosen_sara08) chosen_sara08 = &sara08_all[0].data();
 
         BrakeEV01 brk;
         brk.decode(pdus + 364);
@@ -304,24 +328,16 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
            << " | Index=" << processedIndex
            << " | steering_angle=" << slot.steering_angle
            << ", steering_speed=" << slot.steering_speed
-           << ", sara10_ax=" << chosen_sara10->accel_x
-           << ", sara10_ay=" << chosen_sara10->accel_y
-           << ", sara10_oz=" << chosen_sara10->omega_z
+           << ", accel_x=" << chosen_sara10->accel_x
+           << ", accel_y=" << chosen_sara10->accel_y
+           << ", accel_z=" << chosen_sara08->accel_z
+           << ", omega_x=" << chosen_sara08->omega_x
+           << ", omega_y=" << chosen_sara08->omega_y
+           << ", omega_z=" << chosen_sara10->omega_z
            << ", brake=" << brk.brake_percent
            << ", gas=" << gas
            << ", veh_speed=" << veh_speed
            << " | Worker loop time=" << loop_ms << " ms";
-
-        // (Optional) if you really want to log ALL 61 decoded SARA10 blocks, uncomment:
-        /*
-        for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
-            const auto& d = sara10_all[i].data();
-            ss << " | SARA10@" << sara10_offsets[i]
-               << ":ax=" << d.accel_x
-               << ",ay=" << d.accel_y
-               << ",oz=" << d.omega_z;
-        }
-        */
 
         {
             std::lock_guard<std::mutex> lock(logMutex);
@@ -392,7 +408,6 @@ int main()
     std::thread workerThread(workerThreadFunc, std::ref(mem), std::ref(pcapFile));
 
     // Per ora non gestiamo shutdown elegante: Ctrl+C e basta.
-    // Se vuoi, qui potresti aspettare un segnale e mettere runRxWorker=false, runLogger=false, ecc.
     rxThread.join();
     workerThread.join();
 
