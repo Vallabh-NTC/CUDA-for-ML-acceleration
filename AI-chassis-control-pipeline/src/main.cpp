@@ -141,7 +141,12 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
     uint64_t pktCounter = 0;
     int writeIndex      = 0;
 
-    // ---- Unique offsets (as agreed) ----
+    // ---- Unique offsets (as agreed / extracted) ----
+    static constexpr std::array<int, 32> lwi01_offsets = {{
+        32, 56, 83, 96, 151, 162, 172, 185, 192, 221, 242, 250, 305, 348, 357, 389,
+        416, 418, 470, 511, 575, 625, 637, 653, 677, 678, 715, 802, 818, 1027, 1061, 1142
+    }};
+
     static constexpr std::array<int, 61> sara10_offsets = {{
         0, 16, 27, 48, 64, 80, 95, 111, 112, 118, 128, 130, 151, 170, 189, 213,
         229, 242, 259, 267, 274, 289, 303, 318, 321, 326, 331, 340, 353, 366,
@@ -163,7 +168,6 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         392, 422, 454, 536, 537, 544, 582, 593, 661, 684, 728, 894, 958, 1029, 1235
     }};
 
-    // ---- ESP21 unique offsets from main_jupiter_flex.cpp ----
     static constexpr std::array<int, 16> esp21_offsets = {{
         0, 74, 150, 196, 202, 270, 340, 341, 375, 434, 480, 542, 628, 659, 1106, 1179
     }};
@@ -213,45 +217,56 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         pcapFile.write(reinterpret_cast<const char*>(pkt.data), pkt.len);
 
         // ----- Controlli base -----
-        int n = pkt.len;
-        const unsigned char* buf = pkt.data;
+        // int n = pkt.len;
+        // const unsigned char* buf = pkt.data;
 
-        bool valid_for_decode = true;
-        std::string reason;
+        // bool valid_for_decode = true;
+        // std::string reason;
 
-        if (n < 700) {
-            valid_for_decode = false;
-            reason = "len<700";
-        } else if (buf[0] != 1) {
-            valid_for_decode = false;
-            reason = "buf[0]!=1";
-        }
+        // if (n < 700) {
+        //     valid_for_decode = false;
+        //     reason = "len<700";
+        // } else if (buf[0] != 1) {
+        //     valid_for_decode = false;
+        //     reason = "buf[0]!=1";
+        // }
 
-        // ----- Log semplice per pacchetti ignorati -----
-        if (!valid_for_decode) {
-            std::ostringstream ss;
-            ss << "[PKT " << pktCounter << "] "
-               << "IGNORED (" << reason << ") "
-               << "n=" << n
-               << ", buf[0]=" << int(static_cast<unsigned char>(buf[0]))
-               << ", t_ms=" << pkt.timestamp_ms
-               << ", dt_ms=" << dt_ms
-               << ", freq_Hz=" << freq_hz;
+        // // ----- Log semplice per pacchetti ignorati -----
+        // if (!valid_for_decode) {
+        //     std::ostringstream ss;
+        //     ss << "[PKT " << pktCounter << "] "
+        //        << "IGNORED (" << reason << ") "
+        //        << "n=" << n
+        //        << ", buf[0]=" << int(static_cast<unsigned char>(buf[0]))
+        //        << ", t_ms=" << pkt.timestamp_ms
+        //        << ", dt_ms=" << dt_ms
+        //        << ", freq_Hz=" << freq_hz;
 
-            {
-                std::lock_guard<std::mutex> lock(logMutex);
-                logQueue.emplace(ss.str());
-            }
-            logCv.notify_one();
+        //     {
+        //         std::lock_guard<std::mutex> lock(logMutex);
+        //         logQueue.emplace(ss.str());
+        //     }
+        //     logCv.notify_one();
 
-            continue;
-        }
+        //     continue;
+        // }
 
         // ----- Decode PDUs -----
         const unsigned char* pdus = buf + 3;
 
-        LWI01 lwi;
-        lwi.decode(pdus + 677);
+        // ---- Decode ALL unique LWI01 blocks ----
+        std::array<LWI01, lwi01_offsets.size()> lwi_all;
+        for (std::size_t i = 0; i < lwi01_offsets.size(); ++i) {
+            lwi_all[i].decode(pdus + lwi01_offsets[i]);
+        }
+        const LWI01* chosen_lwi = nullptr;
+        for (std::size_t i = 0; i < lwi01_offsets.size(); ++i) {
+            if (lwi01_offsets[i] == 677) { // original main.cpp offset
+                chosen_lwi = &lwi_all[i];
+                break;
+            }
+        }
+        if (!chosen_lwi) chosen_lwi = &lwi_all[0];
 
         Lichthinten01 lh;
         lh.decode(pdus + 605);
@@ -280,14 +295,10 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
             esp_all[i].decode(pdus + esp21_offsets[i]);
         }
 
-        // Choose which instances to use for logging/processing:
-        // - SARA10: prefer offset 412 (matches your old fixed-offset decode)
-        // - SARA08: prefer offset 437 (matches your old fixed-offset decode)
-        // - BrakeEV01: prefer offset 364 (matches your old fixed-offset decode)
-        // - ESP21: prefer offset 542 (matches your old fixed-offset decode)
+        // ---- Choose preferred instances (keep old fixed offsets as preference) ----
         const SARA_10_Data* chosen_sara10 = nullptr;
         for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
-            if (sara10_offsets[i] == 412) {
+            if (sara10_offsets[i] == 412) { // old SARA10 base
                 chosen_sara10 = &sara10_all[i].data();
                 break;
             }
@@ -296,7 +307,7 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
 
         const SARA_08_Data* chosen_sara08 = nullptr;
         for (std::size_t i = 0; i < sara08_offsets.size(); ++i) {
-            if (sara08_offsets[i] == 437) {
+            if (sara08_offsets[i] == 437) { // old SARA08 base
                 chosen_sara08 = &sara08_all[i].data();
                 break;
             }
@@ -305,7 +316,7 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
 
         const BrakeEV01* chosen_brk = nullptr;
         for (std::size_t i = 0; i < brkev01_offsets.size(); ++i) {
-            if (brkev01_offsets[i] == 364) {
+            if (brkev01_offsets[i] == 364) { // old BrakeEV01 base
                 chosen_brk = &brk_all[i];
                 break;
             }
@@ -314,14 +325,13 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
 
         const ESP21* chosen_esp = nullptr;
         for (std::size_t i = 0; i < esp21_offsets.size(); ++i) {
-            if (esp21_offsets[i] == 542) {
+            if (esp21_offsets[i] == 542) { // old ESP21 base
                 chosen_esp = &esp_all[i];
                 break;
             }
         }
         if (!chosen_esp) chosen_esp = &esp_all[0];
 
-        // Motor20 stays as single decode (unchanged)
         Motor20 m20;
         m20.decode(pdus + 629);
         float gas = m20.data().gas_percent;
@@ -330,8 +340,8 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
 
         // ----- Write into ring buffer -----
         ChassisState& slot = mem.host_ring[writeIndex];
-        slot.steering_angle = lwi.angle;
-        slot.steering_speed = lwi.speed;
+        slot.steering_angle = chosen_lwi->angle;
+        slot.steering_speed = chosen_lwi->speed;
         slot.lights_rear    = lh.compute_mask();
         slot.timestamp_ms   = pkt.timestamp_ms;
 
