@@ -158,6 +158,16 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         1114, 1130
     }};
 
+    static constexpr std::array<int, 30> brkev01_offsets = {{
+        16, 40, 48, 57, 116, 172, 177, 196, 248, 254, 261, 284, 364, 372, 381,
+        392, 422, 454, 536, 537, 544, 582, 593, 661, 684, 728, 894, 958, 1029, 1235
+    }};
+
+    // ---- ESP21 unique offsets from main_jupiter_flex.cpp ----
+    static constexpr std::array<int, 16> esp21_offsets = {{
+        0, 74, 150, 196, 202, 270, 340, 341, 375, 434, 480, 542, 628, 659, 1106, 1179
+    }};
+
     while (true) {
         // ----- Wait for packet from RX thread -----
         Packet pkt;
@@ -258,9 +268,23 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
             sara08_all[i].decode(pdus + sara08_offsets[i]);
         }
 
-        // Choose which instance to use for logging/processing:
+        // ---- Decode ALL unique BrakeEV01 blocks ----
+        std::array<BrakeEV01, brkev01_offsets.size()> brk_all;
+        for (std::size_t i = 0; i < brkev01_offsets.size(); ++i) {
+            brk_all[i].decode(pdus + brkev01_offsets[i]);
+        }
+
+        // ---- Decode ALL unique ESP21 blocks ----
+        std::array<ESP21, esp21_offsets.size()> esp_all;
+        for (std::size_t i = 0; i < esp21_offsets.size(); ++i) {
+            esp_all[i].decode(pdus + esp21_offsets[i]);
+        }
+
+        // Choose which instances to use for logging/processing:
         // - SARA10: prefer offset 412 (matches your old fixed-offset decode)
         // - SARA08: prefer offset 437 (matches your old fixed-offset decode)
+        // - BrakeEV01: prefer offset 364 (matches your old fixed-offset decode)
+        // - ESP21: prefer offset 542 (matches your old fixed-offset decode)
         const SARA_10_Data* chosen_sara10 = nullptr;
         for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
             if (sara10_offsets[i] == 412) {
@@ -279,16 +303,30 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         }
         if (!chosen_sara08) chosen_sara08 = &sara08_all[0].data();
 
-        BrakeEV01 brk;
-        brk.decode(pdus + 364);
+        const BrakeEV01* chosen_brk = nullptr;
+        for (std::size_t i = 0; i < brkev01_offsets.size(); ++i) {
+            if (brkev01_offsets[i] == 364) {
+                chosen_brk = &brk_all[i];
+                break;
+            }
+        }
+        if (!chosen_brk) chosen_brk = &brk_all[0];
 
+        const ESP21* chosen_esp = nullptr;
+        for (std::size_t i = 0; i < esp21_offsets.size(); ++i) {
+            if (esp21_offsets[i] == 542) {
+                chosen_esp = &esp_all[i];
+                break;
+            }
+        }
+        if (!chosen_esp) chosen_esp = &esp_all[0];
+
+        // Motor20 stays as single decode (unchanged)
         Motor20 m20;
         m20.decode(pdus + 629);
         float gas = m20.data().gas_percent;
 
-        ESP21 esp;
-        esp.decode(pdus + 542);
-        float veh_speed = esp.data().vehicle_speed;
+        float veh_speed = chosen_esp->data().vehicle_speed;
 
         // ----- Write into ring buffer -----
         ChassisState& slot = mem.host_ring[writeIndex];
@@ -334,7 +372,9 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
            << ", omega_x=" << chosen_sara08->omega_x
            << ", omega_y=" << chosen_sara08->omega_y
            << ", omega_z=" << chosen_sara10->omega_z
-           << ", brake=" << brk.brake_percent
+           << ", nickwinkel=N/A"
+           << ", wankwinkel=N/A"
+           << ", brake=" << chosen_brk->brake_percent
            << ", gas=" << gas
            << ", veh_speed=" << veh_speed
            << " | Worker loop time=" << loop_ms << " ms";
