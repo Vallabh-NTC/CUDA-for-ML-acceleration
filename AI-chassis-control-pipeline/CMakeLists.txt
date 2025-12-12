@@ -20,7 +20,6 @@ set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 # ---- Sources ----
 add_executable(udp_decoder
     src/BitExtractor.cpp
-    src/Lichthinten01.cpp
     src/LWI01.cpp
     src/UdpReceiver.cpp
     src/main.cpp

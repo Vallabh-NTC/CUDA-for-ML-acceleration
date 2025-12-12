@@ -1,6 +1,5 @@
 #include "UdpReceiver.hpp"
 #include "LWI01.hpp"
-#include "Lichthinten01.hpp"
 #include "ChassisState.hpp"
 #include "CudaMemAssign.hpp"
 #include "SARA_10.hpp"
@@ -104,7 +103,6 @@ void rxThreadFunc(UdpReceiver& receiver)
     while (runRxWorker) {
         int n = receiver.receive(buf, sizeof(buf));
         if (n <= 0) {
-            // timeout/errore -> salta
             continue;
         }
 
@@ -172,6 +170,11 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         0, 74, 150, 196, 202, 270, 340, 341, 375, 434, 480, 542, 628, 659, 1106, 1179
     }};
 
+    static constexpr std::array<int, 31> motor20_offsets = {{
+        8, 65, 68, 78, 79, 117, 170, 179, 204, 213, 233, 349, 359, 365, 374, 434,
+        446, 497, 559, 598, 612, 617, 620, 629, 689, 841, 964, 1003, 1064, 1098, 1158
+    }};
+
     while (true) {
         // ----- Wait for packet from RX thread -----
         Packet pkt;
@@ -182,7 +185,7 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
             });
 
             if (!runRxWorker && pktQueue.empty()) {
-                break;  // shutdown
+                break;
             }
 
             pkt = std::move(pktQueue.front());
@@ -206,7 +209,7 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         prev_ts_ms = pkt.timestamp_ms;
         have_prev_ts = true;
 
-        // ----- PCAP write (tutti i pacchetti) -----
+        // ----- PCAP write -----
         PcapRecordHeader rh{};
         rh.ts_sec   = pkt.ts.tv_sec;
         rh.ts_usec  = pkt.ts.tv_nsec / 1000;
@@ -216,7 +219,7 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         pcapFile.write(reinterpret_cast<const char*>(&rh), sizeof(rh));
         pcapFile.write(reinterpret_cast<const char*>(pkt.data), pkt.len);
 
-        // ----- Controlli base -----
+        // ----- Basic checks -----
         // int n = pkt.len;
         // const unsigned char* buf = pkt.data;
 
@@ -231,7 +234,6 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         //     reason = "buf[0]!=1";
         // }
 
-        // // ----- Log semplice per pacchetti ignorati -----
         // if (!valid_for_decode) {
         //     std::ostringstream ss;
         //     ss << "[PKT " << pktCounter << "] "
@@ -247,102 +249,103 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         //         logQueue.emplace(ss.str());
         //     }
         //     logCv.notify_one();
-
         //     continue;
         // }
 
         // ----- Decode PDUs -----
         const unsigned char* pdus = buf + 3;
 
-        // ---- Decode ALL unique LWI01 blocks ----
+        // LWI01
         std::array<LWI01, lwi01_offsets.size()> lwi_all;
         for (std::size_t i = 0; i < lwi01_offsets.size(); ++i) {
             lwi_all[i].decode(pdus + lwi01_offsets[i]);
         }
         const LWI01* chosen_lwi = nullptr;
         for (std::size_t i = 0; i < lwi01_offsets.size(); ++i) {
-            if (lwi01_offsets[i] == 677) { // original main.cpp offset
+            if (lwi01_offsets[i] == 677) {
                 chosen_lwi = &lwi_all[i];
                 break;
             }
         }
         if (!chosen_lwi) chosen_lwi = &lwi_all[0];
 
-        Lichthinten01 lh;
-        lh.decode(pdus + 605);
-
-        // ---- Decode ALL unique SARA10 blocks ----
+        // SARA10
         std::array<SARA_10, sara10_offsets.size()> sara10_all;
         for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
             sara10_all[i].decode(pdus + sara10_offsets[i]);
         }
-
-        // ---- Decode ALL unique SARA08 blocks ----
-        std::array<SARA_08, sara08_offsets.size()> sara08_all;
-        for (std::size_t i = 0; i < sara08_offsets.size(); ++i) {
-            sara08_all[i].decode(pdus + sara08_offsets[i]);
-        }
-
-        // ---- Decode ALL unique BrakeEV01 blocks ----
-        std::array<BrakeEV01, brkev01_offsets.size()> brk_all;
-        for (std::size_t i = 0; i < brkev01_offsets.size(); ++i) {
-            brk_all[i].decode(pdus + brkev01_offsets[i]);
-        }
-
-        // ---- Decode ALL unique ESP21 blocks ----
-        std::array<ESP21, esp21_offsets.size()> esp_all;
-        for (std::size_t i = 0; i < esp21_offsets.size(); ++i) {
-            esp_all[i].decode(pdus + esp21_offsets[i]);
-        }
-
-        // ---- Choose preferred instances (keep old fixed offsets as preference) ----
         const SARA_10_Data* chosen_sara10 = nullptr;
         for (std::size_t i = 0; i < sara10_offsets.size(); ++i) {
-            if (sara10_offsets[i] == 412) { // old SARA10 base
+            if (sara10_offsets[i] == 412) {
                 chosen_sara10 = &sara10_all[i].data();
                 break;
             }
         }
         if (!chosen_sara10) chosen_sara10 = &sara10_all[0].data();
 
+        // SARA08
+        std::array<SARA_08, sara08_offsets.size()> sara08_all;
+        for (std::size_t i = 0; i < sara08_offsets.size(); ++i) {
+            sara08_all[i].decode(pdus + sara08_offsets[i]);
+        }
         const SARA_08_Data* chosen_sara08 = nullptr;
         for (std::size_t i = 0; i < sara08_offsets.size(); ++i) {
-            if (sara08_offsets[i] == 437) { // old SARA08 base
+            if (sara08_offsets[i] == 437) {
                 chosen_sara08 = &sara08_all[i].data();
                 break;
             }
         }
         if (!chosen_sara08) chosen_sara08 = &sara08_all[0].data();
 
+        // BrakeEV01
+        std::array<BrakeEV01, brkev01_offsets.size()> brk_all;
+        for (std::size_t i = 0; i < brkev01_offsets.size(); ++i) {
+            brk_all[i].decode(pdus + brkev01_offsets[i]);
+        }
         const BrakeEV01* chosen_brk = nullptr;
         for (std::size_t i = 0; i < brkev01_offsets.size(); ++i) {
-            if (brkev01_offsets[i] == 364) { // old BrakeEV01 base
+            if (brkev01_offsets[i] == 364) {
                 chosen_brk = &brk_all[i];
                 break;
             }
         }
         if (!chosen_brk) chosen_brk = &brk_all[0];
 
+        // ESP21
+        std::array<ESP21, esp21_offsets.size()> esp_all;
+        for (std::size_t i = 0; i < esp21_offsets.size(); ++i) {
+            esp_all[i].decode(pdus + esp21_offsets[i]);
+        }
         const ESP21* chosen_esp = nullptr;
         for (std::size_t i = 0; i < esp21_offsets.size(); ++i) {
-            if (esp21_offsets[i] == 542) { // old ESP21 base
+            if (esp21_offsets[i] == 542) {
                 chosen_esp = &esp_all[i];
                 break;
             }
         }
         if (!chosen_esp) chosen_esp = &esp_all[0];
 
-        Motor20 m20;
-        m20.decode(pdus + 629);
-        float gas = m20.data().gas_percent;
+        // Motor20
+        std::array<Motor20, motor20_offsets.size()> motor20_all;
+        for (std::size_t i = 0; i < motor20_offsets.size(); ++i) {
+            motor20_all[i].decode(pdus + motor20_offsets[i]);
+        }
+        const Motor20* chosen_m20 = nullptr;
+        for (std::size_t i = 0; i < motor20_offsets.size(); ++i) {
+            if (motor20_offsets[i] == 629) {
+                chosen_m20 = &motor20_all[i];
+                break;
+            }
+        }
+        if (!chosen_m20) chosen_m20 = &motor20_all[0];
 
+        float gas = chosen_m20->data().gas_percent;
         float veh_speed = chosen_esp->data().vehicle_speed;
 
         // ----- Write into ring buffer -----
         ChassisState& slot = mem.host_ring[writeIndex];
         slot.steering_angle = chosen_lwi->angle;
         slot.steering_speed = chosen_lwi->speed;
-        slot.lights_rear    = lh.compute_mask();
         slot.timestamp_ms   = pkt.timestamp_ms;
 
         int processedIndex = writeIndex;
@@ -351,12 +354,12 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         // ----- GPU kernel -----
         launch_kernel(mem.device_ring, processedIndex);
 
-        // ----- Compute worker loop time -----
+        // ----- loop time -----
         auto loop_end = Clock::now();
         double loop_ms =
             std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
 
-        // ----- Build rich log message -----
+        // ----- Log -----
         char time_buf[32];
         std::tm tm_local{};
         localtime_r(&pkt.ts.tv_sec, &tm_local);
@@ -369,25 +372,21 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
            << "[" << time_buf << "." << std::setw(3) << std::setfill('0') << ms
            << std::setfill(' ') << "] "
            << "DECODED n=" << n
-           << ", buf[0]=" << int(static_cast<unsigned char>(buf[0]))
-           << " | t_ms=" << pkt.timestamp_ms
            << ", dt_ms=" << dt_ms
            << ", freq_Hz=" << freq_hz
            << " | Index=" << processedIndex
-           << " | steering_angle=" << slot.steering_angle
-           << ", steering_speed=" << slot.steering_speed
-           << ", accel_x=" << chosen_sara10->accel_x
-           << ", accel_y=" << chosen_sara10->accel_y
-           << ", accel_z=" << chosen_sara08->accel_z
-           << ", omega_x=" << chosen_sara08->omega_x
-           << ", omega_y=" << chosen_sara08->omega_y
-           << ", omega_z=" << chosen_sara10->omega_z
-           << ", nickwinkel=N/A"
-           << ", wankwinkel=N/A"
+           << " | steer=" << slot.steering_angle
+           << ", steer_spd=" << slot.steering_speed
+           << ", ax=" << chosen_sara10->accel_x
+           << ", ay=" << chosen_sara10->accel_y
+           << ", az=" << chosen_sara08->accel_z
+           << ", ox=" << chosen_sara08->omega_x
+           << ", oy=" << chosen_sara08->omega_y
+           << ", oz=" << chosen_sara10->omega_z
            << ", brake=" << chosen_brk->brake_percent
            << ", gas=" << gas
-           << ", veh_speed=" << veh_speed
-           << " | Worker loop time=" << loop_ms << " ms";
+           << ", v=" << veh_speed
+           << " | loop=" << loop_ms << " ms";
 
         {
             std::lock_guard<std::mutex> lock(logMutex);
@@ -404,16 +403,11 @@ int main()
 {
     std::setlocale(LC_NUMERIC, "C");
 
-    // ---------- CUDA ring buffer ----------
     CudaMemAssign mem(64);
-
-    // ---------- UDP receiver ----------
     UdpReceiver receiver(1500);
 
-    // ---------- Start logging thread ----------
     std::thread logger(loggingThreadFunc);
 
-    // ---------- Build PCAP filename ----------
     std::time_t now = std::time(nullptr);
     std::tm tm_now{};
     localtime_r(&now, &tm_now);
@@ -431,7 +425,6 @@ int main()
         logCv.notify_one();
     }
 
-    // ---------- Open PCAP file ----------
     std::ofstream pcapFile(pcapFilename, std::ios::binary);
     if (!pcapFile) {
         std::cerr << "Error: cannot open " << pcapFilename << "\n";
@@ -441,7 +434,6 @@ int main()
         return 1;
     }
 
-    // Global PCAP header
     PcapGlobalHeader gh{};
     gh.magic_number  = 0xa1b2c3d4;
     gh.version_major = 2;
@@ -453,11 +445,9 @@ int main()
 
     pcapFile.write(reinterpret_cast<const char*>(&gh), sizeof(gh));
 
-    // ---------- Start RX + worker threads ----------
     std::thread rxThread(rxThreadFunc, std::ref(receiver));
     std::thread workerThread(workerThreadFunc, std::ref(mem), std::ref(pcapFile));
 
-    // Per ora non gestiamo shutdown elegante: Ctrl+C e basta.
     rxThread.join();
     workerThread.join();
 
