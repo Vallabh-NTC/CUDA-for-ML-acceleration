@@ -26,7 +26,6 @@ add_executable(udp_decoder
     src/main.cpp
     src/KernelExec.cu
     src/UdpSender.cpp
-    src/SARA.cpp
     src/Motor20.cpp
     src/BrakeEV01.cpp
     src/ESP21.cpp
