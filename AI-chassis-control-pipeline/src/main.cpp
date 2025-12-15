@@ -220,8 +220,8 @@ void workerThreadFunc(CudaMemAssign& mem, std::ofstream& pcapFile)
         pcapFile.write(reinterpret_cast<const char*>(pkt.data), pkt.len);
 
         // ----- Basic checks -----
-        // int n = pkt.len;
-        // const unsigned char* buf = pkt.data;
+        //int n = pkt.len;
+        const unsigned char* buf = pkt.data;
 
         // bool valid_for_decode = true;
         // std::string reason;
