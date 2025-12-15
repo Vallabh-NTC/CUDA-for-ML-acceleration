@@ -7,6 +7,9 @@
 `docker run -it --rm --privileged --net=host -v /dev/bus/usb:/dev/bus/usb -v .:/workspace nvcr.io/nvidia/jetpack-linux-aarch64-crosscompile-x86:5.1.1 bash`
 
 # Execute Environment setup depending on destination SoC
+
+`sed -i 's/\r$//' setup_l4t_cross_compile_Xavier.sh setup_l4t_cross_compile_Orin.sh`
+
 If Xavier :
 `./setup_l4t_cross_compile_Xavier.sh`
 
