@@ -540,8 +540,8 @@ int main()
 
         // ---------------- Cluster 39 ----------------
         case 39: {
-            SARA_10 s10; s10.decode(pdus + 373);
-            SARA_08 s08; s08.decode(pdus + 380);
+            SARA_10 s10; s10.decode(pdus + 398);
+            SARA_08 s08; s08.decode(pdus + 389);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -551,8 +551,8 @@ int main()
 
         // ---------------- Cluster 40 ----------------
         case 40: {
-            SARA_10 s10; s10.decode(pdus + 385);
-            SARA_08 s08; s08.decode(pdus + 402);
+            SARA_10 s10; s10.decode(pdus + 747);
+            SARA_08 s08; s08.decode(pdus + 1062);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -562,8 +562,8 @@ int main()
 
         // ---------------- Cluster 41 ----------------
         case 41: {
-            SARA_10 s10; s10.decode(pdus + 692);
-            SARA_08 s08; s08.decode(pdus + 747);
+            SARA_10 s10; s10.decode(pdus + 0);
+            SARA_08 s08; s08.decode(pdus + 25);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -573,8 +573,8 @@ int main()
 
         // ---------------- Cluster 42 ----------------
         case 42: {
-            SARA_10 s10; s10.decode(pdus + 518);
-            SARA_08 s08; s08.decode(pdus + 520);
+            SARA_10 s10; s10.decode(pdus + 1108);
+            SARA_08 s08; s08.decode(pdus + 108);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -584,8 +584,8 @@ int main()
 
         // ---------------- Cluster 43 ----------------
         case 43: {
-            SARA_10 s10; s10.decode(pdus + 522);
-            SARA_08 s08; s08.decode(pdus + 528);
+            SARA_10 s10; s10.decode(pdus + 402);
+            SARA_08 s08; s08.decode(pdus + 261);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -595,8 +595,8 @@ int main()
 
         // ---------------- Cluster 44 ----------------
         case 44: {
-            SARA_10 s10; s10.decode(pdus + 589);
-            SARA_08 s08; s08.decode(pdus + 595);
+            SARA_10 s10; s10.decode(pdus + 242);
+            SARA_08 s08; s08.decode(pdus + 378);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -606,8 +606,8 @@ int main()
 
         // ---------------- Cluster 45 ----------------
         case 45: {
-            SARA_10 s10; s10.decode(pdus + 609);
-            SARA_08 s08; s08.decode(pdus + 617);
+            SARA_10 s10; s10.decode(pdus + 324);
+            SARA_08 s08; s08.decode(pdus + 855);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -617,8 +617,8 @@ int main()
 
         // ---------------- Cluster 46 ----------------
         case 46: {
-            SARA_10 s10; s10.decode(pdus + 620);
-            SARA_08 s08; s08.decode(pdus + 652);
+            SARA_10 s10; s10.decode(pdus + 156);
+            SARA_08 s08; s08.decode(pdus + 418);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -628,8 +628,8 @@ int main()
 
         // ---------------- Cluster 47 ----------------
         case 47: {
-            SARA_10 s10; s10.decode(pdus + 671);
-            SARA_08 s08; s08.decode(pdus + 682);
+            SARA_10 s10; s10.decode(pdus + 424);
+            SARA_08 s08; s08.decode(pdus + 0);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -639,8 +639,8 @@ int main()
 
         // ---------------- Cluster 48 ----------------
         case 48: {
-            SARA_10 s10; s10.decode(pdus + 684);
-            SARA_08 s08; s08.decode(pdus + 692);
+            SARA_10 s10; s10.decode(pdus + 880);
+            SARA_08 s08; s08.decode(pdus + 158);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -650,8 +650,8 @@ int main()
 
         // ---------------- Cluster 49 ----------------
         case 49: {
-            SARA_10 s10; s10.decode(pdus + 747);
-            SARA_08 s08; s08.decode(pdus + 792);
+            SARA_10 s10; s10.decode(pdus + 96);
+            SARA_08 s08; s08.decode(pdus + 553);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -661,8 +661,8 @@ int main()
 
         // ---------------- Cluster 50 ----------------
         case 50: {
-            SARA_10 s10; s10.decode(pdus + 792);
-            SARA_08 s08; s08.decode(pdus + 856);
+            SARA_10 s10; s10.decode(pdus + 84);
+            SARA_08 s08; s08.decode(pdus + 153);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -672,8 +672,8 @@ int main()
 
         // ---------------- Cluster 51 ----------------
         case 51: {
-            SARA_10 s10; s10.decode(pdus + 856);
-            SARA_08 s08; s08.decode(pdus + 1187);
+            SARA_10 s10; s10.decode(pdus + 1057);
+            SARA_08 s08; s08.decode(pdus + 464);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -683,8 +683,8 @@ int main()
 
         // ---------------- Cluster 52 ----------------
         case 52: {
-            SARA_10 s10; s10.decode(pdus + 1187);
-            SARA_08 s08; s08.decode(pdus + 1202);
+            SARA_10 s10; s10.decode(pdus + 88);
+            SARA_08 s08; s08.decode(pdus + 150);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -694,8 +694,8 @@ int main()
 
         // ---------------- Cluster 53 ----------------
         case 53: {
-            SARA_10 s10; s10.decode(pdus + 0);
-            SARA_08 s08; s08.decode(pdus + 16);
+            SARA_10 s10; s10.decode(pdus + 683);
+            SARA_08 s08; s08.decode(pdus + 230);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -705,8 +705,8 @@ int main()
 
         // ---------------- Cluster 54 ----------------
         case 54: {
-            SARA_10 s10; s10.decode(pdus + 16);
-            SARA_08 s08; s08.decode(pdus + 27);
+            SARA_10 s10; s10.decode(pdus + 261);
+            SARA_08 s08; s08.decode(pdus + 656);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -716,8 +716,8 @@ int main()
 
         // ---------------- Cluster 55 ----------------
         case 55: {
-            SARA_10 s10; s10.decode(pdus + 27);
-            SARA_08 s08; s08.decode(pdus + 48);
+            SARA_10 s10; s10.decode(pdus + 112);
+            SARA_08 s08; s08.decode(pdus + 0);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -727,8 +727,8 @@ int main()
 
         // ---------------- Cluster 56 ----------------
         case 56: {
-            SARA_10 s10; s10.decode(pdus + 48);
-            SARA_08 s08; s08.decode(pdus + 64);
+            SARA_10 s10; s10.decode(pdus + 497);
+            SARA_08 s08; s08.decode(pdus + 680);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -738,8 +738,8 @@ int main()
 
         // ---------------- Cluster 57 ----------------
         case 57: {
-            SARA_10 s10; s10.decode(pdus + 64);
-            SARA_08 s08; s08.decode(pdus + 80);
+            SARA_10 s10; s10.decode(pdus + 660);
+            SARA_08 s08; s08.decode(pdus + 603);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -749,8 +749,8 @@ int main()
 
         // ---------------- Cluster 58 ----------------
         case 58: {
-            SARA_10 s10; s10.decode(pdus + 80);
-            SARA_08 s08; s08.decode(pdus + 95);
+            SARA_10 s10; s10.decode(pdus + 1075);
+            SARA_08 s08; s08.decode(pdus + 838);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -760,8 +760,8 @@ int main()
 
         // ---------------- Cluster 59 ----------------
         case 59: {
-            SARA_10 s10; s10.decode(pdus + 95);
-            SARA_08 s08; s08.decode(pdus + 111);
+            SARA_10 s10; s10.decode(pdus + 943);
+            SARA_08 s08; s08.decode(pdus + 369);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -771,8 +771,8 @@ int main()
 
         // ---------------- Cluster 60 ----------------
         case 60: {
-            SARA_10 s10; s10.decode(pdus + 112);
-            SARA_08 s08; s08.decode(pdus + 118);
+            SARA_10 s10; s10.decode(pdus + 189);
+            SARA_08 s08; s08.decode(pdus + 307);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -782,8 +782,8 @@ int main()
 
         // ---------------- Cluster 61 ----------------
         case 61: {
-            SARA_10 s10; s10.decode(pdus + 118);
-            SARA_08 s08; s08.decode(pdus + 128);
+            SARA_10 s10; s10.decode(pdus + 16);
+            SARA_08 s08; s08.decode(pdus + 110);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
@@ -793,8 +793,8 @@ int main()
 
         // ---------------- Cluster 62 ----------------
         case 62: {
-            SARA_10 s10; s10.decode(pdus + 128);
-            SARA_08 s08; s08.decode(pdus + 130);
+            SARA_10 s10; s10.decode(pdus + 568);
+            SARA_08 s08; s08.decode(pdus + 698);
 
             ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
             az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
