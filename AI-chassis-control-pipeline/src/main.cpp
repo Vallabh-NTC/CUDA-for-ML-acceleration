@@ -47,6 +47,11 @@ int main()
     UdpReceiver receiver(1500);
     unsigned char buf[65536];
 
+    float ax=NAN, ay=NAN, az=NAN;
+    float ox=NAN, oy=NAN, oz=NAN;
+    float steer=NAN, steer_spd=NAN;
+    float gas=NAN, brake=NAN, v=NAN;
+
     while (true) {
         int n = receiver.receive(buf, sizeof(buf));
         if (n < 3) continue;
@@ -56,11 +61,6 @@ int main()
 
         timespec ts{};
         clock_gettime(CLOCK_REALTIME, &ts);
-
-        float ax=NAN, ay=NAN, az=NAN;
-        float ox=NAN, oy=NAN, oz=NAN;
-        float steer=NAN, steer_spd=NAN;
-        float gas=NAN, brake=NAN, v=NAN;
 
         bool has = false;
 
