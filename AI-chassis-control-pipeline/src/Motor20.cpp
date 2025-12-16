@@ -9,20 +9,17 @@
 template<typename T>
 T Motor20::extract(const unsigned char* buff, int byte, int bit, int length)
 {
-    uint32_t raw = 0;
+    uint32_t raw =
+        (buff[byte]     << 16) |
+        (buff[byte + 1] << 8 ) |
+        (buff[byte + 2]);
 
-    // Copy two bytes to ensure we cover cross-boundary bits
-    raw = (buff[byte] << 8) | buff[byte + 1];
-
-    // Shift to remove unwanted high bits
-    raw >>= (16 - bit - length);
-
-    // Mask out the lower bits
-    uint32_t mask = (1u << length) - 1u;
-    raw &= mask;
+    raw >>= (24 - bit - length);
+    raw &= ((1u << length) - 1u);
 
     return static_cast<T>(raw);
 }
+
 
 //
 // Decode Motor20 PDU
