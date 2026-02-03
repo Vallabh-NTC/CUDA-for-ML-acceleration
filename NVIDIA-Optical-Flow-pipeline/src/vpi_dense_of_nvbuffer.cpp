@@ -1,11 +1,23 @@
 // vpi_gst_of_rtp_overlay.cpp
 //
-// GStreamer PNG folder -> VPI OFA Dense Optical Flow (pyramids) -> draw arrows (no OpenCV) -> RTP/H264 UDP out
+// GStreamer PNG folder -> VPI OFA Dense Optical Flow (pyramids) -> draw arrows (no OpenCV)
+// -> RTP/H264 UDP out
 //
 // Sender: 192.168.1.100:5000 (RTP/H264)
 // Receiver example:
 // gst-launch-1.0 -v udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96" \
 //   ! rtpjitterbuffer ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+//
+// Notes:
+// - This version adds "clean-up" logic to suppress random/outlier arrows:
+//   1) Texture gate: don't draw arrows in flat/low-texture regions.
+//   2) Local consistency gate: reject vectors that differ too much from neighbors (median).
+//   3) Dynamic magnitude threshold: adapt threshold based on the current frame's flow magnitude distribution.
+//
+// Build: (example; adjust include/lib paths for your platform)
+//   g++ -O2 -std=c++17 vpi_gst_of_rtp_overlay.cpp -o ofa_rtp \
+//       `pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0` \
+//       -lvpi
 //
 
 #include <vpi/VPI.h>
@@ -28,6 +40,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <cstdint>
 
 #define CHECK_VPI(stmt)                                                         \
     do {                                                                        \
@@ -92,7 +105,7 @@ static void draw_line_rgba(uint8_t *img, int W, int H,
     }
 }
 
-// Arrow: black outline + green inside, like your OpenCV style
+// Arrow: black outline + green inside (OpenCV-like style)
 static void draw_arrow_rgba(uint8_t *img, int W, int H,
                             int x0, int y0, int x1, int y1,
                             int thickness)
@@ -129,10 +142,10 @@ static void draw_arrow_rgba(uint8_t *img, int W, int H,
     draw_line_rgba(img, W, H, x1, y1, hx2, hy2, 0,255,0, thickness);
 }
 
-// Bilinear sample flow grid (mvW x mvH) at full-res pixel x,y.
-// flowGrid contains float2 per cell (vx,vy) in pixels.
+// Flow grid contains float2 per cell (vx,vy) in pixels.
 struct F2 { float x,y; };
 
+// Bilinear sample flow grid (mvW x mvH) at flow-grid coordinate gx,gy.
 static inline F2 bilinear_flow(const F2* grid, int mvW, int mvH, float gx, float gy)
 {
     gx = std::clamp(gx, 0.0f, float(mvW - 1));
@@ -151,22 +164,140 @@ static inline F2 bilinear_flow(const F2* grid, int mvW, int mvH, float gx, float
     return F2{ ab.x + ty*(cd.x - ab.x), ab.y + ty*(cd.y - ab.y) };
 }
 
-static void draw_big_green_arrows_rgba(uint8_t *rgba, int W, int H,
-                                      const F2* flowGrid, int mvW, int mvH,
-                                      int gridStep, // OFA grid (e.g. 4)
-                                      int stepPx, float scale, float maxLenPx,
-                                      float magThreshold, int thickness)
+// ---------- Arrow clean-up helpers ----------
+
+// Compute a cheap local texture score from GRAY8 image (sum of abs gradients).
+// Higher means more texture; near 0 means flat region.
+static inline float local_texture_4n(const uint8_t* g, int W, int H, int x, int y)
 {
+    int x1 = std::min(x+1, W-1), y1 = std::min(y+1, H-1);
+    int x0 = std::max(x-1, 0),   y0 = std::max(y-1, 0);
+
+    int gx = std::abs(int(g[y*W + x1]) - int(g[y*W + x0]));
+    int gy = std::abs(int(g[y1*W + x]) - int(g[y0*W + x]));
+    return float(gx + gy); // 0..510
+}
+
+static inline bool inb(int x,int y,int W,int H)
+{
+    return (unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H;
+}
+
+// Percentile (in-place nth_element). p01 in [0..1].
+static float percentile_inplace(std::vector<float>& v, float p01)
+{
+    if (v.empty()) return 0.0f;
+    p01 = std::clamp(p01, 0.0f, 1.0f);
+    size_t k = (size_t)std::lround(p01 * float(v.size() - 1));
+    std::nth_element(v.begin(), v.begin() + (ptrdiff_t)k, v.end());
+    return v[k];
+}
+
+// Median of neighbor vectors (component-wise) using nth_element.
+static F2 median_vec_2d(std::vector<F2>& neigh)
+{
+    std::vector<float> xs, ys;
+    xs.reserve(neigh.size());
+    ys.reserve(neigh.size());
+    for (auto &v : neigh) { xs.push_back(v.x); ys.push_back(v.y); }
+
+    auto med = [](std::vector<float>& a)->float {
+        size_t k = a.size()/2;
+        std::nth_element(a.begin(), a.begin() + (ptrdiff_t)k, a.end());
+        return a[k];
+    };
+
+    return F2{ med(xs), med(ys) };
+}
+
+// Draw arrows with outlier rejection.
+// - grayForTexture: optional pointer to GRAY8 (W*H) used for texture gating (can be nullptr to disable).
+static void draw_big_green_arrows_rgba(
+    uint8_t *rgba, int W, int H,
+    const uint8_t* grayForTexture,
+    const F2* flowGrid, int mvW, int mvH,
+    int gridStep,             // OFA grid (e.g. 4)
+    int stepPx,               // arrow sampling step in pixels (e.g. 64)
+    float scale,              // arrow scale factor applied to flow
+    float maxLenPx,           // arrow length clamp (pixels)
+    float magThresholdMin,    // minimum magnitude threshold (pixels of flow)
+    int thickness,
+
+    // Clean-up knobs:
+    bool  enableDynamicThreshold,
+    float dynamicP75Factor,   // thr = max(minThr, p75 * factor)
+    bool  enableTextureGate,
+    float textureThreshold,   // 0..510, typical 10..30
+    bool  enableNeighborGate,
+    float neighborDiffThr     // in pixels of flow (before scaling), typical 1.2..2.5
+)
+{
+    // ---- optional dynamic threshold pass (compute distribution of magnitudes) ----
+    float magThr = magThresholdMin;
+
+    if (enableDynamicThreshold) {
+        std::vector<float> mags;
+        mags.reserve((size_t)(W/stepPx + 2) * (size_t)(H/stepPx + 2));
+
+        for (int y = 0; y < H; y += stepPx) {
+            for (int x = 0; x < W; x += stepPx) {
+                float gx = float(x) / float(gridStep);
+                float gy = float(y) / float(gridStep);
+                F2 f = bilinear_flow(flowGrid, mvW, mvH, gx, gy);
+                mags.push_back(std::sqrt(f.x*f.x + f.y*f.y));
+            }
+        }
+
+        float p75 = percentile_inplace(mags, 0.75f);
+        float dyn = p75 * dynamicP75Factor;
+        magThr = std::max(magThresholdMin, dyn);
+    }
+
+    // ---- main drawing loop ----
+    std::vector<F2> neigh; neigh.reserve(9);
+
     for (int y = 0; y < H; y += stepPx) {
         for (int x = 0; x < W; x += stepPx) {
-            // map pixel to flow-grid coordinate
+
+            // 1) Texture gate: reject flat regions (optional)
+            if (enableTextureGate && grayForTexture) {
+                float tex = local_texture_4n(grayForTexture, W, H, x, y);
+                if (tex < textureThreshold) continue;
+            }
+
+            // Sample flow at this location (bilinear in flow-grid coordinates)
             float gx = float(x) / float(gridStep);
             float gy = float(y) / float(gridStep);
-
             F2 f = bilinear_flow(flowGrid, mvW, mvH, gx, gy);
-            float mag = std::sqrt(f.x*f.x + f.y*f.y);
-            if (mag < magThreshold) continue;
 
+            float mag = std::sqrt(f.x*f.x + f.y*f.y);
+            if (mag < magThr) continue;
+
+            // 2) Neighbor consistency gate: reject isolated outliers (optional)
+            if (enableNeighborGate) {
+                int ix = (int)std::lround(gx);
+                int iy = (int)std::lround(gy);
+                ix = std::clamp(ix, 0, mvW-1);
+                iy = std::clamp(iy, 0, mvH-1);
+
+                neigh.clear();
+                for (int oy = -1; oy <= 1; ++oy) {
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        int nx = ix + ox, ny = iy + oy;
+                        if (inb(nx, ny, mvW, mvH)) {
+                            neigh.push_back(flowGrid[ny*mvW + nx]);
+                        }
+                    }
+                }
+
+                if (neigh.size() >= 5) { // enough samples for a stable median
+                    F2 m = median_vec_2d(neigh);
+                    float diff = std::hypot(f.x - m.x, f.y - m.y);
+                    if (diff > neighborDiffThr) continue;
+                }
+            }
+
+            // Scale and clamp arrow length
             float dx = f.x * scale;
             float dy = f.y * scale;
 
@@ -277,7 +408,6 @@ static GstElement* build_output_pipeline(const std::string &host, int port, int 
     return pipeline;
 }
 
-
 static GstSample* pull_sample(GstAppSink* appsink, int timeout_ms)
 {
     return gst_app_sink_try_pull_sample(appsink, (guint64)timeout_ms * 1000000ULL);
@@ -318,23 +448,36 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // ---- OFA/VPI knobs (like your original) ----
+    // ---- OFA/VPI knobs ----
     const int   numLevels = 4;
     const float pyrScale  = 0.5f;
     const int   grid      = 4;
 
-    // Overlay knobs (like your OpenCV settings)
+    // Overlay knobs
     const int   STEP_BIG_PX   = 64;
     const float SCALE_BIG     = 14.0f;
     const float MAXLEN_BIG    = 80.0f;
-    const float THRESH_BIG    = 0.05f;
+    const float THRESH_MIN    = 0.05f; // minimum flow magnitude (pixels) before drawing
     const int   THICKNESS_BIG = 3;
+
+    // ---- Clean-up knobs (tune these to remove "random arrows") ----
+    const bool  ENABLE_DYNAMIC_THR = true;
+    const float DYN_P75_FACTOR     = 0.6f;  // thr = max(THRESH_MIN, p75 * factor). Increase to show fewer arrows.
+
+    const bool  ENABLE_TEXTURE_GATE = true;
+    const float TEXTURE_THR         = 15.0f; // 0..510. Increase to suppress arrows in flat regions.
+
+    const bool  ENABLE_NEIGH_GATE   = true;
+    const float NEIGH_DIFF_THR      = 1.5f;  // flow pixels (before scaling). Lower = stricter outlier rejection.
 
     std::cout << "PNG(folder) -> VPI OFA Dense OF -> overlay arrows -> RTP/H264 UDP\n"
               << "Dir: " << dir << "\n"
               << "Size: " << W << "x" << H << "\n"
               << "Levels: " << numLevels << " scale=" << pyrScale << " grid=" << grid << "\n"
-              << "Send: 192.168.1.100:5000 (RTP/H264)\n";
+              << "Send: 192.168.1.100:5000 (RTP/H264)\n"
+              << "Cleanup: dynThr=" << ENABLE_DYNAMIC_THR
+              << " texGate=" << ENABLE_TEXTURE_GATE
+              << " neighGate=" << ENABLE_NEIGH_GATE << "\n";
 
     // ---- init GStreamer ----
     gst_init(&argc, &argv);
@@ -404,8 +547,7 @@ int main(int argc, char** argv)
 
     // Host buffers
     std::vector<uint8_t> prevGray, curGray, rgba;
-    std::vector<F2> flowGrid;
-    flowGrid.resize((size_t)mvW * (size_t)mvH);
+    std::vector<F2> flowGrid((size_t)mvW * (size_t)mvH);
 
     bool havePrev = false;
 
@@ -471,7 +613,8 @@ int main(int argc, char** argv)
             continue;
         }
 
-        // ---- VPI staged sync (same logic as your OpenCV version) ----
+        // ---- VPI staged sync ----
+
         upload_gray8_to_vpi(prev_y8_pl, prevGray.data(), W, H, W);
         upload_gray8_to_vpi(cur_y8_pl,  curGray.data(),  W, H, W);
 
@@ -521,14 +664,21 @@ int main(int argc, char** argv)
             }
         }
 
-        // Build RGBA frame from prevGray (like your original overlay on prev)
+        // Build RGBA frame from prevGray (overlay is drawn on previous frame)
         gray_to_rgba(rgba, prevGray, W, H);
 
-        // Draw arrows
-        draw_big_green_arrows_rgba(rgba.data(), W, H,
-                                  flowGrid.data(), mvW, mvH,
-                                  grid, STEP_BIG_PX, SCALE_BIG, MAXLEN_BIG,
-                                  THRESH_BIG, THICKNESS_BIG);
+        // Draw arrows with clean-up logic
+        draw_big_green_arrows_rgba(
+            rgba.data(), W, H,
+            prevGray.data(),
+            flowGrid.data(), mvW, mvH,
+            grid,
+            STEP_BIG_PX, SCALE_BIG, MAXLEN_BIG,
+            THRESH_MIN, THICKNESS_BIG,
+            ENABLE_DYNAMIC_THR, DYN_P75_FACTOR,
+            ENABLE_TEXTURE_GATE, TEXTURE_THR,
+            ENABLE_NEIGH_GATE, NEIGH_DIFF_THR
+        );
 
         // Push out RTP/H264 frame
         if (!push_rgba_frame(appsrc, rgba.data(), rgba.size(), pts, frameDur)) {
