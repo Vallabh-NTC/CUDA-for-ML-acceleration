@@ -1,0 +1,3 @@
+[submodule "NVIDIA_Optical_flow_sdk/optical-flow-sdk"]
+	path = NVIDIA_Optical_flow_sdk/optical-flow-sdk
+	url = https://gitlab.com/vallabh46/optical-flow-sdk.git
