@@ -1,6 +1,8 @@
 // vpi_gst_of_rtp_overlay.cpp
 //
 // GStreamer PNG folder -> VPI OFA Dense Optical Flow (pyramids) -> draw arrows (no OpenCV)
+// + draw resultant (global) motion arrow
+// + write ONE CSV for all frames (resultant_direction.csv)
 // -> RTP/H264 UDP out
 //
 // Sender: 192.168.1.100:5000 (RTP/H264)
@@ -9,10 +11,11 @@
 //   ! rtpjitterbuffer ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
 //
 // Notes:
-// - This version adds "clean-up" logic to suppress random/outlier arrows:
+// - This version includes "clean-up" logic to suppress random/outlier arrows:
 //   1) Texture gate: don't draw arrows in flat/low-texture regions.
 //   2) Local consistency gate: reject vectors that differ too much from neighbors (median).
 //   3) Dynamic magnitude threshold: adapt threshold based on the current frame's flow magnitude distribution.
+// - CSV output: ONE file containing a row per output frame: frame,angle_deg,magnitude,vx,vy,count
 //
 // Build: (example; adjust include/lib paths for your platform)
 //   g++ -O2 -std=c++17 vpi_gst_of_rtp_overlay.cpp -o ofa_rtp \
@@ -41,6 +44,13 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+
+#include <fstream>
+#include <filesystem>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define CHECK_VPI(stmt)                                                         \
     do {                                                                        \
@@ -105,16 +115,17 @@ static void draw_line_rgba(uint8_t *img, int W, int H,
     }
 }
 
-// Arrow: black outline + green inside (OpenCV-like style)
-static void draw_arrow_rgba(uint8_t *img, int W, int H,
-                            int x0, int y0, int x1, int y1,
-                            int thickness)
+// Arrow: outline + inside color (OpenCV-like style)
+static void draw_arrow_rgba_color(uint8_t *img, int W, int H,
+                                  int x0, int y0, int x1, int y1,
+                                  int thickness,
+                                  uint8_t innerR, uint8_t innerG, uint8_t innerB,
+                                  uint8_t outlineR=0, uint8_t outlineG=0, uint8_t outlineB=0)
 {
-    // main shaft outline
-    draw_line_rgba(img, W, H, x0, y0, x1, y1, 0,0,0, thickness+2);
-    draw_line_rgba(img, W, H, x0, y0, x1, y1, 0,255,0, thickness);
+    // main shaft outline then inner
+    draw_line_rgba(img, W, H, x0, y0, x1, y1, outlineR, outlineG, outlineB, thickness+2);
+    draw_line_rgba(img, W, H, x0, y0, x1, y1, innerR, innerG, innerB, thickness);
 
-    // arrow head
     float dx = float(x1 - x0);
     float dy = float(y1 - y0);
     float L = std::sqrt(dx*dx + dy*dy);
@@ -125,7 +136,6 @@ static void draw_arrow_rgba(uint8_t *img, int W, int H,
     float ang = 0.6f; // ~34 deg
     float cx = float(x1), cy = float(y1);
 
-    // rotate unit vector by +/- ang and go backwards
     float vx1 =  std::cos(ang)*ux - std::sin(ang)*uy;
     float vy1 =  std::sin(ang)*ux + std::cos(ang)*uy;
     float vx2 =  std::cos(-ang)*ux - std::sin(-ang)*uy;
@@ -136,10 +146,18 @@ static void draw_arrow_rgba(uint8_t *img, int W, int H,
     int hx2 = int(std::lround(cx - headLen * vx2));
     int hy2 = int(std::lround(cy - headLen * vy2));
 
-    draw_line_rgba(img, W, H, x1, y1, hx1, hy1, 0,0,0, thickness+2);
-    draw_line_rgba(img, W, H, x1, y1, hx2, hy2, 0,0,0, thickness+2);
-    draw_line_rgba(img, W, H, x1, y1, hx1, hy1, 0,255,0, thickness);
-    draw_line_rgba(img, W, H, x1, y1, hx2, hy2, 0,255,0, thickness);
+    draw_line_rgba(img, W, H, x1, y1, hx1, hy1, outlineR, outlineG, outlineB, thickness+2);
+    draw_line_rgba(img, W, H, x1, y1, hx2, hy2, outlineR, outlineG, outlineB, thickness+2);
+    draw_line_rgba(img, W, H, x1, y1, hx1, hy1, innerR, innerG, innerB, thickness);
+    draw_line_rgba(img, W, H, x1, y1, hx2, hy2, innerR, innerG, innerB, thickness);
+}
+
+// Backwards-compatible green arrow (used for per-cell vectors)
+static void draw_arrow_rgba(uint8_t *img, int W, int H,
+                            int x0, int y0, int x1, int y1,
+                            int thickness)
+{
+    draw_arrow_rgba_color(img, W, H, x0, y0, x1, y1, thickness, 0,255,0, 0,0,0);
 }
 
 // Flow grid contains float2 per cell (vx,vy) in pixels.
@@ -167,7 +185,6 @@ static inline F2 bilinear_flow(const F2* grid, int mvW, int mvH, float gx, float
 // ---------- Arrow clean-up helpers ----------
 
 // Compute a cheap local texture score from GRAY8 image (sum of abs gradients).
-// Higher means more texture; near 0 means flat region.
 static inline float local_texture_4n(const uint8_t* g, int W, int H, int x, int y)
 {
     int x1 = std::min(x+1, W-1), y1 = std::min(y+1, H-1);
@@ -211,7 +228,6 @@ static F2 median_vec_2d(std::vector<F2>& neigh)
 }
 
 // Draw arrows with outlier rejection.
-// - grayForTexture: optional pointer to GRAY8 (W*H) used for texture gating (can be nullptr to disable).
 static void draw_big_green_arrows_rgba(
     uint8_t *rgba, int W, int H,
     const uint8_t* grayForTexture,
@@ -259,13 +275,12 @@ static void draw_big_green_arrows_rgba(
     for (int y = 0; y < H; y += stepPx) {
         for (int x = 0; x < W; x += stepPx) {
 
-            // 1) Texture gate: reject flat regions (optional)
+            // 1) Texture gate
             if (enableTextureGate && grayForTexture) {
                 float tex = local_texture_4n(grayForTexture, W, H, x, y);
                 if (tex < textureThreshold) continue;
             }
 
-            // Sample flow at this location (bilinear in flow-grid coordinates)
             float gx = float(x) / float(gridStep);
             float gy = float(y) / float(gridStep);
             F2 f = bilinear_flow(flowGrid, mvW, mvH, gx, gy);
@@ -273,7 +288,7 @@ static void draw_big_green_arrows_rgba(
             float mag = std::sqrt(f.x*f.x + f.y*f.y);
             if (mag < magThr) continue;
 
-            // 2) Neighbor consistency gate: reject isolated outliers (optional)
+            // 2) Neighbor consistency
             if (enableNeighborGate) {
                 int ix = (int)std::lround(gx);
                 int iy = (int)std::lround(gy);
@@ -290,14 +305,13 @@ static void draw_big_green_arrows_rgba(
                     }
                 }
 
-                if (neigh.size() >= 5) { // enough samples for a stable median
+                if (neigh.size() >= 5) {
                     F2 m = median_vec_2d(neigh);
                     float diff = std::hypot(f.x - m.x, f.y - m.y);
                     if (diff > neighborDiffThr) continue;
                 }
             }
 
-            // Scale and clamp arrow length
             float dx = f.x * scale;
             float dy = f.y * scale;
 
@@ -435,13 +449,167 @@ static bool push_rgba_frame(GstAppSrc* appsrc, const uint8_t* rgba, size_t bytes
     return ret == GST_FLOW_OK;
 }
 
+// ---------------- Resultant direction (ONE CSV) + draw resultant ----------------
+
+struct ResultantFlow {
+    F2 sum;     // sum of accepted vectors
+    F2 avg;     // sum / count (0 if count==0)
+    int count;  // number of accepted samples
+};
+
+// Compute resultant flow using the same sampling and clean-up logic knobs as drawing.
+// Returns both sum and avg; direction is the same for both, but avg is easier to scale for drawing.
+static ResultantFlow compute_resultant_flow(
+    int W, int H,
+    const uint8_t* grayForTexture,
+    const F2* flowGrid, int mvW, int mvH,
+    int gridStep,
+    int stepPx,
+    float magThresholdMin,
+
+    bool  enableDynamicThreshold,
+    float dynamicP75Factor,
+    bool  enableTextureGate,
+    float textureThreshold,
+    bool  enableNeighborGate,
+    float neighborDiffThr
+)
+{
+    float magThr = magThresholdMin;
+
+    if (enableDynamicThreshold) {
+        std::vector<float> mags;
+        mags.reserve((size_t)(W/stepPx + 2) * (size_t)(H/stepPx + 2));
+
+        for (int y = 0; y < H; y += stepPx) {
+            for (int x = 0; x < W; x += stepPx) {
+                float gx = float(x) / float(gridStep);
+                float gy = float(y) / float(gridStep);
+                F2 f = bilinear_flow(flowGrid, mvW, mvH, gx, gy);
+                mags.push_back(std::sqrt(f.x*f.x + f.y*f.y));
+            }
+        }
+
+        float p75 = percentile_inplace(mags, 0.75f);
+        float dyn = p75 * dynamicP75Factor;
+        magThr = std::max(magThresholdMin, dyn);
+    }
+
+    std::vector<F2> neigh; neigh.reserve(9);
+
+    double sumX = 0.0;
+    double sumY = 0.0;
+    int count = 0;
+
+    for (int y = 0; y < H; y += stepPx) {
+        for (int x = 0; x < W; x += stepPx) {
+
+            if (enableTextureGate && grayForTexture) {
+                float tex = local_texture_4n(grayForTexture, W, H, x, y);
+                if (tex < textureThreshold) continue;
+            }
+
+            float gx = float(x) / float(gridStep);
+            float gy = float(y) / float(gridStep);
+            F2 f = bilinear_flow(flowGrid, mvW, mvH, gx, gy);
+
+            float mag = std::sqrt(f.x*f.x + f.y*f.y);
+            if (mag < magThr) continue;
+
+            if (enableNeighborGate) {
+                int ix = (int)std::lround(gx);
+                int iy = (int)std::lround(gy);
+                ix = std::clamp(ix, 0, mvW-1);
+                iy = std::clamp(iy, 0, mvH-1);
+
+                neigh.clear();
+                for (int oy = -1; oy <= 1; ++oy) {
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        int nx = ix + ox, ny = iy + oy;
+                        if (inb(nx, ny, mvW, mvH)) {
+                            neigh.push_back(flowGrid[ny*mvW + nx]);
+                        }
+                    }
+                }
+
+                if (neigh.size() >= 5) {
+                    F2 m = median_vec_2d(neigh);
+                    float diff = std::hypot(f.x - m.x, f.y - m.y);
+                    if (diff > neighborDiffThr) continue;
+                }
+            }
+
+            sumX += (double)f.x;
+            sumY += (double)f.y;
+            count++;
+        }
+    }
+
+    ResultantFlow rf{};
+    rf.sum = F2{ (float)sumX, (float)sumY };
+    rf.count = count;
+    if (count > 0) {
+        rf.avg = F2{ (float)(sumX / (double)count), (float)(sumY / (double)count) };
+    } else {
+        rf.avg = F2{0,0};
+    }
+    return rf;
+}
+
+static void append_resultant_csv_row(std::ofstream& ofs, int frameIndex, const ResultantFlow& rf)
+{
+    float vx = rf.avg.x;
+    float vy = rf.avg.y;
+    float mag = std::hypot(vx, vy);
+
+    float angDeg = 0.0f;
+    if (mag > 1e-6f) {
+        angDeg = std::atan2(vy, vx) * 180.0f / float(M_PI);
+    }
+
+    // frame,angle_deg,magnitude,vx,vy,count
+    ofs << frameIndex << ","
+        << angDeg << ","
+        << mag << ","
+        << vx << ","
+        << vy << ","
+        << rf.count
+        << "\n";
+}
+
+static void draw_resultant_arrow_on_frame(uint8_t* rgba, int W, int H,
+                                         const F2& avgVec,
+                                         float scalePxPerFlow, float maxLenPx,
+                                         int thickness)
+{
+    int cx = W / 2;
+    int cy = H / 2;
+
+    float dx = avgVec.x * scalePxPerFlow;
+    float dy = avgVec.y * scalePxPerFlow;
+
+    float L = std::sqrt(dx*dx + dy*dy);
+    if (L < 1e-4f) return;
+
+    if (L > maxLenPx) {
+        float s = maxLenPx / L;
+        dx *= s; dy *= s;
+    }
+
+    int x1 = (int)std::lround((float)cx + dx);
+    int y1 = (int)std::lround((float)cy + dy);
+
+    // Draw resultant in RED with black outline (stands out from green grid arrows)
+    draw_arrow_rgba_color(rgba, W, H, cx, cy, x1, y1, thickness, 255,0,0, 0,0,0);
+}
+
 int main(int argc, char** argv)
 {
     std::string dir = (argc >= 2) ? argv[1] : "/path/to/images";
     int W = (argc >= 4) ? std::atoi(argv[2]) : 2560;
     int H = (argc >= 4) ? std::atoi(argv[3]) : 720;
 
-    // Quick sanity check for first file (helps avoid confusing multifilesrc errors)
+    // Quick sanity check for first file
     std::string first = dir + "/frame_000000.png";
     if (!file_exists(first)) {
         std::cerr << "Missing first frame: " << first << "\n";
@@ -453,24 +621,29 @@ int main(int argc, char** argv)
     const float pyrScale  = 0.5f;
     const int   grid      = 4;
 
-    // Overlay knobs
+    // Overlay knobs (per-cell arrows)
     const int   STEP_BIG_PX   = 64;
     const float SCALE_BIG     = 14.0f;
     const float MAXLEN_BIG    = 80.0f;
-    const float THRESH_MIN    = 0.05f; // minimum flow magnitude (pixels) before drawing
+    const float THRESH_MIN    = 0.05f;
     const int   THICKNESS_BIG = 3;
 
-    // ---- Clean-up knobs (tune these to remove "random arrows") ----
+    // Resultant arrow knobs (global arrow)
+    const float SCALE_RESULTANT = 120.0f; // px per (avg flow pixel). Tune to taste.
+    const float MAXLEN_RESULTANT = 160.0f;
+    const int   THICKNESS_RESULTANT = 5;
+
+    // ---- Clean-up knobs ----
     const bool  ENABLE_DYNAMIC_THR = true;
-    const float DYN_P75_FACTOR     = 0.6f;  // thr = max(THRESH_MIN, p75 * factor). Increase to show fewer arrows.
+    const float DYN_P75_FACTOR     = 0.6f;
 
     const bool  ENABLE_TEXTURE_GATE = true;
-    const float TEXTURE_THR         = 15.0f; // 0..510. Increase to suppress arrows in flat regions.
+    const float TEXTURE_THR         = 15.0f;
 
     const bool  ENABLE_NEIGH_GATE   = true;
-    const float NEIGH_DIFF_THR      = 1.5f;  // flow pixels (before scaling). Lower = stricter outlier rejection.
+    const float NEIGH_DIFF_THR      = 1.5f;
 
-    std::cout << "PNG(folder) -> VPI OFA Dense OF -> overlay arrows -> RTP/H264 UDP\n"
+    std::cout << "PNG(folder) -> VPI OFA Dense OF -> overlay arrows + resultant -> RTP/H264 UDP\n"
               << "Dir: " << dir << "\n"
               << "Size: " << W << "x" << H << "\n"
               << "Levels: " << numLevels << " scale=" << pyrScale << " grid=" << grid << "\n"
@@ -551,10 +724,28 @@ int main(int argc, char** argv)
 
     bool havePrev = false;
 
-    // Timing for RTP (30 fps from pipeline caps); we push one per input sample
+    // Timing for RTP (30 fps)
     const int fpsN = 30, fpsD = 1;
     GstClockTime frameDur = gst_util_uint64_scale_int(GST_SECOND, fpsD, fpsN);
     GstClockTime pts = 0;
+
+    // CSV: ONE file for all frames (relative to where you run the program)
+    namespace fs = std::filesystem;
+    const std::string csvOutDir = "csv_out";
+    std::error_code ec;
+    fs::create_directories(csvOutDir, ec);
+
+    const std::string csvPath = (fs::path(csvOutDir) / "resultant_direction.csv").string();
+    std::ofstream csv(csvPath, std::ios::out | std::ios::trunc);
+    if (csv) {
+        csv << "frame,angle_deg,magnitude,vx,vy,count\n";
+        csv.flush();
+        std::cout << "CSV output: " << csvPath << "\n";
+    } else {
+        std::cerr << "WARNING: Could not open CSV file for writing: " << csvPath << "\n";
+    }
+
+    int prevFrameIndex = 0;
 
     auto check_bus_errors = [&](GstBus* bus, const char* name)->bool {
         while (true) {
@@ -610,11 +801,11 @@ int main(int argc, char** argv)
         if (!havePrev) {
             prevGray = curGray;
             havePrev = true;
+            prevFrameIndex = 0;
             continue;
         }
 
         // ---- VPI staged sync ----
-
         upload_gray8_to_vpi(prev_y8_pl, prevGray.data(), W, H, W);
         upload_gray8_to_vpi(cur_y8_pl,  curGray.data(),  W, H, W);
 
@@ -664,10 +855,30 @@ int main(int argc, char** argv)
             }
         }
 
-        // Build RGBA frame from prevGray (overlay is drawn on previous frame)
+        // Compute resultant flow (avg) using same gating logic as arrows
+        ResultantFlow rf = compute_resultant_flow(
+            W, H,
+            prevGray.data(),
+            flowGrid.data(), mvW, mvH,
+            grid,
+            STEP_BIG_PX,
+            THRESH_MIN,
+            ENABLE_DYNAMIC_THR, DYN_P75_FACTOR,
+            ENABLE_TEXTURE_GATE, TEXTURE_THR,
+            ENABLE_NEIGH_GATE, NEIGH_DIFF_THR
+        );
+
+        // Append CSV row (ONE file)
+        if (csv) {
+            append_resultant_csv_row(csv, prevFrameIndex, rf);
+            // optional: flush periodically (costs IO). Uncomment if you want real-time file updates.
+            // if ((prevFrameIndex % 30) == 0) csv.flush();
+        }
+
+        // Build RGBA frame from prevGray (overlay drawn on previous frame)
         gray_to_rgba(rgba, prevGray, W, H);
 
-        // Draw arrows with clean-up logic
+        // Draw per-cell arrows with clean-up logic
         draw_big_green_arrows_rgba(
             rgba.data(), W, H,
             prevGray.data(),
@@ -680,6 +891,11 @@ int main(int argc, char** argv)
             ENABLE_NEIGH_GATE, NEIGH_DIFF_THR
         );
 
+        // Draw resultant arrow from the center of the frame (RED)
+        draw_resultant_arrow_on_frame(rgba.data(), W, H, rf.avg,
+                                      SCALE_RESULTANT, MAXLEN_RESULTANT,
+                                      THICKNESS_RESULTANT);
+
         // Push out RTP/H264 frame
         if (!push_rgba_frame(appsrc, rgba.data(), rgba.size(), pts, frameDur)) {
             std::cerr << "Failed to push buffer to appsrc\n";
@@ -689,12 +905,19 @@ int main(int argc, char** argv)
 
         // Advance frames
         prevGray.swap(curGray);
+        prevFrameIndex += 1;
     }
 
     // Tell appsrc end-of-stream
     gst_app_src_end_of_stream(appsrc);
 
     CHECK_VPI(vpiStreamSync(stream));
+
+    // Close CSV
+    if (csv) {
+        csv.flush();
+        csv.close();
+    }
 
     // Cleanup GStreamer
     gst_element_set_state(inPipe,  GST_STATE_NULL);
