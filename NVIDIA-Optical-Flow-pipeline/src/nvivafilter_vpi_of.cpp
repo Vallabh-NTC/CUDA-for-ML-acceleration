@@ -11,12 +11,6 @@
 // - DO NOT wrap EGLImage into VPI on nvbuf-mem-surface-array pipelines.
 // - Some pipelines keep the NVMM container locked exclusively during the callback.
 // - Use CUDA-EGL to copy NV12 Y plane into a CUDA-backed VPI image, then operate only on VPI-owned buffers.
-//
-// Debug additions:
-// - Optional MV stats + top-K spike print from mv_cpu
-//   Enable with env: VPI_OF_MV_PRINT=1
-//   Control cadence: VPI_OF_MV_PRINT_EVERY_N (default: VPI_OF_PRINT_EVERY_N)
-//   Control topK:   VPI_OF_MV_PRINT_TOPK (default: 8)
 
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +90,133 @@ static bool get_size_from_env(int &W, int &H)
     return (W > 0 && H > 0);
 }
 
+// ----------------------------- MV stats helpers -----------------------------
+
+struct MVStats
+{
+    int samples = 0;
+    float p50 = 0.0f;
+    float p90 = 0.0f;
+    float p99 = 0.0f;
+    float maxv = 0.0f;
+    float mean = 0.0f;
+    float stdv = 0.0f;
+};
+
+// Compute percentile via nth_element (no full sort)
+static float percentile_inplace(std::vector<float> &v, float q01)
+{
+    if (v.empty()) return 0.0f;
+    q01 = std::clamp(q01, 0.0f, 1.0f);
+    size_t k = (size_t)std::llround((v.size() - 1) * q01);
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k];
+}
+
+struct MVTop
+{
+    float mag;
+    float dx, dy;
+    int mx, my;
+};
+
+static MVStats compute_mv_stats_and_topk(
+    VPIImage mv_cpu,
+    int mvW, int mvH,
+    int x0, int x1, int y0, int y1,
+    int step,
+    int topK,
+    std::vector<MVTop> &top)
+{
+    MVStats st;
+    top.clear();
+    top.reserve((size_t)topK);
+
+    VPIImageData data;
+    std::memset(&data, 0, sizeof(data));
+    CHECK_VPI(vpiImageLockData(mv_cpu, VPI_LOCK_READ,
+                              VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &data));
+
+    const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
+    const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
+
+    std::vector<float> mags;
+    mags.reserve((size_t)((((x1-x0)+step-1)/step) * (((y1-y0)+step-1)/step)));
+
+    double sum = 0.0;
+    double sum2 = 0.0;
+    float maxv = 0.0f;
+
+    auto top_push = [&](float mag, float dx, float dy, int mx, int my) {
+        if ((int)top.size() < topK) {
+            top.push_back({mag, dx, dy, mx, my});
+            if ((int)top.size() == topK) {
+                std::sort(top.begin(), top.end(),
+                          [](const MVTop &a, const MVTop &b){ return a.mag > b.mag; });
+            }
+            return;
+        }
+        if (mag <= top.back().mag) return;
+        top.back() = {mag, dx, dy, mx, my};
+        // bubble down
+        for (int i = topK - 1; i > 0; --i) {
+            if (top[i].mag > top[i-1].mag) std::swap(top[i], top[i-1]);
+            else break;
+        }
+    };
+
+    for (int my = y0; my < y1; my += step) {
+        const int16_t *row = (const int16_t *)(base + my * pitch);
+        for (int mx = x0; mx < x1; mx += step) {
+            int16_t fx = row[mx * 2 + 0];
+            int16_t fy = row[mx * 2 + 1];
+            float dx = s10_5_to_px(fx);
+            float dy = s10_5_to_px(fy);
+            float mag = std::hypot(dx, dy);
+
+            mags.push_back(mag);
+            st.samples++;
+
+            sum  += mag;
+            sum2 += (double)mag * (double)mag;
+            maxv = std::max(maxv, mag);
+
+            top_push(mag, dx, dy, mx, my);
+        }
+    }
+
+    CHECK_VPI(vpiImageUnlock(mv_cpu));
+
+    st.maxv = maxv;
+    if (st.samples > 0) {
+        st.mean = (float)(sum / (double)st.samples);
+        double var = (sum2 / (double)st.samples) - ((sum / (double)st.samples) * (sum / (double)st.samples));
+        st.stdv = (float)std::sqrt(std::max(0.0, var));
+        // percentiles
+        st.p50 = percentile_inplace(mags, 0.50f);
+        st.p90 = percentile_inplace(mags, 0.90f);
+        st.p99 = percentile_inplace(mags, 0.99f);
+    }
+    return st;
+}
+
+static bool is_bad_frame_spike(const MVStats &s, float ratio, float minAbs)
+{
+    // Spike-based rule:
+    // - We allow any global motion magnitude, we only reject frames where
+    //   the tail explodes relative to the median/upper quantiles.
+    // - minAbs prevents tiny-noise cases from triggering on ratios.
+    if (s.samples <= 0) return false;
+
+    float p50 = std::max(1e-6f, s.p50);
+    float p90 = std::max(1e-6f, s.p90);
+
+    bool spike_tail = (s.p99 > p50 * ratio) || (s.maxv > p90 * ratio);
+    bool strong_enough = (s.maxv >= minAbs);
+
+    return spike_tail && strong_enough;
+}
+
 // ----------------------------- State -----------------------------
 
 struct State
@@ -141,10 +262,13 @@ struct State
     uint8_t overlayColorY = 235;
     int overlayMaxArrows = 4096;
 
-    // MV debug printing
+    // MV debug / filtering
     bool mvPrintEnabled = false;
-    uint32_t mvPrintEveryNFrames = 30;
-    int mvPrintTopK = 8;
+    uint32_t mvPrintEveryN = 30;
+    int mvTopK = 8;
+
+    float badRatio = 3.0f;    // tail ratio threshold
+    float badMinAbs = 60.0f;  // minimum absolute max to consider a spike "real"
 
     bool warnedMissingCaps = false;
 };
@@ -164,15 +288,19 @@ static void init_vpi_if_needed(State *st, int W, int H)
     st->W = W; st->H = H;
 
     st->printEveryNFrames = (uint32_t)std::max(1, get_env_int("VPI_OF_PRINT_EVERY_N", 30));
+
     st->overlayEnabled    = (get_env_int("VPI_OF_OVERLAY", 1) != 0);
     st->overlayStep       = std::max(1, get_env_int("VPI_OF_OVERLAY_STEP", 12));
     st->overlayScale      = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", 3.5f));
     st->overlayColorY     = (uint8_t)std::clamp(get_env_int("VPI_OF_OVERLAY_COLOR_Y", 235), 0, 255);
     st->overlayMaxArrows  = std::max(128, get_env_int("VPI_OF_OVERLAY_MAX_ARROWS", 4096));
 
-    st->mvPrintEnabled      = (get_env_int("VPI_OF_MV_PRINT", 0) != 0);
-    st->mvPrintEveryNFrames = (uint32_t)std::max(1, get_env_int("VPI_OF_MV_PRINT_EVERY_N", (int)st->printEveryNFrames));
-    st->mvPrintTopK         = std::max(1, get_env_int("VPI_OF_MV_PRINT_TOPK", 8));
+    st->mvPrintEnabled = (get_env_int("VPI_OF_MVPRINT", 0) != 0);
+    st->mvPrintEveryN  = (uint32_t)std::max(1, get_env_int("VPI_OF_MVPRINT_EVERY_N", (int)st->printEveryNFrames));
+    st->mvTopK         = std::max(1, get_env_int("VPI_OF_MVPRINT_TOPK", 8));
+
+    st->badRatio  = std::max(1.2f, get_env_float("VPI_OF_BAD_RATIO", 3.0f));
+    st->badMinAbs = std::max(0.0f, get_env_float("VPI_OF_BAD_MIN_ABS", 60.0f));
 
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
@@ -234,8 +362,10 @@ static void init_vpi_if_needed(State *st, int W, int H)
             st->printEveryNFrames, st->overlayEnabled ? 1 : 0, st->overlayStep,
             st->overlayScale, (unsigned)st->overlayColorY, st->overlayMaxArrows);
 
-    fprintf(stderr, "[vpi_of] mvPrint: enabled=%d everyN=%u topK=%d\n",
-            st->mvPrintEnabled ? 1 : 0, st->mvPrintEveryNFrames, st->mvPrintTopK);
+    fprintf(stderr,
+            "[vpi_of] mvPrint: enabled=%d everyN=%u topK=%d badRatio=%.2f badMinAbs=%.1f\n",
+            st->mvPrintEnabled ? 1 : 0, st->mvPrintEveryN, st->mvTopK,
+            st->badRatio, st->badMinAbs);
 }
 
 static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
@@ -255,6 +385,7 @@ static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
     const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
     const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
 
+    // center ROI
     int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
     int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
 
@@ -295,125 +426,6 @@ static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
     return (int)arrows.size();
 }
 
-// ----------------------------- MV Debug Print -----------------------------
-// Prints robust stats + top-K largest vectors within overlay ROI.
-
-struct MVTop
-{
-    float mag;
-    int mx, my;
-    float dx, dy;
-};
-
-static void mv_debug_print(State *st)
-{
-    if (!st->mvPrintEnabled) return;
-    if (st->frameCount == 0) return;
-    if ((st->frameCount % st->mvPrintEveryNFrames) != 0) return;
-
-    const int mvW = (st->W + st->grid - 1) / st->grid;
-    const int mvH = (st->H + st->grid - 1) / st->grid;
-
-    VPIImageData data;
-    std::memset(&data, 0, sizeof(data));
-
-    CHECK_VPI(vpiImageLockData(st->mv_cpu, VPI_LOCK_READ,
-                              VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &data));
-
-    const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
-    const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
-
-    int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
-    int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
-
-    const int step = std::max(1, st->overlayStep);
-
-    double sumMag = 0.0, sumMag2 = 0.0;
-    int count = 0;
-    float minMag = 1e9f, maxMag = 0.0f;
-
-    std::vector<float> mags;
-    mags.reserve(4096);
-
-    std::vector<MVTop> top;
-    top.reserve((size_t)st->mvPrintTopK);
-
-    auto push_topk = [&](float mag, int mx, int my, float dx, float dy) {
-        MVTop t{mag, mx, my, dx, dy};
-        if ((int)top.size() < st->mvPrintTopK) { top.push_back(t); return; }
-        int imin = 0;
-        float mmin = top[0].mag;
-        for (int i = 1; i < (int)top.size(); ++i) {
-            if (top[i].mag < mmin) { mmin = top[i].mag; imin = i; }
-        }
-        if (mag > mmin) top[imin] = t;
-    };
-
-    for (int my = y0; my < y1; my += step) {
-        const int16_t *row = (const int16_t *)(base + my * pitch);
-        for (int mx = x0; mx < x1; mx += step) {
-            int16_t fx = row[mx * 2 + 0];
-            int16_t fy = row[mx * 2 + 1];
-
-            float dx = s10_5_to_px(fx);
-            float dy = s10_5_to_px(fy);
-
-            float mag = std::sqrt(dx*dx + dy*dy);
-            if (mag < 0.05f) continue;
-
-            sumMag += mag;
-            sumMag2 += (double)mag * (double)mag;
-            count++;
-
-            minMag = std::min(minMag, mag);
-            maxMag = std::max(maxMag, mag);
-
-            if ((int)mags.size() < 4096) mags.push_back(mag);
-
-            push_topk(mag, mx, my, dx, dy);
-        }
-    }
-
-    std::sort(top.begin(), top.end(), [](const MVTop &a, const MVTop &b){ return a.mag > b.mag; });
-
-    float mean = 0.f, stdev = 0.f;
-    float p50 = 0.f, p90 = 0.f, p99 = 0.f;
-
-    if (count > 0) {
-        mean = (float)(sumMag / (double)count);
-        double var = (sumMag2 / (double)count) - (double)mean * (double)mean;
-        if (var < 0.0) var = 0.0;
-        stdev = (float)std::sqrt(var);
-    }
-
-    if (!mags.empty()) {
-        auto getp = [&](float q)->float {
-            size_t idx = (size_t)std::clamp((int)std::floor(q * (mags.size() - 1)), 0, (int)mags.size() - 1);
-            std::nth_element(mags.begin(), mags.begin() + idx, mags.end());
-            return mags[idx];
-        };
-        p50 = getp(0.50f);
-        p90 = getp(0.90f);
-        p99 = getp(0.99f);
-    }
-
-    fprintf(stderr,
-            "[vpi_of][mv] frame=%llu samples=%d mag(min/mean/std/p50/p90/p99/max)=%.3f/%.3f/%.3f/%.3f/%.3f/%.3f/%.3f\n",
-            (unsigned long long)st->frameCount, count,
-            (count > 0 ? minMag : 0.f), mean, stdev, p50, p90, p99, (count > 0 ? maxMag : 0.f));
-
-    for (int i = 0; i < (int)top.size(); ++i) {
-        const MVTop &t = top[i];
-        int px = t.mx * st->grid;
-        int py = t.my * st->grid;
-        fprintf(stderr,
-                "[vpi_of][mv]  top[%d] mag=%.3f dx=%.3f dy=%.3f mv=(%d,%d) px=(%d,%d)\n",
-                i, t.mag, t.dx, t.dy, t.mx, t.my, px, py);
-    }
-
-    CHECK_VPI(vpiImageUnlock(st->mv_cpu));
-}
-
 static void gpu_process(EGLImageKHR image, void **userPtr)
 {
     State *st = get_or_create_state(userPtr);
@@ -436,14 +448,15 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     init_vpi_if_needed(st, W, H);
 
-    // Ingest: copy NV12 Y from EGLImage -> cur_y8_pl (CUDA pitch)
+    // --------------------------------------------------------------------
+    // Ingest path: copy NV12 luma (Y) from EGLImage -> cur_y8_pl (CUDA memory)
+    // --------------------------------------------------------------------
     VPIImageData ydata;
     std::memset(&ydata, 0, sizeof(ydata));
 
     CHECK_VPI(vpiImageLockData(st->cur_y8_pl, VPI_LOCK_WRITE,
                               VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &ydata));
 
-    // NOTE: Field names may vary by VPI minor version.
     uint8_t *dstY = (uint8_t*)ydata.buffer.pitch.planes[0].data;
     int dstPitch  = (int)ydata.buffer.pitch.planes[0].pitchBytes;
 
@@ -451,6 +464,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     CHECK_VPI(vpiImageUnlock(st->cur_y8_pl));
 
+    // First frame: seed prev and return
     if (!st->havePrev) {
         std::swap(st->prev_y8_pl, st->cur_y8_pl);
         st->havePrev = true;
@@ -485,22 +499,64 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     st->frameCount++;
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    const bool doPrint = (st->printEveryNFrames > 0) && ((st->frameCount % st->printEveryNFrames) == 0);
-    const bool needMVcpu = st->overlayEnabled || doPrint || st->mvPrintEnabled;
+    const bool doFpsPrint = (st->printEveryNFrames > 0) && ((st->frameCount % st->printEveryNFrames) == 0);
+    const bool doMvPrint  = st->mvPrintEnabled && ((st->frameCount % st->mvPrintEveryN) == 0);
+    const bool needMVcpu  = st->overlayEnabled || doMvPrint;
 
-    // Phase D (VIC + CPU): mv conversion to CPU-readable
     if (needMVcpu) {
         CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
                                              st->mv_bl, st->mv_vic_pl, nullptr));
         CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_CPU,
                                              st->mv_vic_pl, st->mv_cpu, nullptr));
         CHECK_VPI(vpiStreamSync(st->stream));
-
-        // Optional MV debug printing (stats + top-K spikes)
-        mv_debug_print(st);
     }
 
-    // Overlay
+    bool badFrame = false;
+
+    if (needMVcpu) {
+        const int mvW = (W + st->grid - 1) / st->grid;
+        const int mvH = (H + st->grid - 1) / st->grid;
+
+        int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
+        int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
+
+        std::vector<MVTop> top;
+        MVStats s = compute_mv_stats_and_topk(
+            st->mv_cpu, mvW, mvH,
+            x0, x1, y0, y1,
+            st->overlayStep, st->mvTopK, top);
+
+        badFrame = is_bad_frame_spike(s, st->badRatio, st->badMinAbs);
+
+        if (doMvPrint || badFrame) {
+            fprintf(stderr,
+                    "[vpi_of][mv] frame=%llu samples=%d p50=%.3f p90=%.3f p99=%.3f max=%.3f mean=%.3f std=%.3f\n",
+                    (unsigned long long)st->frameCount,
+                    s.samples, s.p50, s.p90, s.p99, s.maxv, s.mean, s.stdv);
+
+            for (int i = 0; i < (int)top.size(); ++i) {
+                const auto &t = top[i];
+                int px = t.mx * st->grid;
+                int py = t.my * st->grid;
+                fprintf(stderr,
+                        "[vpi_of][mv]  top[%d] mag=%.3f dx=%.3f dy=%.3f mv=(%d,%d) px=(%d,%d)\n",
+                        i, t.mag, t.dx, t.dy, t.mx, t.my, px, py);
+            }
+        }
+
+        if (badFrame) {
+            fprintf(stderr,
+                    "[vpi_of][mv] BAD frame (spike): p50=%.3f p90=%.3f p99=%.3f max=%.3f ratio=%.2f minAbs=%.1f -> skip overlay, reseed prev\n",
+                    s.p50, s.p90, s.p99, s.maxv, st->badRatio, st->badMinAbs);
+
+            // Re-seed: prev <- cur, and return without overlay.
+            std::swap(st->prev_y8_pl, st->cur_y8_pl);
+            st->havePrev = true;
+            return;
+        }
+    }
+
+    // Overlay (only if not bad frame)
     if (st->overlayEnabled) {
         std::vector<Arrow> arrows;
         int n = build_arrow_list_cpu(st, arrows);
@@ -515,7 +571,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         st->timersInit = true;
     }
 
-    if (doPrint) {
+    if (doFpsPrint) {
         auto now = std::chrono::steady_clock::now();
         double secFromStart = std::chrono::duration<double>(now - st->t0).count();
         double secFromLast  = std::chrono::duration<double>(now - st->tLast).count();
@@ -526,6 +582,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         st->tLast = now;
     }
 
+    // Normal advance
     std::swap(st->prev_y8_pl, st->cur_y8_pl);
 }
 
