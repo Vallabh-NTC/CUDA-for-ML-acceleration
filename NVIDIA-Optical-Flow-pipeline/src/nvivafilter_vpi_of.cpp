@@ -17,10 +17,6 @@
 //   Enable with env: VPI_OF_MV_PRINT=1
 //   Control cadence: VPI_OF_MV_PRINT_EVERY_N (default: VPI_OF_PRINT_EVERY_N)
 //   Control topK:   VPI_OF_MV_PRINT_TOPK (default: 8)
-//
-// Robust overlay fix:
-// - Detect "bad MV frames" (scene-cut / glitch) when typical motion explodes.
-// - On bad frames: skip overlay + reset prev buffer to recover immediately.
 
 #include <cstdio>
 #include <cstdlib>
@@ -149,10 +145,6 @@ struct State
     bool mvPrintEnabled = false;
     uint32_t mvPrintEveryNFrames = 30;
     int mvPrintTopK = 8;
-
-    // MV sanity / scene-cut handling
-    float lastP50 = 0.0f;
-    bool  lastP50Valid = false;
 
     bool warnedMissingCaps = false;
 };
@@ -304,6 +296,7 @@ static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
 }
 
 // ----------------------------- MV Debug Print -----------------------------
+// Prints robust stats + top-K largest vectors within overlay ROI.
 
 struct MVTop
 {
@@ -421,95 +414,6 @@ static void mv_debug_print(State *st)
     CHECK_VPI(vpiImageUnlock(st->mv_cpu));
 }
 
-// ----------------------------- MV Sanity Gate -----------------------------
-
-struct MVStats
-{
-    int   samples = 0;
-    float p50 = 0.f;
-    float p90 = 0.f;
-    float p99 = 0.f;
-    float maxv = 0.f;
-};
-
-static MVStats mv_compute_stats(State *st)
-{
-    MVStats s;
-
-    const int mvW = (st->W + st->grid - 1) / st->grid;
-    const int mvH = (st->H + st->grid - 1) / st->grid;
-
-    VPIImageData data;
-    std::memset(&data, 0, sizeof(data));
-
-    CHECK_VPI(vpiImageLockData(st->mv_cpu, VPI_LOCK_READ,
-                              VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &data));
-
-    const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
-    const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
-
-    int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
-    int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
-
-    const int step = std::max(1, st->overlayStep);
-
-    std::vector<float> mags;
-    mags.reserve(4096);
-
-    float maxMag = 0.f;
-
-    for (int my = y0; my < y1; my += step) {
-        const int16_t *row = (const int16_t *)(base + my * pitch);
-        for (int mx = x0; mx < x1; mx += step) {
-            int16_t fx = row[mx * 2 + 0];
-            int16_t fy = row[mx * 2 + 1];
-
-            float dx = s10_5_to_px(fx);
-            float dy = s10_5_to_px(fy);
-
-            float mag = std::sqrt(dx*dx + dy*dy);
-            if (mag < 0.05f) continue;
-            mags.push_back(mag);
-            if (mag > maxMag) maxMag = mag;
-
-            if ((int)mags.size() >= 4096) break;
-        }
-        if ((int)mags.size() >= 4096) break;
-    }
-
-    s.samples = (int)mags.size();
-    s.maxv = maxMag;
-
-    auto getp = [&](float q)->float {
-        if (mags.empty()) return 0.f;
-        size_t idx = (size_t)std::clamp((int)std::floor(q * (mags.size() - 1)), 0, (int)mags.size() - 1);
-        std::nth_element(mags.begin(), mags.begin() + idx, mags.end());
-        return mags[idx];
-    };
-
-    s.p50 = getp(0.50f);
-    s.p90 = getp(0.90f);
-    s.p99 = getp(0.99f);
-
-    CHECK_VPI(vpiImageUnlock(st->mv_cpu));
-    return s;
-}
-
-static bool mv_is_bad_frame(State *st, const MVStats &ms)
-{
-    if (ms.samples < 50) return true;
-
-    // Absolute sanity: if typical motion is enormous -> discard.
-    if (ms.p50 > 20.0f) return true;
-
-    // Relative jump sanity: sudden jump vs previous frame.
-    if (st->lastP50Valid) {
-        float prev = std::max(0.05f, st->lastP50);
-        if (ms.p50 > prev * 6.0f && ms.p50 > 4.0f) return true;
-    }
-    return false;
-}
-
 static void gpu_process(EGLImageKHR image, void **userPtr)
 {
     State *st = get_or_create_state(userPtr);
@@ -539,6 +443,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     CHECK_VPI(vpiImageLockData(st->cur_y8_pl, VPI_LOCK_WRITE,
                               VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &ydata));
 
+    // NOTE: Field names may vary by VPI minor version.
     uint8_t *dstY = (uint8_t*)ydata.buffer.pitch.planes[0].data;
     int dstPitch  = (int)ydata.buffer.pitch.planes[0].pitchBytes;
 
@@ -583,6 +488,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     const bool doPrint = (st->printEveryNFrames > 0) && ((st->frameCount % st->printEveryNFrames) == 0);
     const bool needMVcpu = st->overlayEnabled || doPrint || st->mvPrintEnabled;
 
+    // Phase D (VIC + CPU): mv conversion to CPU-readable
     if (needMVcpu) {
         CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
                                              st->mv_bl, st->mv_vic_pl, nullptr));
@@ -590,25 +496,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                                              st->mv_vic_pl, st->mv_cpu, nullptr));
         CHECK_VPI(vpiStreamSync(st->stream));
 
-        // Debug print (optional)
+        // Optional MV debug printing (stats + top-K spikes)
         mv_debug_print(st);
-
-        // Sanity gate: detect broken MV segments and reset history
-        MVStats ms = mv_compute_stats(st);
-        bool bad = mv_is_bad_frame(st, ms);
-
-        st->lastP50 = ms.p50;
-        st->lastP50Valid = true;
-
-        if (bad) {
-            fprintf(stderr, "[vpi_of][mv] BAD frame detected (p50=%.3f p99=%.3f max=%.3f) -> skip overlay + reset prev\n",
-                    ms.p50, ms.p99, ms.maxv);
-
-            std::swap(st->prev_y8_pl, st->cur_y8_pl);
-            return;
-        }
     }
 
+    // Overlay
     if (st->overlayEnabled) {
         std::vector<Arrow> arrows;
         int n = build_arrow_list_cpu(st, arrows);
