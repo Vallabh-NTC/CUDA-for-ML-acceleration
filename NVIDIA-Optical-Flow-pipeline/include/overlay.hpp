@@ -1,8 +1,7 @@
 #pragma once
 #include <cstdint>
 
-// NVCC spesso non vede EGLImageKHR se non includi EGL headers.
-// Per evitare include pesanti in .cu, facciamo forward typedef.
+// Forward typedef to avoid pulling EGL headers in CUDA TU headers.
 typedef void* EGLImageKHR;
 
 struct Arrow
@@ -14,16 +13,17 @@ struct Arrow
 extern "C" {
 #endif
 
-// Draws arrows on NV12 luma (Y) plane in-place on the EGLImage.
+// Draw arrows on NV12 in-place via CUDA-EGL interop.
+// Color is specified as NV12 luma/chroma (Y,U,V).
 // - eglImage: EGLImageKHR from nvivafilter callback
 // - W,H: frame size
 // - arrows: CPU array
 // - n: number of arrows
-// - colorY: luma value (0..255)
+// - Y,U,V: desired arrow color in YUV (NV12)
 void overlay_draw_arrows_nv12(EGLImageKHR eglImage,
                               int W, int H,
                               const Arrow *arrows, int n,
-                              uint8_t colorY);
+                              uint8_t Y, uint8_t U, uint8_t V);
 
 #ifdef __cplusplus
 }

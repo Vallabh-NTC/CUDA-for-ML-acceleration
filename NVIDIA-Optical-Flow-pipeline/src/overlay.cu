@@ -1,6 +1,7 @@
 // overlay.cu
 // CUDA overlay on NV12 EGLImage (Jetson NVMM surface-array friendly)
-// Draws RED arrows by writing both Y and UV planes.
+// Draws arrows by writing both Y and UV planes.
+// Color is passed as YUV parameters (NV12).
 // No printf, no device-side logging.
 
 #include <cstdint>
@@ -12,11 +13,6 @@
 
 #include "overlay.hpp"
 
-// ----------------- Color (approx BT.709 red) -----------------
-static constexpr uint8_t kRedY = 76;
-static constexpr uint8_t kRedU = 85;
-static constexpr uint8_t kRedV = 255;
-
 // ----------------- Helpers (PITCH path) -----------------
 __device__ inline void putY_ptr(uint8_t *Y, int pitch, int W, int H, int x, int y, uint8_t v)
 {
@@ -27,8 +23,8 @@ __device__ inline void putY_ptr(uint8_t *Y, int pitch, int W, int H, int x, int 
 __device__ inline void putUV_ptr(uint8_t *UV, int pitchUV, int W, int H, int x, int y, uint8_t U, uint8_t V)
 {
     // NV12 UV is 4:2:0 (half res). UV interleaved.
-    int uvx = x >> 1;      // /2
-    int uvy = y >> 1;      // /2
+    int uvx = x >> 1;
+    int uvy = y >> 1;
     int uvW = W >> 1;
     int uvH = H >> 1;
 
@@ -42,15 +38,16 @@ __device__ inline void putUV_ptr(uint8_t *UV, int pitchUV, int W, int H, int x, 
 __device__ inline void drawLine_ptr(uint8_t *Y, uint8_t *UV,
                                     int pitchY, int pitchUV,
                                     int W, int H,
-                                    int x0, int y0, int x1, int y1)
+                                    int x0, int y0, int x1, int y1,
+                                    uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
 
     while (true) {
-        putY_ptr(Y, pitchY, W, H, x0, y0, kRedY);
-        putUV_ptr(UV, pitchUV, W, H, x0, y0, kRedU, kRedV);
+        putY_ptr(Y, pitchY, W, H, x0, y0, Yc);
+        putUV_ptr(UV, pitchUV, W, H, x0, y0, Uc, Vc);
 
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -84,15 +81,16 @@ __device__ inline void putUV_surf(cudaSurfaceObject_t sUV, int W, int H, int x, 
 
 __device__ inline void drawLine_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_t sUV,
                                      int W, int H,
-                                     int x0, int y0, int x1, int y1)
+                                     int x0, int y0, int x1, int y1,
+                                     uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
 
     while (true) {
-        putY_surf(sY, W, H, x0, y0, kRedY);
-        putUV_surf(sUV, W, H, x0, y0, kRedU, kRedV);
+        putY_surf(sY, W, H, x0, y0, Yc);
+        putUV_surf(sUV, W, H, x0, y0, Uc, Vc);
 
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -105,15 +103,16 @@ __device__ inline void drawLine_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_t
 __global__ void overlayPitchKernel(uint8_t *Y, uint8_t *UV,
                                    int pitchY, int pitchUV,
                                    int W, int H,
-                                   const Arrow *arrows, int n)
+                                   const Arrow *arrows, int n,
+                                   uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     Arrow a = arrows[i];
-    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, a.x0, a.y0, a.x1, a.y1);
+    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, a.x0, a.y0, a.x1, a.y1, Yc, Uc, Vc);
 
-    // small arrowhead
+    // Small arrowhead
     int hx = a.x1 - a.x0;
     int hy = a.y1 - a.y0;
     if (hx == 0 && hy == 0) return;
@@ -132,19 +131,20 @@ __global__ void overlayPitchKernel(uint8_t *Y, uint8_t *UV,
     int xh2 = a.x1 - ahx - apx;
     int yh2 = a.y1 - ahy - apy;
 
-    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, a.x1, a.y1, xh1, yh1);
-    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, a.x1, a.y1, xh2, yh2);
+    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, a.x1, a.y1, xh1, yh1, Yc, Uc, Vc);
+    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, a.x1, a.y1, xh2, yh2, Yc, Uc, Vc);
 }
 
 __global__ void overlaySurfKernel(cudaSurfaceObject_t sY, cudaSurfaceObject_t sUV,
                                   int W, int H,
-                                  const Arrow *arrows, int n)
+                                  const Arrow *arrows, int n,
+                                  uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     Arrow a = arrows[i];
-    drawLine_surf(sY, sUV, W, H, a.x0, a.y0, a.x1, a.y1);
+    drawLine_surf(sY, sUV, W, H, a.x0, a.y0, a.x1, a.y1, Yc, Uc, Vc);
 
     int hx = a.x1 - a.x0;
     int hy = a.y1 - a.y0;
@@ -164,15 +164,15 @@ __global__ void overlaySurfKernel(cudaSurfaceObject_t sY, cudaSurfaceObject_t sU
     int xh2 = a.x1 - ahx - apx;
     int yh2 = a.y1 - ahy - apy;
 
-    drawLine_surf(sY, sUV, W, H, a.x1, a.y1, xh1, yh1);
-    drawLine_surf(sY, sUV, W, H, a.x1, a.y1, xh2, yh2);
+    drawLine_surf(sY, sUV, W, H, a.x1, a.y1, xh1, yh1, Yc, Uc, Vc);
+    drawLine_surf(sY, sUV, W, H, a.x1, a.y1, xh2, yh2, Yc, Uc, Vc);
 }
 
 // ----------------- Host entry -----------------
 extern "C" void overlay_draw_arrows_nv12(EGLImageKHR eglImage,
                                         int W, int H,
                                         const Arrow *arrows, int n,
-                                        uint8_t /*unused*/)
+                                        uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
     if (!eglImage || !arrows || n <= 0) return;
 
@@ -226,7 +226,8 @@ extern "C" void overlay_draw_arrows_nv12(EGLImageKHR eglImage,
         int pitchY  = (int)eglFrame.pitch;
         int pitchUV = (int)eglFrame.pitch;
 
-        overlayPitchKernel<<<blocks, threads, 0, stream>>>(Y, UV, pitchY, pitchUV, W, H, d_arrows, n);
+        overlayPitchKernel<<<blocks, threads, 0, stream>>>(
+            Y, UV, pitchY, pitchUV, W, H, d_arrows, n, Yc, Uc, Vc);
         cudaGetLastError(); // swallow
     } else if (eglFrame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
         CUarray arrY  = eglFrame.frame.pArray[0];
@@ -244,7 +245,8 @@ extern "C" void overlay_draw_arrows_nv12(EGLImageKHR eglImage,
         if (cudaCreateSurfaceObject(&sY, &rdY) == cudaSuccess &&
             cudaCreateSurfaceObject(&sUV, &rdUV) == cudaSuccess) {
 
-            overlaySurfKernel<<<blocks, threads, 0, stream>>>(sY, sUV, W, H, d_arrows, n);
+            overlaySurfKernel<<<blocks, threads, 0, stream>>>(
+                sY, sUV, W, H, d_arrows, n, Yc, Uc, Vc);
             cudaGetLastError();
         }
 
