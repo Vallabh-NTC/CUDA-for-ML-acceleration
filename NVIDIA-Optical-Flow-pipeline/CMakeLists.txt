@@ -1,12 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
-project(vpi_dense_of_nvbuffer LANGUAGES C CXX)
+project(vpi_of_nvivafilter LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-add_executable(vpi_dense_of_nvbuffer
-  src/vpi_dense_of_nvbuffer.cpp
-)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # -------------------------
 # Sysroot is mandatory
@@ -21,6 +18,14 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+# -------------------------
+# Build target (nvivafilter customer lib)
+# -------------------------
+add_library(vpi_of SHARED
+  src/nvivafilter_vpi_of.cpp
+)
+set_target_properties(vpi_of PROPERTIES OUTPUT_NAME "vpi_of")
 
 # -------------------------
 # Paths
@@ -47,141 +52,105 @@ set(CUDA_LIB_DIR         ${CMAKE_SYSROOT}/usr/local/cuda/lib64)
 # -------------------------
 # Includes
 # -------------------------
-target_include_directories(vpi_dense_of_nvbuffer PRIVATE
+target_include_directories(vpi_of PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include 
   ${SYS_INC_DIR}
   ${SYS_INC_DIR_AARCH64}
 
+  # GStreamer + GLib headers from sysroot
   ${SYS_INC_DIR}/gstreamer-1.0
   ${SYS_INC_DIR}/glib-2.0
   ${SYS_LIB_DIR}/glib-2.0/include
 
+  # Jetson Multimedia API (nvivafilter_customer_api.hpp + NvBufSurface etc.)
   ${JETSON_MMAPI_INC_DIR}
 
+  # VPI + CUDA
   ${VPI_INC_DIR}
   ${CUDA_INC_DIR}
 )
 
-# OpenCV headers (sysroot)
-set(OPENCV4_INCLUDE_DIR ${CMAKE_SYSROOT}/usr/include/opencv4)
-set(OPENCV2_INCLUDE_DIR ${CMAKE_SYSROOT}/usr/include)
-
-if(EXISTS "${OPENCV4_INCLUDE_DIR}/opencv2/opencv.hpp")
-  message(STATUS "Found OpenCV headers in: ${OPENCV4_INCLUDE_DIR}")
-  target_include_directories(vpi_dense_of_nvbuffer PRIVATE ${OPENCV4_INCLUDE_DIR})
-elseif(EXISTS "${OPENCV2_INCLUDE_DIR}/opencv2/opencv.hpp")
-  message(STATUS "Found OpenCV headers in: ${OPENCV2_INCLUDE_DIR}")
-  target_include_directories(vpi_dense_of_nvbuffer PRIVATE ${OPENCV2_INCLUDE_DIR})
-else()
-  message(FATAL_ERROR "OpenCV headers not found in sysroot.")
-endif()
-
-# Basic sanity checks
+# Sanity checks
 if(NOT EXISTS "${VPI_INC_DIR}/vpi/VPI.h")
   message(FATAL_ERROR "VPI headers not found: ${VPI_INC_DIR}/vpi/VPI.h")
 endif()
-if(NOT EXISTS "${CUDA_INC_DIR}/cuda_runtime.h")
-  message(FATAL_ERROR "CUDA headers not found: ${CUDA_INC_DIR}/cuda_runtime.h")
+# We ship nvivafilter_customer_api.hpp in ./include, so don't warn if MMAPI header is missing in sysroot.
+if(EXISTS "${JETSON_MMAPI_INC_DIR}/nvivafilter_customer_api.hpp")
+  message(STATUS "Found nvivafilter_customer_api.hpp in MMAPI: ${JETSON_MMAPI_INC_DIR}")
+else()
+  message(STATUS "Using project-local nvivafilter_customer_api.hpp from ./include")
 endif()
-if(NOT EXISTS "${CUPVA_LIB_DIR}")
-  message(FATAL_ERROR "CUPVA lib dir not found: ${CUPVA_LIB_DIR}")
+
+if(NOT EXISTS "${CUDA_INC_DIR}/cuda.h")
+  message(FATAL_ERROR "CUDA headers not found: ${CUDA_INC_DIR}/cuda.h")
 endif()
 
 # -------------------------
-# Find core libs
+# Find libs (sysroot only)
 # -------------------------
-find_library(GST_LIB      NAMES gstreamer-1.0 HINTS ${SYS_LIB_DIR} REQUIRED)
-find_library(GST_BASE_LIB NAMES gstbase-1.0   HINTS ${SYS_LIB_DIR} REQUIRED)
-find_library(GST_APP_LIB  NAMES gstapp-1.0    HINTS ${SYS_LIB_DIR} REQUIRED)
-find_library(GLIB_LIB     NAMES glib-2.0      HINTS ${SYS_LIB_DIR} REQUIRED)
-find_library(GOBJECT_LIB  NAMES gobject-2.0   HINTS ${SYS_LIB_DIR} REQUIRED)
+find_library(GST_LIB            NAMES gstreamer-1.0     HINTS ${SYS_LIB_DIR} REQUIRED)
+find_library(GST_BASE_LIB       NAMES gstbase-1.0       HINTS ${SYS_LIB_DIR} REQUIRED)
+find_library(GST_APP_LIB        NAMES gstapp-1.0        HINTS ${SYS_LIB_DIR} REQUIRED)
+find_library(GST_ALLOCATORS_LIB NAMES gstallocators-1.0 HINTS ${SYS_LIB_DIR} REQUIRED)
+find_library(GLIB_LIB           NAMES glib-2.0          HINTS ${SYS_LIB_DIR} REQUIRED)
+find_library(GOBJECT_LIB        NAMES gobject-2.0       HINTS ${SYS_LIB_DIR} REQUIRED)
 
-find_library(NVBUFSURFACE_LIB NAMES nvbufsurface HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR} REQUIRED)
-
-# -------------------------
-# VPI / CUPVA / CUDA
-# -------------------------
+# VPI
 find_library(NVVPI_LIB NAMES nvvpi HINTS ${VPI_LIB_DIR} REQUIRED)
-message(STATUS "Using NVVPI: ${NVVPI_LIB}")
 
-find_library(CUDART_LIB NAMES cudart HINTS ${CUDA_LIB_DIR} REQUIRED)
-message(STATUS "Using CUDART: ${CUDART_LIB}")
-
+# CUPVA (needed because VPI/OFA depends on it on Jetson)
 find_library(CUPVA_HOST_LIB
   NAMES cupva_host libcupva_host.so libcupva_host.so.2.3 libcupva_host.so.2.3.0
   HINTS ${CUPVA_LIB_DIR} ${VPI_PRIV_LIB_DIR}
   REQUIRED
 )
-message(STATUS "Using CUPVA_HOST: ${CUPVA_HOST_LIB}")
-
 find_library(CUPVA_HOST_UTILS_LIB
   NAMES cupva_host_utils libcupva_host_utils.so libcupva_host_utils.so.2.3 libcupva_host_utils.so.2.3.0
   HINTS ${CUPVA_LIB_DIR} ${VPI_PRIV_LIB_DIR}
   REQUIRED
 )
-message(STATUS "Using CUPVA_HOST_UTILS: ${CUPVA_HOST_UTILS_LIB}")
 
-# Explicit PVA deps (from Jetson ldd of libcupva_host.so)
+# PVA deps (commonly required by CUPVA on linkers)
 find_library(NVPVA_LIB      NAMES nvpva      HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR} REQUIRED)
 find_library(NVPVAINTF_LIB  NAMES nvpvaintf  HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR} REQUIRED)
 find_library(NVPVAUMD_LIB   NAMES nvpvaumd   HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR} REQUIRED)
 
-message(STATUS "Using NVPVA: ${NVPVA_LIB}")
-message(STATUS "Using NVPVAINTF: ${NVPVAINTF_LIB}")
-message(STATUS "Using NVPVAUMD: ${NVPVAUMD_LIB}")
-
-# Optional NvSci deps (helpful for cross linkers)
+# NvSci deps (optional but helps cross linkers)
 find_library(NVSCIBUF_LIB    NAMES nvscibuf     HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR})
 find_library(NVSCISYNC_LIB   NAMES nvscisync    HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR})
 find_library(NVSCICOMMON_LIB NAMES nvscicommon  HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR})
 find_library(NVSCIIPC_LIB    NAMES nvsciipc     HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR})
 
-# EGL (VPI often needs it)
-find_library(EGL_LIB NAMES EGL HINTS ${SYS_LIB_DIR} ${TEGRA_EGL_DIR} ${TEGRA_LIB_DIR} REQUIRED)
+# EGL for EGLImageKHR wrappers
+find_library(EGL_LIB        NAMES EGL        HINTS ${SYS_LIB_DIR} ${TEGRA_EGL_DIR} ${TEGRA_LIB_DIR} REQUIRED)
 find_library(EGL_NVIDIA_LIB NAMES EGL_nvidia libEGL_nvidia.so.0 HINTS ${TEGRA_EGL_DIR} ${TEGRA_LIB_DIR})
 
-# -------------------------
-# OpenCV libs (sysroot only)
-# -------------------------
-set(_OPENCV_HINT_DIRS
-  ${SYS_LIB_DIR}
-  ${CMAKE_SYSROOT}/usr/lib
-  ${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu
-)
+# CUDA runtime + driver (note: in the .so we mostly need libcuda + libEGL; cudart is optional here,
+# but keep it if you later add cudaRuntime calls)
+find_library(CUDART_LIB NAMES cudart HINTS ${CUDA_LIB_DIR})
+find_library(CUDA_LIB   NAMES cuda   HINTS ${TEGRA_LIB_DIR} ${SYS_LIB_DIR} REQUIRED)
 
-macro(find_opencv_lib outvar)
-  find_library(${outvar} NAMES ${ARGN} HINTS ${_OPENCV_HINT_DIRS})
-endmacro()
-
-find_opencv_lib(OPENCV_CORE_LIB      opencv_core opencv_core4)
-find_opencv_lib(OPENCV_IMGPROC_LIB   opencv_imgproc opencv_imgproc4)
-find_opencv_lib(OPENCV_IMGCODECS_LIB opencv_imgcodecs opencv_imgcodecs4)
-find_opencv_lib(OPENCV_HIGHGUI_LIB   opencv_highgui opencv_highgui4)
-find_opencv_lib(OPENCV_VIDEOIO_LIB   opencv_videoio opencv_videoio4)
-
-foreach(L OPENCV_CORE_LIB OPENCV_IMGPROC_LIB OPENCV_IMGCODECS_LIB OPENCV_HIGHGUI_LIB)
-  if(NOT ${L})
-    message(FATAL_ERROR "Missing OpenCV lib: ${L}")
-  endif()
-endforeach()
-
-set(OPENCV_LIBS
-  ${OPENCV_CORE_LIB}
-  ${OPENCV_IMGPROC_LIB}
-  ${OPENCV_IMGCODECS_LIB}
-  ${OPENCV_HIGHGUI_LIB}
-)
-if(OPENCV_VIDEOIO_LIB)
-  list(APPEND OPENCV_LIBS ${OPENCV_VIDEOIO_LIB})
-endif()
+message(STATUS "Using GST:            ${GST_LIB}")
+message(STATUS "Using GST_BASE:       ${GST_BASE_LIB}")
+message(STATUS "Using GST_APP:        ${GST_APP_LIB}")
+message(STATUS "Using GST_ALLOCATORS: ${GST_ALLOCATORS_LIB}")
+message(STATUS "Using GLIB:           ${GLIB_LIB}")
+message(STATUS "Using GOBJECT:        ${GOBJECT_LIB}")
+message(STATUS "Using NVVPI:          ${NVVPI_LIB}")
+message(STATUS "Using CUPVA_HOST:     ${CUPVA_HOST_LIB}")
+message(STATUS "Using CUPVA_UTILS:    ${CUPVA_HOST_UTILS_LIB}")
+message(STATUS "Using EGL:            ${EGL_LIB}")
+message(STATUS "Using EGL_NVIDIA:     ${EGL_NVIDIA_LIB}")
+message(STATUS "Using CUDA (driver):  ${CUDA_LIB}")
+message(STATUS "Using CUDART:         ${CUDART_LIB}")
 
 # -------------------------
 # Link libraries
-# NOTE: order matters for GNU ld in cross builds.
+# (order matters for GNU ld in cross builds)
 # -------------------------
-target_link_libraries(vpi_dense_of_nvbuffer PRIVATE
-  ${GST_LIB} ${GST_BASE_LIB} ${GST_APP_LIB}
+target_link_libraries(vpi_of PRIVATE
+  ${GST_LIB} ${GST_BASE_LIB} ${GST_APP_LIB} ${GST_ALLOCATORS_LIB}
   ${GLIB_LIB} ${GOBJECT_LIB}
-  ${NVBUFSURFACE_LIB}
 
   ${NVVPI_LIB}
   ${CUPVA_HOST_LIB}
@@ -199,9 +168,8 @@ target_link_libraries(vpi_dense_of_nvbuffer PRIVATE
   ${EGL_LIB}
   ${EGL_NVIDIA_LIB}
 
+  ${CUDA_LIB}
   ${CUDART_LIB}
-
-  ${OPENCV_LIBS}
 
   pthread dl m
 )
@@ -209,13 +177,11 @@ target_link_libraries(vpi_dense_of_nvbuffer PRIVATE
 # -------------------------
 # Linker options (cross build)
 # -------------------------
-target_link_options(vpi_dense_of_nvbuffer PRIVATE
+target_link_options(vpi_of PRIVATE
   -Wl,--no-as-needed
   -Wl,--copy-dt-needed-entries
 
-  # CRITICAL in your case:
-  # CUPVA host keeps some PVA symbols undefined (resolved at runtime on target),
-  # but the cross-linker wants them resolved at link-time.
+  # CUPVA/PVA symbols can be left unresolved for runtime on target
   -Wl,--unresolved-symbols=ignore-in-shared-libs
 
   -L${SYS_LIB_DIR}
@@ -234,5 +200,14 @@ target_link_options(vpi_dense_of_nvbuffer PRIVATE
   -Wl,-rpath-link,${CUPVA_LIB_DIR}
   -Wl,-rpath-link,${CUDA_LIB_DIR}
 
+  # Runtime rpath on the Jetson
   -Wl,-rpath,/usr/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra-egl:/opt/nvidia/vpi2/lib/aarch64-linux-gnu:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv:/opt/nvidia/cupva-2.3/lib/aarch64-linux-gnu:/usr/local/cuda/lib64
+)
+
+# -------------------------
+# Install path: nvivafilter loads customer libs by absolute path,
+# but keeping an install target helps.
+# -------------------------
+install(TARGETS vpi_of
+  LIBRARY DESTINATION usr/local/lib/nvivafilter
 )

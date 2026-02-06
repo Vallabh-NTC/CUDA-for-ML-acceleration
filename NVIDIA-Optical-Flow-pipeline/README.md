@@ -2,9 +2,7 @@ rsync -avz ntc-orin@192.168.1.10:/opt/nvidia/vpi2/ /l4t/targetfs/opt/nvidia/vpi2
 rsync -avz --delete   ntc-orin@192.168.1.10:/opt/nvidia/vpi2/include/   /l4t/targetfs/opt/nvidia/vpi2/include/
  
  rsync -avz   ntc-orin@192.168.1.10:/opt/nvidia/cupva-2.3/   /l4t/targetfs/opt/nvidia/cupva-2.3/
- rsync -avz --delete \
->   ntc-orin@192.168.1.10:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/ \
->   /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/
+ rsync -avz --delete ntc-orin@192.168.1.10:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/  /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/
 
 rsync -avz   ntc-orin@192.168.1.10:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv/   /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv/
 
