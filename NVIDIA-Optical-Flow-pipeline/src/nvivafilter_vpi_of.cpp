@@ -4,20 +4,28 @@
 //
 // NVDEC -> NVMM(NV12) -> nvivafilter (this .so) -> NVMM
 //
-// VPI2.4 EGL wrapper (NO CUDA-EGL mapping) + OFA Dense Optical Flow.
+// VPI 2.4 EGL wrapper (NO CUDA-EGL mapping) + OFA Dense Optical Flow.
 // Prints motion vectors (dx,dy) in pixels every ~1 second (every 30 frames).
 //
 // IMPORTANT (why we do an extra CPU copy):
 // - OFA output is block-linear (2S16_BL). CPU can't read it directly.
 // - We convert BL -> pitch-linear using VIC into a VIC-enabled container (mv_vic_pl).
 // - Then we copy to a CPU-enabled container (mv_cpu) using CPU backend,
-//   ONLY for printing/debug (can be removed later for full GPU-only overlay).
+//   ONLY for printing/debug.
+//
+// SAFE performance fix vs your original:
+// - The expensive debug path (mv_bl -> mv_vic_pl -> mv_cpu + lock) runs ONLY
+//   on print intervals (every N frames), not every frame.
+//
+// CRITICAL robustness note for nvivafilter:
+// - DO NOT destroy State inside post_process(): on Jetson it may be called per-frame,
+//   not only at teardown. Destroying resources there can cause VPI_ERROR_BUFFER_LOCKED.
 //
 // Width/Height:
 // - Prefer caps via pre_process().
 // - Fallback to env VPI_OF_W / VPI_OF_H.
 //
-// Assumptions about MV format:
+// MV format:
 // - 2S16 values are treated as S10.5 fixed-point => pixels = value / 32.0
 
 #include <cstdio>
@@ -49,7 +57,7 @@
         if (_st != VPI_SUCCESS) {                                               \
             char msg[512];                                                      \
             vpiGetLastStatusMessage(msg, sizeof(msg));                          \
-            fprintf(stderr, "[vpi_of] VPI error: %s at %s\n",                   \
+            fprintf(stderr, "[vpi_of] VPI error: %s at %s\n",                    \
                     vpiStatusGetName(_st), #stmt);                              \
             fprintf(stderr, "[vpi_of] Message: %s\n", msg);                     \
             std::abort();                                                       \
@@ -58,7 +66,6 @@
 
 static inline float s10_5_to_px(int16_t v) { return float(v) / 32.0f; }
 
-// Compute max pyramid levels for scale=0.5 such that smallest level >= 32x32
 static int max_levels_scale_half_min32(int W, int H)
 {
     int levels = 1;
@@ -132,6 +139,8 @@ struct State
     std::chrono::steady_clock::time_point t0;
     std::chrono::steady_clock::time_point tLast;
     bool timersInit = false;
+
+    uint32_t printEveryNFrames = 30; // print every N OF-computed frames
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -142,6 +151,9 @@ static State* get_or_create_state(void **userPtr)
     return st;
 }
 
+// NOTE: We keep destroy_state implemented for completeness, but we do NOT call it
+// from post_process() because on Jetson/nvivafilter post_process may be per-frame.
+// You can call destroy_state only if you are 100% sure you are in teardown.
 static void destroy_state(State *st)
 {
     if (!st) return;
@@ -225,24 +237,22 @@ static void init_vpi_if_needed(State *st, int W, int H)
     std::vector<int32_t> gridArr(st->numLevels, st->grid);
 
     CHECK_VPI(vpiCreateOpticalFlowDense(VPI_BACKEND_OFA,
-                                        W, H,
-                                        VPI_IMAGE_FORMAT_Y8_ER_BL,
-                                        gridArr.data(), st->numLevels,
-                                        VPI_OPTICAL_FLOW_QUALITY_HIGH,
-                                        &st->ofa_payload));
+                                       W, H,
+                                       VPI_IMAGE_FORMAT_Y8_ER_BL,
+                                       gridArr.data(), st->numLevels,
+                                       VPI_OPTICAL_FLOW_QUALITY_HIGH,
+                                       &st->ofa_payload));
 
     const int mvW = (W + st->grid - 1) / st->grid;
     const int mvH = (H + st->grid - 1) / st->grid;
 
-    // OFA output is block-linear
     CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16_BL, 0, &st->mv_bl));
 
-    // Conversion target for VIC must have VIC backend enabled
     CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16,
-                         VPI_BACKEND_VIC | VPI_BACKEND_CPU, &st->mv_vic_pl));
+                             VPI_BACKEND_VIC | VPI_BACKEND_CPU, &st->mv_vic_pl));
 
-    // CPU-readable container
-    CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16, VPI_BACKEND_CPU, &st->mv_cpu));
+    CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16,
+                             VPI_BACKEND_CPU, &st->mv_cpu));
 
     st->inited = true;
 
@@ -254,6 +264,7 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
 static bool vpi_wrap_input_from_eglimage(State *st, EGLImageKHR image)
 {
+    // Keep original behavior: recreate wrapper each frame.
     if (st->vpi_in_nv12) {
         vpiImageDestroy(st->vpi_in_nv12);
         st->vpi_in_nv12 = nullptr;
@@ -282,9 +293,10 @@ static void print_flow_samples(State *st)
     VPIImageData data;
     std::memset(&data, 0, sizeof(data));
 
-    // VPI 2.4: lock CPU image to get HOST_PITCH_LINEAR pointer
+    bool locked = false;
     CHECK_VPI(vpiImageLockData(st->mv_cpu, VPI_LOCK_READ,
                               VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &data));
+    locked = true;
 
     const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
     const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
@@ -297,7 +309,6 @@ static void print_flow_samples(State *st)
 
     int16_t dx, dy;
 
-    // Center sample
     int cx = mvW / 2;
     int cy = mvH / 2;
     read_vec(cx, cy, dx, dy);
@@ -307,7 +318,6 @@ static void print_flow_samples(State *st)
             cx * st->grid, cy * st->grid,
             s10_5_to_px(dx), s10_5_to_px(dy));
 
-    // A second sample near top-left (clamped)
     int sx1 = std::min(10, mvW - 1);
     int sy1 = std::min(10, mvH - 1);
     read_vec(sx1, sy1, dx, dy);
@@ -317,7 +327,6 @@ static void print_flow_samples(State *st)
             sx1 * st->grid, sy1 * st->grid,
             s10_5_to_px(dx), s10_5_to_px(dy));
 
-    // A third sample near bottom-right (clamped)
     int sx2 = std::max(0, mvW - 11);
     int sy2 = std::max(0, mvH - 11);
     read_vec(sx2, sy2, dx, dy);
@@ -327,7 +336,9 @@ static void print_flow_samples(State *st)
             sx2 * st->grid, sy2 * st->grid,
             s10_5_to_px(dx), s10_5_to_px(dy));
 
-    CHECK_VPI(vpiImageUnlock(st->mv_cpu));
+    if (locked) {
+        CHECK_VPI(vpiImageUnlock(st->mv_cpu));
+    }
 }
 
 // ----------------------------- Main processing -----------------------------
@@ -339,7 +350,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     static bool cuda_inited = false;
     if (!cuda_inited) { cuInit(0); cuda_inited = true; }
 
-    // Prefer size from caps (pre_process), fallback to env
     int W = st->W, H = st->H;
     if (W <= 0 || H <= 0) {
         if (!get_size_from_env(W, H)) {
@@ -390,17 +400,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                                               st->ofa_payload, st->prev_pyr_bl, st->cur_pyr_bl, st->mv_bl));
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Debug path (GPU -> CPU) for printing only:
-    // 1) mv_bl (BL) -> mv_vic_pl (PL) using VIC
-    CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
-                                         st->mv_bl, st->mv_vic_pl, nullptr));
-    CHECK_VPI(vpiStreamSync(st->stream));
-
-    // 2) mv_vic_pl -> mv_cpu using CPU backend (so we can lock on host)
-    CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_CPU,
-                                         st->mv_vic_pl, st->mv_cpu, nullptr));
-    CHECK_VPI(vpiStreamSync(st->stream));
-
     st->frameCount++;
 
     if (!st->timersInit) {
@@ -409,12 +408,26 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         st->timersInit = true;
     }
 
-    // Print every 30 frames (~1 second at 30 fps)
-    if ((st->frameCount % 30) == 0) {
+    // Print every N frames
+    const bool doPrint = (st->printEveryNFrames > 0) &&
+                         ((st->frameCount % st->printEveryNFrames) == 0);
+
+    if (doPrint) {
+        // Debug path ONLY on print frames:
+        // 1) mv_bl (BL) -> mv_vic_pl (PL) using VIC
+        CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
+                                             st->mv_bl, st->mv_vic_pl, nullptr));
+        CHECK_VPI(vpiStreamSync(st->stream));
+
+        // 2) mv_vic_pl -> mv_cpu using CPU backend
+        CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_CPU,
+                                             st->mv_vic_pl, st->mv_cpu, nullptr));
+        CHECK_VPI(vpiStreamSync(st->stream));
+
         auto now = std::chrono::steady_clock::now();
         double secFromStart = std::chrono::duration<double>(now - st->t0).count();
         double secFromLast  = std::chrono::duration<double>(now - st->tLast).count();
-        double fpsWindow    = 30.0 / std::max(1e-9, secFromLast);
+        double fpsWindow    = double(st->printEveryNFrames) / std::max(1e-9, secFromLast);
 
         fprintf(stderr, "[vpi_of] frames=%llu  elapsed=%.2fs  fps~%.1f\n",
                 (unsigned long long)st->frameCount, secFromStart, fpsWindow);
@@ -443,7 +456,9 @@ static void pre_process(void **, unsigned int *inW, unsigned int *inH,
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*,
                          ColorFormat*, unsigned int, void **)
 {
-    // Not used
+    // IMPORTANT:
+    // On Jetson/nvivafilter this may be called per-frame.
+    // Do NOT destroy state here.
 }
 
 extern "C" void init(CustomerFunction *f)
@@ -455,10 +470,12 @@ extern "C" void init(CustomerFunction *f)
 
     fprintf(stderr, "[vpi_of] init(): VPI OFA filter loaded (pass-through + compute)\n");
     fprintf(stderr, "[vpi_of] NOTE: size from caps (preferred) or env VPI_OF_W/VPI_OF_H (fallback)\n");
-    fprintf(stderr, "[vpi_of] NOTE: CPU copy is only for printing/debug and can be removed later.\n");
+    fprintf(stderr, "[vpi_of] NOTE: CPU copy is only for printing/debug and runs ONLY on print frames.\n");
 }
 
 extern "C" void deinit(void)
 {
+    // No access to userPtr here; and post_process may be per-frame.
+    // For now we leave cleanup to process exit (stable behavior).
     fprintf(stderr, "[vpi_of] deinit(): called\n");
 }
