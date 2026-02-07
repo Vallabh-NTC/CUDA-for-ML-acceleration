@@ -8,15 +8,29 @@
 // OVERLAY:
 // - Draws motion-vector arrows (red) onto NV12 via CUDA EGL interop.
 // - Draws a single "resultant" arrow (blue) at the image center.
-// OUTPUT:
-// - Prints ONLY speed per frame to stdout, based on:
-//     1 meter = 717 pixels, FPS = 30
-//   Speed formula: m/s = (px_per_frame * FPS) / 717
 //
-// Stability fix:
+// OUTPUT:
+// - Prints speed per frame to stdout, based on pixel-to-meter calibration.
+// - Uses real dt between callbacks (steady_clock) instead of a fixed FPS.
+// - When a frame is classified as "bad", holds the last filtered speed.
+//
+// Calibration:
+//   1 meter = 717 pixels (PX_PER_M)
+//
+// Speed formula with dt:
+//   speed_mps = (res_mag_px_per_pair / PX_PER_M) / dt_seconds
+//
+// Stability note:
 // - DO NOT wrap EGLImage into VPI on nvbuf-mem-surface-array pipelines.
-// - Some pipelines keep the NVMM container locked exclusively during the callback.
-// - Use CUDA-EGL to copy NV12 Y plane into a CUDA-backed VPI image, then operate only on VPI-owned buffers.
+// - Use CUDA-EGL to copy NV12 Y plane into a CUDA-backed VPI image,
+//   then operate only on VPI-owned buffers.
+//
+// Robustness additions (NEW):
+// - Robust global motion vector estimate using median(dx), median(dy).
+// - Robust spread estimate using MAD on magnitudes.
+// - Directional coherence score: rob_res_mag / mean_mag.
+// - Gating: if confidence is low -> hold last output (no fake zeros).
+// - Adaptive EMA smoothing: alpha depends on confidence.
 
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +70,7 @@
         }                                                                       \
     } while (0)
 
+// OFA motion vectors are in S10.5 fixed point -> pixels by /32.
 static inline float s10_5_to_px(int16_t v) { return float(v) / 32.0f; }
 
 static int max_levels_scale_half_min32(int W, int H)
@@ -101,6 +116,8 @@ static bool get_size_from_env(int &W, int &H)
 struct MVStats
 {
     int samples = 0;
+
+    // Magnitude distribution (all sampled vectors)
     float p50 = 0.0f;
     float p90 = 0.0f;
     float p99 = 0.0f;
@@ -108,10 +125,25 @@ struct MVStats
     float mean = 0.0f;
     float stdv = 0.0f;
 
-    // Vector-mean (resultant motion) in px/frame.
+    // Legacy simple vector mean (all sampled vectors)
     float mean_dx = 0.0f;
     float mean_dy = 0.0f;
     float res_mag = 0.0f;  // hypot(mean_dx, mean_dy)
+
+    // -------- Robust global motion estimate (NEW) --------
+    // After filtering by magnitude [minMag..maxMag]
+    int   robust_samples = 0;
+
+    float mean_mag = 0.0f;     // mean magnitude of robust samples
+    float med_mag  = 0.0f;     // median magnitude
+    float mad_mag  = 0.0f;     // MAD of magnitude around med_mag
+
+    float rob_dx = 0.0f;       // robust dx (median dx)
+    float rob_dy = 0.0f;       // robust dy (median dy)
+    float rob_res_mag = 0.0f;  // hypot(rob_dx, rob_dy)
+
+    // Coherence of motion: near 1 if vectors point similarly, near 0 if random
+    float coherence = 0.0f;    // rob_res_mag / (mean_mag + eps)
 };
 
 // Compute percentile via nth_element (no full sort)
@@ -122,6 +154,23 @@ static float percentile_inplace(std::vector<float> &v, float q01)
     size_t k = (size_t)std::llround((v.size() - 1) * q01);
     std::nth_element(v.begin(), v.begin() + k, v.end());
     return v[k];
+}
+
+// Robust helper: median via nth_element
+static float median_inplace(std::vector<float> &v)
+{
+    if (v.empty()) return 0.0f;
+    size_t k = v.size() / 2;
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k];
+}
+
+// Robust helper: MAD (median absolute deviation) around a known median
+static float mad_from_values(std::vector<float> v, float med)
+{
+    // Copy-by-value is intentional: we mutate into absolute deviations.
+    for (float &x : v) x = std::fabs(x - med);
+    return median_inplace(v);
 }
 
 struct MVTop
@@ -137,8 +186,11 @@ static MVStats compute_mv_stats_and_topk(
     int x0, int x1, int y0, int y1,
     int step,
     int topK,
-    std::vector<MVTop> &top)
+    std::vector<MVTop> &top,
+    float minMag, float maxMag)   // NEW: robust filtering band
 {
+    (void)mvW; (void)mvH;
+
     MVStats st;
     top.clear();
     top.reserve((size_t)topK);
@@ -151,8 +203,15 @@ static MVStats compute_mv_stats_and_topk(
     const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
     const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
 
+    // Store magnitudes for percentiles on all samples (legacy stats),
+    // plus a filtered set for robust stats.
     std::vector<float> mags;
     mags.reserve((size_t)((((x1-x0)+step-1)/step) * (((y1-y0)+step-1)/step)));
+
+    std::vector<float> magsR, dxsR, dysR;
+    magsR.reserve(mags.capacity());
+    dxsR.reserve(mags.capacity());
+    dysR.reserve(mags.capacity());
 
     double sum  = 0.0;
     double sum2 = 0.0;
@@ -162,6 +221,7 @@ static MVStats compute_mv_stats_and_topk(
     float maxv = 0.0f;
 
     auto top_push = [&](float mag, float dx, float dy, int mx, int my) {
+        if (topK <= 0) return;
         if ((int)top.size() < topK) {
             top.push_back({mag, dx, dy, mx, my});
             if ((int)top.size() == topK) {
@@ -184,6 +244,7 @@ static MVStats compute_mv_stats_and_topk(
         for (int mx = x0; mx < x1; mx += step) {
             int16_t fx = row[mx * 2 + 0];
             int16_t fy = row[mx * 2 + 1];
+
             float dx = s10_5_to_px(fx);
             float dy = s10_5_to_px(fy);
             float mag = std::hypot(dx, dy);
@@ -199,11 +260,20 @@ static MVStats compute_mv_stats_and_topk(
             maxv = std::max(maxv, mag);
 
             top_push(mag, dx, dy, mx, my);
+
+            // Robust sample set: keep only vectors within a reasonable magnitude band.
+            // This rejects tiny noise and extreme outliers cheaply.
+            if (mag >= minMag && mag <= maxMag) {
+                magsR.push_back(mag);
+                dxsR.push_back(dx);
+                dysR.push_back(dy);
+            }
         }
     }
 
     CHECK_VPI(vpiImageUnlock(mv_cpu));
 
+    // Legacy stats (all samples)
     st.maxv = maxv;
     if (st.samples > 0) {
         st.mean = (float)(sum / (double)st.samples);
@@ -219,6 +289,32 @@ static MVStats compute_mv_stats_and_topk(
         st.p90 = percentile_inplace(mags, 0.90f);
         st.p99 = percentile_inplace(mags, 0.99f);
     }
+
+    // Robust stats (filtered samples)
+    st.robust_samples = (int)magsR.size();
+    if (st.robust_samples > 0) {
+        // Robust global motion: median dx/dy.
+        st.rob_dx = median_inplace(dxsR);
+        st.rob_dy = median_inplace(dysR);
+        st.rob_res_mag = (float)std::hypot(st.rob_dx, st.rob_dy);
+
+        // Robust magnitude spread: MAD around median magnitude.
+        st.med_mag = median_inplace(magsR);
+        st.mad_mag = mad_from_values(magsR, st.med_mag);
+
+        // Mean magnitude (for coherence score).
+        double sumMag = 0.0;
+        for (float m : magsR) sumMag += m;
+        st.mean_mag = (float)(sumMag / (double)st.robust_samples);
+
+        st.coherence = st.rob_res_mag / (st.mean_mag + 1e-6f);
+        st.coherence = std::clamp(st.coherence, 0.0f, 1.0f);
+    } else {
+        st.rob_dx = st.rob_dy = st.rob_res_mag = 0.0f;
+        st.mean_mag = st.med_mag = st.mad_mag = 0.0f;
+        st.coherence = 0.0f;
+    }
+
     return st;
 }
 
@@ -280,11 +376,29 @@ struct State
     float overlayScale = 3.5f;
     int overlayMaxArrows = 4096;
 
-    // MV filtering (optional safety)
-    float badRatio = 3.0f;    // tail ratio threshold
-    float badMinAbs = 60.0f;  // minimum absolute max to consider a spike "real"
+    // MV spike tail detection (kept as one gating component)
+    float badRatio = 3.0f;
+    float badMinAbs = 60.0f;
 
     bool warnedMissingCaps = false;
+
+    // Timing + last output
+    bool haveTime = false;
+    std::chrono::steady_clock::time_point lastTime;
+    float lastSpeedMps = 0.0f;
+
+    // -------- Robust MV filtering + confidence (NEW) --------
+    float mvMinMag = 0.5f;     // ignore tiny noise vectors (px/frame)
+    float mvMaxMag = 120.0f;   // drop extreme outliers/saturation (px/frame)
+    float cohMin   = 0.30f;    // minimum coherence threshold (0..1)
+    float madMax   = 12.0f;    // maximum allowed MAD of magnitudes (px)
+    int   minRobustSamples = 64; // minimum robust samples to trust the frame
+
+    // -------- Adaptive EMA smoothing (NEW) --------
+    float emaAlphaHi = 0.50f;  // used when confidence is excellent
+    float emaAlphaLo = 0.15f;  // used when confidence is acceptable
+    float speedEma   = 0.0f;
+    bool  haveEma    = false;
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -309,6 +423,17 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
     st->badRatio  = std::max(1.2f, get_env_float("VPI_OF_BAD_RATIO", 3.0f));
     st->badMinAbs = std::max(0.0f, get_env_float("VPI_OF_BAD_MIN_ABS", 60.0f));
+
+    // Robust MV filtering + confidence (NEW)
+    st->mvMinMag = std::max(0.0f, get_env_float("VPI_OF_MIN_MAG", 0.5f));
+    st->mvMaxMag = std::max(st->mvMinMag + 0.1f, get_env_float("VPI_OF_MAX_MAG", 120.0f));
+    st->cohMin   = std::clamp(get_env_float("VPI_OF_COH_MIN", 0.30f), 0.0f, 1.0f);
+    st->madMax   = std::max(0.0f, get_env_float("VPI_OF_MAD_MAX", 12.0f));
+    st->minRobustSamples = std::max(16, get_env_int("VPI_OF_MIN_ROBUST_SAMPLES", 64));
+
+    // Adaptive EMA smoothing (NEW)
+    st->emaAlphaHi = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_HI", 0.50f), 0.0f, 1.0f);
+    st->emaAlphaLo = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_LO", 0.15f), 0.0f, 1.0f);
 
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
@@ -381,7 +506,7 @@ static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
     const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
     const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
 
-    // Center ROI used for arrows too (matches stats)
+    // Center ROI used for arrows too (matches stats ROI)
     int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
     int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
 
@@ -422,25 +547,30 @@ static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
     return (int)arrows.size();
 }
 
-static inline void print_speed_only(const MVStats &s)
+// ----------------------------- Speed helpers -----------------------------
+
+static inline float compute_speed_mps_from_dt(float res_mag_px_per_pair, float dtSec)
 {
-    // Convert resultant motion from px/frame to m/s and km/h.
-    // Given: 1 meter = 717 pixels, FPS = 30.
+    // PX_PER_M: pixels per meter (calibration)
     constexpr float PX_PER_M = 717.0f;
-    constexpr float FPS = 30.0f;
 
-    float speed_mps = (s.res_mag * FPS) / PX_PER_M;
+    if (!(dtSec > 0.0f)) return 0.0f;
+
+    // m/s = (px / PX_PER_M) / dt
+    return (res_mag_px_per_pair / PX_PER_M) / dtSec;
+}
+
+static inline void print_speed_mps(float speed_mps)
+{
     float speed_kmh = speed_mps * 3.6f;
-
-    // Print ONLY speed per frame (no other logs).
+    // Requirement in your project: keep the printing format as you want.
     std::fprintf(stdout, "%.3f m/s (%.2f km/h)\n", speed_mps, speed_kmh);
     std::fflush(stdout);
 }
 
 static inline void print_speed_zero()
 {
-    std::fprintf(stdout, "0.000 m/s (0.00 km/h)\n");
-    std::fflush(stdout);
+    print_speed_mps(0.0f);
 }
 
 static void gpu_process(EGLImageKHR image, void **userPtr)
@@ -454,7 +584,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     int W = st->W, H = st->H;
     if (W <= 0 || H <= 0) {
         if (!get_size_from_env(W, H)) {
-            // No other prints allowed; just skip silently.
+            // No extra prints allowed; skip silently.
             return;
         }
         st->W = W; st->H = H;
@@ -462,9 +592,23 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     init_vpi_if_needed(st, W, H);
 
-    // --------------------------------------------------------------------
+    // Timing: compute dt (seconds) between callbacks.
+    auto now = std::chrono::steady_clock::now();
+    float dtSec = 0.0f;
+
+    if (!st->haveTime) {
+        st->haveTime = true;
+        st->lastTime = now;
+    } else {
+        dtSec = std::chrono::duration<float>(now - st->lastTime).count();
+        st->lastTime = now;
+
+        // Clamp dt to avoid pathological scheduler hiccups.
+        // Accept roughly ~10..80 fps.
+        dtSec = std::clamp(dtSec, 1.0f/80.0f, 1.0f/10.0f);
+    }
+
     // Ingest: copy NV12 luma (Y) from EGLImage -> cur_y8_pl (CUDA memory)
-    // --------------------------------------------------------------------
     VPIImageData ydata;
     std::memset(&ydata, 0, sizeof(ydata));
 
@@ -481,6 +625,10 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     // First frame: no previous frame available -> speed is 0
     if (!st->havePrev) {
         print_speed_zero();
+        st->lastSpeedMps = 0.0f;
+        st->speedEma = 0.0f;
+        st->haveEma = false;
+
         std::swap(st->prev_y8_pl, st->cur_y8_pl);
         st->havePrev = true;
         return;
@@ -510,7 +658,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     st->frameCount++;
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Always compute stats/speed every frame -> need CPU MV.
+    // Convert MV to CPU for robust statistics and speed.
     CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
                                          st->mv_bl, st->mv_vic_pl, nullptr));
     CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_CPU,
@@ -520,30 +668,74 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     const int mvW = (W + st->grid - 1) / st->grid;
     const int mvH = (H + st->grid - 1) / st->grid;
 
+    // Central ROI in MV grid space
     int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
     int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
 
+    // Compute stats (robust + percentiles) on the same sampling step as overlay.
     std::vector<MVTop> topDummy;
     MVStats s = compute_mv_stats_and_topk(
         st->mv_cpu, mvW, mvH,
         x0, x1, y0, y1,
-        st->overlayStep, /*topK*/1, topDummy);
+        st->overlayStep, /*topK*/1, topDummy,
+        st->mvMinMag, st->mvMaxMag);
 
-    bool badFrame = is_bad_frame_spike(s, st->badRatio, st->badMinAbs);
+    // dt fallback if timing not ready
+    float useDt = (dtSec > 0.0f) ? dtSec : (1.0f / 30.0f);
+
+    // Confidence / gating signals:
+    // 1) tail spike explosion (your original rule)
+    bool tailSpike = is_bad_frame_spike(s, st->badRatio, st->badMinAbs);
+
+    // 2) low robust sample count -> unreliable estimate
+    bool lowSamples = (s.robust_samples < st->minRobustSamples);
+
+    // 3) directional coherence too low -> vectors disagree strongly
+    bool lowCoherence = (s.coherence < st->cohMin);
+
+    // 4) robust magnitude spread too high -> noisy/outlier-heavy field
+    bool highMad = (s.mad_mag > st->madMax);
+
+    bool badFrame = tailSpike || lowSamples || lowCoherence || highMad;
+
+    // Compute raw speed from robust resultant (median dx/dy).
+    float speed_raw_mps = compute_speed_mps_from_dt(s.rob_res_mag, useDt);
+
+    // If frame is bad: hold last EMA (or lastSpeedMps if EMA isn't ready).
+    // We still reseed prev=cur to keep N vs N-1 pairing (no skip in the chain).
     if (badFrame) {
-        // Print 0 for this frame, reseed previous, skip overlay.
-        print_speed_zero();
+        float out = st->haveEma ? st->speedEma : st->lastSpeedMps;
+        print_speed_mps(out);
+
         std::swap(st->prev_y8_pl, st->cur_y8_pl);
         st->havePrev = true;
         return;
     }
 
-    // Print speed for this frame (ONLY output allowed).
-    print_speed_only(s);
+    // Adaptive EMA smoothing:
+    // - excellent confidence -> alphaHi (more responsive)
+    // - acceptable confidence -> alphaLo (more stable)
+    bool excellent =
+        (s.coherence >= std::min(0.85f, st->cohMin + 0.30f)) &&
+        (s.mad_mag <= st->madMax * 0.60f);
+
+    float alpha = excellent ? st->emaAlphaHi : st->emaAlphaLo;
+
+    if (!st->haveEma) {
+        st->speedEma = speed_raw_mps;
+        st->haveEma = true;
+    } else {
+        st->speedEma = (1.0f - alpha) * st->speedEma + alpha * speed_raw_mps;
+    }
+
+    float speed_mps = st->speedEma;
+    st->lastSpeedMps = speed_mps;
+
+    print_speed_mps(speed_mps);
 
     // Overlay:
     // - Red vector field
-    // - Blue resultant arrow at image center
+    // - Blue robust resultant arrow at image center
     if (st->overlayEnabled) {
         // Red field arrows
         std::vector<Arrow> arrows;
@@ -553,12 +745,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                                      /*Y*/76, /*U*/85, /*V*/255);
         }
 
-        // Blue resultant at center
+        // Blue robust resultant at center
         int cx = W / 2;
         int cy = H / 2;
 
-        float dx = s.mean_dx;
-        float dy = s.mean_dy;
+        // Use robust dx/dy (median) for a stable direction arrow.
+        float dx = s.rob_dx;
+        float dy = s.rob_dy;
 
         float sc = st->overlayScale;
         int x1p = cx + (int)lrintf(dx * sc);
@@ -600,10 +793,10 @@ extern "C" void init(CustomerFunction *f)
     f->fGPUProcess  = gpu_process;
     f->fPostProcess = post_process;
 
-    // No prints here (requirement: only speed per frame).
+    // No prints here (keep stdout reserved for per-frame speed output).
 }
 
 extern "C" void deinit(void)
 {
-    // No prints here (requirement: only speed per frame).
+    // No prints here.
 }
