@@ -42,6 +42,8 @@ add_library(vpi_of SHARED
   src/nvivafilter_vpi_of.cpp
   src/overlay.cu
   src/egl_copy.cu
+  src/mv_reduce.cu
+  
 )
 set_target_properties(vpi_of PROPERTIES OUTPUT_NAME "vpi_of")
 

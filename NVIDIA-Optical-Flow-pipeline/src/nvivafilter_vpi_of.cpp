@@ -5,45 +5,29 @@
 // NVDEC -> NVMM(NV12) -> nvivafilter (this .so) -> NVMM
 //
 // VPI 2.4 + OFA Dense Optical Flow.
-// OVERLAY:
-// - Draws motion-vector arrows (red) onto NV12 via CUDA EGL interop.
-// - Draws a single "resultant" arrow (blue) at the image center.
 //
-// OUTPUT:
-// - Prints speed per frame to stdout, based on pixel-to-meter calibration.
-// - Uses real dt between callbacks (steady_clock) instead of a fixed FPS.
-// - When a frame is classified as "bad", holds the last filtered speed.
+// Key constraint on VPI 2.4:
+// - CUDA conversion is NOT implemented for 2S16_BL -> 2S16.
+// - Locking OFA output (2S16_BL) as CUDA_ARRAY might not be supported.
+// Therefore we use VIC to convert mv_bl -> mv_pl (2S16 pitch-linear),
+// and then lock mv_pl as CUDA_PITCH_LINEAR for GPU reduction/overlay.
 //
-// Calibration:
-//   1 meter = 717 pixels (PX_PER_M)
-//
-// Speed formula with dt:
-//   speed_mps = (res_mag_px_per_pair / PX_PER_M) / dt_seconds
-//
-// Stability note:
-// - DO NOT wrap EGLImage into VPI on nvbuf-mem-surface-array pipelines.
-// - Use CUDA-EGL to copy NV12 Y plane into a CUDA-backed VPI image,
-//   then operate only on VPI-owned buffers.
-//
-// Robustness additions (NEW):
-// - Robust global motion vector estimate using median(dx), median(dy).
-// - Robust spread estimate using MAD on magnitudes.
-// - Directional coherence score: rob_res_mag / mean_mag.
-// - Gating: if confidence is low -> hold last output (no fake zeros).
-// - Adaptive EMA smoothing: alpha depends on confidence.
+// CPU does only dt timing + stdout printing.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
-#include <vector>
 #include <chrono>
+#include <vector>
 #include <cmath>
+
 
 #include <EGL/egl.h>
 
 #include <cuda.h>
+#include <cuda_runtime.h>
 
 #include <vpi/VPI.h>
 #include <vpi/Image.h>
@@ -54,8 +38,9 @@
 #include <vpi/algo/OpticalFlowDense.h>
 
 #include "nvivafilter_customer_api.hpp"
+#include "egl_copy.hpp"
 #include "overlay.hpp"
-#include "egl_copy.hpp"   // egl_nv12_copy_y_to_cuda(...)
+#include "mv_reduce.hpp"
 
 #define CHECK_VPI(stmt)                                                         \
     do {                                                                        \
@@ -63,29 +48,12 @@
         if (_st != VPI_SUCCESS) {                                               \
             char msg[512];                                                      \
             vpiGetLastStatusMessage(msg, sizeof(msg));                          \
-            fprintf(stderr, "[vpi_of] VPI error: %s at %s\n",                    \
-                    vpiStatusGetName(_st), #stmt);                              \
-            fprintf(stderr, "[vpi_of] Message: %s\n", msg);                     \
+            std::fprintf(stderr, "[vpi_of] VPI error: %s at %s\n",              \
+                         vpiStatusGetName(_st), #stmt);                         \
+            std::fprintf(stderr, "[vpi_of] Message: %s\n", msg);                \
             std::abort();                                                       \
         }                                                                       \
     } while (0)
-
-// OFA motion vectors are in S10.5 fixed point -> pixels by /32.
-static inline float s10_5_to_px(int16_t v) { return float(v) / 32.0f; }
-
-static int max_levels_scale_half_min32(int W, int H)
-{
-    int levels = 1;
-    int w = W, h = H;
-    while (true) {
-        int w2 = (w + 1) / 2;
-        int h2 = (h + 1) / 2;
-        if (w2 < 32 || h2 < 32) break;
-        w = w2; h = h2;
-        levels++;
-    }
-    return levels;
-}
 
 static int get_env_int(const char *k, int defv)
 {
@@ -111,231 +79,26 @@ static bool get_size_from_env(int &W, int &H)
     return (W > 0 && H > 0);
 }
 
-// ----------------------------- MV stats helpers -----------------------------
-
-struct MVStats
+static int max_levels_scale_half_min32(int W, int H)
 {
-    int samples = 0;
-
-    // Magnitude distribution (all sampled vectors)
-    float p50 = 0.0f;
-    float p90 = 0.0f;
-    float p99 = 0.0f;
-    float maxv = 0.0f;
-    float mean = 0.0f;
-    float stdv = 0.0f;
-
-    // Legacy simple vector mean (all sampled vectors)
-    float mean_dx = 0.0f;
-    float mean_dy = 0.0f;
-    float res_mag = 0.0f;  // hypot(mean_dx, mean_dy)
-
-    // -------- Robust global motion estimate (NEW) --------
-    // After filtering by magnitude [minMag..maxMag]
-    int   robust_samples = 0;
-
-    float mean_mag = 0.0f;     // mean magnitude of robust samples
-    float med_mag  = 0.0f;     // median magnitude
-    float mad_mag  = 0.0f;     // MAD of magnitude around med_mag
-
-    float rob_dx = 0.0f;       // robust dx (median dx)
-    float rob_dy = 0.0f;       // robust dy (median dy)
-    float rob_res_mag = 0.0f;  // hypot(rob_dx, rob_dy)
-
-    // Coherence of motion: near 1 if vectors point similarly, near 0 if random
-    float coherence = 0.0f;    // rob_res_mag / (mean_mag + eps)
-};
-
-// Compute percentile via nth_element (no full sort)
-static float percentile_inplace(std::vector<float> &v, float q01)
-{
-    if (v.empty()) return 0.0f;
-    q01 = std::clamp(q01, 0.0f, 1.0f);
-    size_t k = (size_t)std::llround((v.size() - 1) * q01);
-    std::nth_element(v.begin(), v.begin() + k, v.end());
-    return v[k];
-}
-
-// Robust helper: median via nth_element
-static float median_inplace(std::vector<float> &v)
-{
-    if (v.empty()) return 0.0f;
-    size_t k = v.size() / 2;
-    std::nth_element(v.begin(), v.begin() + k, v.end());
-    return v[k];
-}
-
-// Robust helper: MAD (median absolute deviation) around a known median
-static float mad_from_values(std::vector<float> v, float med)
-{
-    // Copy-by-value is intentional: we mutate into absolute deviations.
-    for (float &x : v) x = std::fabs(x - med);
-    return median_inplace(v);
-}
-
-struct MVTop
-{
-    float mag;
-    float dx, dy;
-    int mx, my;
-};
-
-static MVStats compute_mv_stats_and_topk(
-    VPIImage mv_cpu,
-    int mvW, int mvH,
-    int x0, int x1, int y0, int y1,
-    int step,
-    int topK,
-    std::vector<MVTop> &top,
-    float minMag, float maxMag)   // NEW: robust filtering band
-{
-    (void)mvW; (void)mvH;
-
-    MVStats st;
-    top.clear();
-    top.reserve((size_t)topK);
-
-    VPIImageData data;
-    std::memset(&data, 0, sizeof(data));
-    CHECK_VPI(vpiImageLockData(mv_cpu, VPI_LOCK_READ,
-                              VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &data));
-
-    const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
-    const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
-
-    // Store magnitudes for percentiles on all samples (legacy stats),
-    // plus a filtered set for robust stats.
-    std::vector<float> mags;
-    mags.reserve((size_t)((((x1-x0)+step-1)/step) * (((y1-y0)+step-1)/step)));
-
-    std::vector<float> magsR, dxsR, dysR;
-    magsR.reserve(mags.capacity());
-    dxsR.reserve(mags.capacity());
-    dysR.reserve(mags.capacity());
-
-    double sum  = 0.0;
-    double sum2 = 0.0;
-    double sum_dx = 0.0;
-    double sum_dy = 0.0;
-
-    float maxv = 0.0f;
-
-    auto top_push = [&](float mag, float dx, float dy, int mx, int my) {
-        if (topK <= 0) return;
-        if ((int)top.size() < topK) {
-            top.push_back({mag, dx, dy, mx, my});
-            if ((int)top.size() == topK) {
-                std::sort(top.begin(), top.end(),
-                          [](const MVTop &a, const MVTop &b){ return a.mag > b.mag; });
-            }
-            return;
-        }
-        if (mag <= top.back().mag) return;
-        top.back() = {mag, dx, dy, mx, my};
-        // Bubble down (keep sorted descending)
-        for (int i = topK - 1; i > 0; --i) {
-            if (top[i].mag > top[i-1].mag) std::swap(top[i], top[i-1]);
-            else break;
-        }
-    };
-
-    for (int my = y0; my < y1; my += step) {
-        const int16_t *row = (const int16_t *)(base + my * pitch);
-        for (int mx = x0; mx < x1; mx += step) {
-            int16_t fx = row[mx * 2 + 0];
-            int16_t fy = row[mx * 2 + 1];
-
-            float dx = s10_5_to_px(fx);
-            float dy = s10_5_to_px(fy);
-            float mag = std::hypot(dx, dy);
-
-            mags.push_back(mag);
-            st.samples++;
-
-            sum  += mag;
-            sum2 += (double)mag * (double)mag;
-            sum_dx += dx;
-            sum_dy += dy;
-
-            maxv = std::max(maxv, mag);
-
-            top_push(mag, dx, dy, mx, my);
-
-            // Robust sample set: keep only vectors within a reasonable magnitude band.
-            // This rejects tiny noise and extreme outliers cheaply.
-            if (mag >= minMag && mag <= maxMag) {
-                magsR.push_back(mag);
-                dxsR.push_back(dx);
-                dysR.push_back(dy);
-            }
-        }
+    int levels = 1;
+    int w = W, h = H;
+    while (true) {
+        int w2 = (w + 1) / 2;
+        int h2 = (h + 1) / 2;
+        if (w2 < 32 || h2 < 32) break;
+        w = w2; h = h2;
+        levels++;
     }
-
-    CHECK_VPI(vpiImageUnlock(mv_cpu));
-
-    // Legacy stats (all samples)
-    st.maxv = maxv;
-    if (st.samples > 0) {
-        st.mean = (float)(sum / (double)st.samples);
-        double var = (sum2 / (double)st.samples) -
-                     ((sum / (double)st.samples) * (sum / (double)st.samples));
-        st.stdv = (float)std::sqrt(std::max(0.0, var));
-
-        st.mean_dx = (float)(sum_dx / (double)st.samples);
-        st.mean_dy = (float)(sum_dy / (double)st.samples);
-        st.res_mag = (float)std::hypot(st.mean_dx, st.mean_dy);
-
-        st.p50 = percentile_inplace(mags, 0.50f);
-        st.p90 = percentile_inplace(mags, 0.90f);
-        st.p99 = percentile_inplace(mags, 0.99f);
-    }
-
-    // Robust stats (filtered samples)
-    st.robust_samples = (int)magsR.size();
-    if (st.robust_samples > 0) {
-        // Robust global motion: median dx/dy.
-        st.rob_dx = median_inplace(dxsR);
-        st.rob_dy = median_inplace(dysR);
-        st.rob_res_mag = (float)std::hypot(st.rob_dx, st.rob_dy);
-
-        // Robust magnitude spread: MAD around median magnitude.
-        st.med_mag = median_inplace(magsR);
-        st.mad_mag = mad_from_values(magsR, st.med_mag);
-
-        // Mean magnitude (for coherence score).
-        double sumMag = 0.0;
-        for (float m : magsR) sumMag += m;
-        st.mean_mag = (float)(sumMag / (double)st.robust_samples);
-
-        st.coherence = st.rob_res_mag / (st.mean_mag + 1e-6f);
-        st.coherence = std::clamp(st.coherence, 0.0f, 1.0f);
-    } else {
-        st.rob_dx = st.rob_dy = st.rob_res_mag = 0.0f;
-        st.mean_mag = st.med_mag = st.mad_mag = 0.0f;
-        st.coherence = 0.0f;
-    }
-
-    return st;
+    return levels;
 }
 
-static bool is_bad_frame_spike(const MVStats &s, float ratio, float minAbs)
+static inline void print_speed_mps(float speed_mps)
 {
-    // Spike-based rule:
-    // - Allow any global motion magnitude, reject only frames where
-    //   the tail explodes relative to the median/upper quantiles.
-    // - minAbs prevents tiny-noise cases from triggering on ratios.
-    if (s.samples <= 0) return false;
-
-    float p50 = std::max(1e-6f, s.p50);
-    float p90 = std::max(1e-6f, s.p90);
-
-    bool spike_tail = (s.p99 > p50 * ratio) || (s.maxv > p90 * ratio);
-    bool strong_enough = (s.maxv >= minAbs);
-
-    return spike_tail && strong_enough;
+    float speed_kmh = speed_mps * 3.6f;
+    std::fprintf(stdout, "%.3f m/s (%.2f km/h)\n", speed_mps, speed_kmh);
+    std::fflush(stdout);
 }
-
-// ----------------------------- State -----------------------------
 
 struct State
 {
@@ -363,42 +126,57 @@ struct State
     VPIPayload ofa_payload = nullptr;
     int grid = 2;
 
-    VPIImage mv_bl     = nullptr;
-    VPIImage mv_vic_pl = nullptr;
-    VPIImage mv_cpu    = nullptr;
+    // OFA output MV in block-linear
+    VPIImage mv_bl = nullptr;
+
+    // VIC->pitch-linear MV that is also CUDA-accessible (for GPU read)
+    VPIImage mv_vic_cuda_pl = nullptr;
 
     bool havePrev = false;
-    uint64_t frameCount = 0;
+
+    // ROI controls in normalized coordinates [0..1] in MV space.
+    // They are applied to MV grid dimensions (mvW, mvH).
+    float roiX0 = 0.15f;
+    float roiX1 = 0.85f;
+    float roiY0 = 0.20f;
+    float roiY1 = 0.80f;
+
 
     // Overlay controls
     bool overlayEnabled = true;
     int overlayStep = 12;
     float overlayScale = 3.5f;
-    int overlayMaxArrows = 4096;
 
-    // MV spike tail detection (kept as one gating component)
-    float badRatio = 3.0f;
-    float badMinAbs = 60.0f;
+    // Band-pass for MV magnitudes (px/frame)
+    float mvMinMag = 0.5f;
+    float mvMaxMag = 120.0f;
 
-    bool warnedMissingCaps = false;
+    // Gating thresholds
+    int   minSamples = 64;
+    float cohMin     = 0.30f;
+    float stdMax     = 12.0f;
+    float tailRatio  = 3.0f;
+    float tailMinAbs = 60.0f;
 
-    // Timing + last output
+    // Calibration
+    float pxPerM = 717.0f;
+
+    // Adaptive EMA
+    float emaAlphaHi = 0.50f;
+    float emaAlphaLo = 0.15f;
+
+    // Timing
     bool haveTime = false;
     std::chrono::steady_clock::time_point lastTime;
-    float lastSpeedMps = 0.0f;
 
-    // -------- Robust MV filtering + confidence (NEW) --------
-    float mvMinMag = 0.5f;     // ignore tiny noise vectors (px/frame)
-    float mvMaxMag = 120.0f;   // drop extreme outliers/saturation (px/frame)
-    float cohMin   = 0.30f;    // minimum coherence threshold (0..1)
-    float madMax   = 12.0f;    // maximum allowed MAD of magnitudes (px)
-    int   minRobustSamples = 64; // minimum robust samples to trust the frame
+    // GPU EMA state and speed output
+    DevEmaState *d_ema = nullptr;
+    float       *d_speed_out = nullptr;
 
-    // -------- Adaptive EMA smoothing (NEW) --------
-    float emaAlphaHi = 0.50f;  // used when confidence is excellent
-    float emaAlphaLo = 0.15f;  // used when confidence is acceptable
-    float speedEma   = 0.0f;
-    bool  haveEma    = false;
+    // CPU-side
+    float speed_host  = 0.0f;
+    float res_dx_host = 0.0f;
+    float res_dy_host = 0.0f;
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -415,29 +193,41 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
     st->W = W; st->H = H;
 
-    // Runtime controls via environment variables.
-    st->overlayEnabled    = (get_env_int("VPI_OF_OVERLAY", 1) != 0);
-    st->overlayStep       = std::max(1, get_env_int("VPI_OF_OVERLAY_STEP", 12));
-    st->overlayScale      = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", 3.5f));
-    st->overlayMaxArrows  = std::max(128, get_env_int("VPI_OF_OVERLAY_MAX_ARROWS", 4096));
+    // Env runtime controls
+    st->overlayEnabled = (get_env_int("VPI_OF_OVERLAY", 1) != 0);
+    st->overlayStep    = std::max(1, get_env_int("VPI_OF_OVERLAY_STEP", 12));
+    st->overlayScale   = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", 3.5f));
 
-    st->badRatio  = std::max(1.2f, get_env_float("VPI_OF_BAD_RATIO", 3.0f));
-    st->badMinAbs = std::max(0.0f, get_env_float("VPI_OF_BAD_MIN_ABS", 60.0f));
-
-    // Robust MV filtering + confidence (NEW)
     st->mvMinMag = std::max(0.0f, get_env_float("VPI_OF_MIN_MAG", 0.5f));
     st->mvMaxMag = std::max(st->mvMinMag + 0.1f, get_env_float("VPI_OF_MAX_MAG", 120.0f));
-    st->cohMin   = std::clamp(get_env_float("VPI_OF_COH_MIN", 0.30f), 0.0f, 1.0f);
-    st->madMax   = std::max(0.0f, get_env_float("VPI_OF_MAD_MAX", 12.0f));
-    st->minRobustSamples = std::max(16, get_env_int("VPI_OF_MIN_ROBUST_SAMPLES", 64));
 
-    // Adaptive EMA smoothing (NEW)
+    st->minSamples = std::max(16, get_env_int("VPI_OF_MIN_ROBUST_SAMPLES", 64));
+    st->cohMin     = std::clamp(get_env_float("VPI_OF_COH_MIN", 0.30f), 0.0f, 1.0f);
+    st->stdMax     = std::max(0.0f, get_env_float("VPI_OF_STD_MAX", 12.0f));
+
+    st->tailRatio  = std::max(1.0f, get_env_float("VPI_OF_TAIL_RATIO", 3.0f));
+    st->tailMinAbs = std::max(0.0f, get_env_float("VPI_OF_TAIL_MIN_ABS", 60.0f));
+
+    st->pxPerM = std::max(1.0f, get_env_float("VPI_OF_PX_PER_M", 717.0f));
+
     st->emaAlphaHi = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_HI", 0.50f), 0.0f, 1.0f);
     st->emaAlphaLo = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_LO", 0.15f), 0.0f, 1.0f);
 
+    // ROI (normalized) runtime controls.
+    // Example: export VPI_OF_ROI_X0=0.30 VPI_OF_ROI_X1=0.70 VPI_OF_ROI_Y0=0.35 VPI_OF_ROI_Y1=0.65
+    st->roiX0 = std::clamp(get_env_float("VPI_OF_ROI_X0", 0.15f), 0.0f, 1.0f);
+    st->roiX1 = std::clamp(get_env_float("VPI_OF_ROI_X1", 0.85f), 0.0f, 1.0f);
+    st->roiY0 = std::clamp(get_env_float("VPI_OF_ROI_Y0", 0.20f), 0.0f, 1.0f);
+    st->roiY1 = std::clamp(get_env_float("VPI_OF_ROI_Y1", 0.80f), 0.0f, 1.0f);
+
+    // Sanity: enforce non-empty ROI, otherwise fallback to defaults.
+    if (!(st->roiX1 > st->roiX0 + 0.01f)) { st->roiX0 = 0.15f; st->roiX1 = 0.85f; }
+    if (!(st->roiY1 > st->roiY0 + 0.01f)) { st->roiY0 = 0.20f; st->roiY1 = 0.80f; }
+
+
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
-    // Allocate Y8 images with CUDA backend so we can write from CUDA-EGL copy.
+    // CUDA-backed Y8 for CUDA-EGL copy
     CHECK_VPI(vpiImageCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
                              VPI_BACKEND_CUDA | VPI_BACKEND_CPU, &st->prev_y8_pl));
     CHECK_VPI(vpiImageCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
@@ -445,6 +235,7 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
     st->numLevels = max_levels_scale_half_min32(W, H);
 
+    // Pyramids
     CHECK_VPI(vpiPyramidCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
                               st->numLevels, st->pyrScale, 0, &st->prev_pyr_pl));
     CHECK_VPI(vpiPyramidCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
@@ -467,8 +258,8 @@ static void init_vpi_if_needed(State *st, int W, int H)
         CHECK_VPI(vpiImageCreateWrapperPyramidLevel(st->cur_pyr_bl,  lvl, &st->curLvlBL[lvl]));
     }
 
+    // OFA payload
     std::vector<int32_t> gridArr(st->numLevels, st->grid);
-
     CHECK_VPI(vpiCreateOpticalFlowDense(VPI_BACKEND_OFA,
                                        W, H,
                                        VPI_IMAGE_FORMAT_Y8_ER_BL,
@@ -476,101 +267,23 @@ static void init_vpi_if_needed(State *st, int W, int H)
                                        VPI_OPTICAL_FLOW_QUALITY_HIGH,
                                        &st->ofa_payload));
 
+    // MV images
     const int mvW = (W + st->grid - 1) / st->grid;
     const int mvH = (H + st->grid - 1) / st->grid;
 
     CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16_BL, 0, &st->mv_bl));
+
+    // IMPORTANT: destination supports VIC (writer) + CUDA (reader)
     CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16,
-                             VPI_BACKEND_VIC | VPI_BACKEND_CPU, &st->mv_vic_pl));
-    CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16,
-                             VPI_BACKEND_CPU, &st->mv_cpu));
+                             VPI_BACKEND_VIC | VPI_BACKEND_CUDA, &st->mv_vic_cuda_pl));
+
+    // Persistent GPU EMA + speed output
+    cudaMalloc(&st->d_ema, sizeof(DevEmaState));
+    cudaMalloc(&st->d_speed_out, sizeof(float));
+    cudaMemset(st->d_ema, 0, sizeof(DevEmaState));
+    cudaMemset(st->d_speed_out, 0, sizeof(float));
 
     st->inited = true;
-}
-
-struct Arrow;
-static int build_arrow_list_cpu(State *st, std::vector<Arrow> &arrows)
-{
-    arrows.clear();
-    arrows.reserve((size_t)st->overlayMaxArrows);
-
-    const int mvW = (st->W + st->grid - 1) / st->grid;
-    const int mvH = (st->H + st->grid - 1) / st->grid;
-
-    VPIImageData data;
-    std::memset(&data, 0, sizeof(data));
-
-    CHECK_VPI(vpiImageLockData(st->mv_cpu, VPI_LOCK_READ,
-                              VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &data));
-
-    const uint8_t *base = (const uint8_t*)data.buffer.pitch.planes[0].data;
-    const int pitch     = (int)data.buffer.pitch.planes[0].pitchBytes;
-
-    // Center ROI used for arrows too (matches stats ROI)
-    int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
-    int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
-
-    const int step = st->overlayStep;
-    const float scale = st->overlayScale;
-    const float maxLenPx = 80.0f;
-
-    for (int my = y0; my < y1; my += step) {
-        const int16_t *row = (const int16_t *)(base + my * pitch);
-        for (int mx = x0; mx < x1; mx += step) {
-            int16_t fx = row[mx * 2 + 0];
-            int16_t fy = row[mx * 2 + 1];
-
-            float dx = s10_5_to_px(fx);
-            float dy = s10_5_to_px(fy);
-
-            float mag = std::abs(dx) + std::abs(dy);
-            if (mag < 0.30f) continue;
-
-            float clx = std::clamp(dx, -maxLenPx, maxLenPx);
-            float cly = std::clamp(dy, -maxLenPx, maxLenPx);
-
-            int px0 = mx * st->grid;
-            int py0 = my * st->grid;
-            int px1 = px0 + (int)lrintf(clx * scale);
-            int py1 = py0 + (int)lrintf(cly * scale);
-
-            px1 = std::clamp(px1, 0, st->W - 1);
-            py1 = std::clamp(py1, 0, st->H - 1);
-
-            arrows.push_back({px0, py0, px1, py1});
-            if ((int)arrows.size() >= st->overlayMaxArrows) break;
-        }
-        if ((int)arrows.size() >= st->overlayMaxArrows) break;
-    }
-
-    CHECK_VPI(vpiImageUnlock(st->mv_cpu));
-    return (int)arrows.size();
-}
-
-// ----------------------------- Speed helpers -----------------------------
-
-static inline float compute_speed_mps_from_dt(float res_mag_px_per_pair, float dtSec)
-{
-    // PX_PER_M: pixels per meter (calibration)
-    constexpr float PX_PER_M = 717.0f;
-
-    if (!(dtSec > 0.0f)) return 0.0f;
-
-    // m/s = (px / PX_PER_M) / dt
-    return (res_mag_px_per_pair / PX_PER_M) / dtSec;
-}
-
-static inline void print_speed_mps(float speed_mps)
-{
-    float speed_kmh = speed_mps * 3.6f;
-    // Requirement in your project: keep the printing format as you want.
-    std::fprintf(stdout, "%.3f m/s (%.2f km/h)\n", speed_mps, speed_kmh);
-    std::fflush(stdout);
-}
-
-static inline void print_speed_zero()
-{
-    print_speed_mps(0.0f);
 }
 
 static void gpu_process(EGLImageKHR image, void **userPtr)
@@ -580,38 +293,30 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     static bool cu_inited = false;
     if (!cu_inited) { cuInit(0); cu_inited = true; }
 
-    // Size from caps OR env fallback
+    // Size from caps or env fallback
     int W = st->W, H = st->H;
     if (W <= 0 || H <= 0) {
-        if (!get_size_from_env(W, H)) {
-            // No extra prints allowed; skip silently.
-            return;
-        }
+        if (!get_size_from_env(W, H)) return;
         st->W = W; st->H = H;
     }
 
     init_vpi_if_needed(st, W, H);
 
-    // Timing: compute dt (seconds) between callbacks.
+    // dt on CPU
     auto now = std::chrono::steady_clock::now();
     float dtSec = 0.0f;
-
     if (!st->haveTime) {
         st->haveTime = true;
         st->lastTime = now;
     } else {
         dtSec = std::chrono::duration<float>(now - st->lastTime).count();
         st->lastTime = now;
-
-        // Clamp dt to avoid pathological scheduler hiccups.
-        // Accept roughly ~10..80 fps.
         dtSec = std::clamp(dtSec, 1.0f/80.0f, 1.0f/10.0f);
     }
+    float useDt = (dtSec > 0.0f) ? dtSec : (1.0f / 30.0f);
 
-    // Ingest: copy NV12 luma (Y) from EGLImage -> cur_y8_pl (CUDA memory)
-    VPIImageData ydata;
-    std::memset(&ydata, 0, sizeof(ydata));
-
+    // Copy NV12 luma (Y) from EGLImage to CUDA-backed VPI Y8
+    VPIImageData ydata{};
     CHECK_VPI(vpiImageLockData(st->cur_y8_pl, VPI_LOCK_WRITE,
                               VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &ydata));
 
@@ -622,13 +327,9 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     CHECK_VPI(vpiImageUnlock(st->cur_y8_pl));
 
-    // First frame: no previous frame available -> speed is 0
+    // First frame
     if (!st->havePrev) {
-        print_speed_zero();
-        st->lastSpeedMps = 0.0f;
-        st->speedEma = 0.0f;
-        st->haveEma = false;
-
+        print_speed_mps(0.0f);
         std::swap(st->prev_y8_pl, st->cur_y8_pl);
         st->havePrev = true;
         return;
@@ -641,7 +342,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                                                st->cur_y8_pl,  st->cur_pyr_pl,  VPI_BORDER_CLAMP));
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Phase B (VIC): per-level PL->BL conversions
+    // Phase B (VIC): PL->BL per level
     for (int lvl = 0; lvl < st->numLevels; ++lvl) {
         CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
                                              st->prevLvlPL[lvl], st->prevLvlBL[lvl], nullptr));
@@ -655,117 +356,97 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                                               st->ofa_payload,
                                               st->prev_pyr_bl, st->cur_pyr_bl,
                                               st->mv_bl));
-    st->frameCount++;
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Convert MV to CPU for robust statistics and speed.
+    // Convert MV: BL -> pitch-linear using VIC (CUDA conversion not available in VPI 2.4)
     CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
-                                         st->mv_bl, st->mv_vic_pl, nullptr));
-    CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_CPU,
-                                         st->mv_vic_pl, st->mv_cpu, nullptr));
+                                         st->mv_bl, st->mv_vic_cuda_pl, nullptr));
     CHECK_VPI(vpiStreamSync(st->stream));
+
+    // Lock pitch-linear MV as CUDA
+    VPIImageData mvdata{};
+    CHECK_VPI(vpiImageLockData(st->mv_vic_cuda_pl, VPI_LOCK_READ,
+                              VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &mvdata));
+
+    const int16_t *mvPtr = (const int16_t*)mvdata.buffer.pitch.planes[0].data;
+    int mvPitchBytes     = (int)mvdata.buffer.pitch.planes[0].pitchBytes;
 
     const int mvW = (W + st->grid - 1) / st->grid;
     const int mvH = (H + st->grid - 1) / st->grid;
 
-    // Central ROI in MV grid space
-    int x0 = (int)(mvW * 0.15f), x1 = (int)(mvW * 0.85f);
-    int y0 = (int)(mvH * 0.20f), y1 = (int)(mvH * 0.80f);
+    // ROI in MV space derived from normalized settings.
+    int x0 = (int)((float)mvW * st->roiX0 + 0.5f);
+    int x1 = (int)((float)mvW * st->roiX1 + 0.5f);
+    int y0 = (int)((float)mvH * st->roiY0 + 0.5f);
+    int y1 = (int)((float)mvH * st->roiY1 + 0.5f);
 
-    // Compute stats (robust + percentiles) on the same sampling step as overlay.
-    std::vector<MVTop> topDummy;
-    MVStats s = compute_mv_stats_and_topk(
-        st->mv_cpu, mvW, mvH,
-        x0, x1, y0, y1,
-        st->overlayStep, /*topK*/1, topDummy,
-        st->mvMinMag, st->mvMaxMag);
 
-    // dt fallback if timing not ready
-    float useDt = (dtSec > 0.0f) ? dtSec : (1.0f / 30.0f);
+    // Clamp and ensure non-empty ROI (at least a few cells).
+    x0 = std::clamp(x0, 0, mvW - 1);
+    x1 = std::clamp(x1, x0 + 1, mvW);
+    y0 = std::clamp(y0, 0, mvH - 1);
+    y1 = std::clamp(y1, y0 + 1, mvH);
 
-    // Confidence / gating signals:
-    // 1) tail spike explosion (your original rule)
-    bool tailSpike = is_bad_frame_spike(s, st->badRatio, st->badMinAbs);
 
-    // 2) low robust sample count -> unreliable estimate
-    bool lowSamples = (s.robust_samples < st->minRobustSamples);
+    MVParams p{};
+    p.mvW = mvW; p.mvH = mvH;
+    p.mvPitchBytes = mvPitchBytes;
+    p.grid = st->grid;
 
-    // 3) directional coherence too low -> vectors disagree strongly
-    bool lowCoherence = (s.coherence < st->cohMin);
+    p.x0 = x0; p.x1 = x1;
+    p.y0 = y0; p.y1 = y1;
+    p.step = st->overlayStep;
 
-    // 4) robust magnitude spread too high -> noisy/outlier-heavy field
-    bool highMad = (s.mad_mag > st->madMax);
+    p.minMag = st->mvMinMag;
+    p.maxMag = st->mvMaxMag;
 
-    bool badFrame = tailSpike || lowSamples || lowCoherence || highMad;
+    p.minSamples = st->minSamples;
+    p.cohMin     = st->cohMin;
+    p.stdMax     = st->stdMax;
+    p.tailRatio  = st->tailRatio;
+    p.tailMinAbs = st->tailMinAbs;
 
-    // Compute raw speed from robust resultant (median dx/dy).
-    float speed_raw_mps = compute_speed_mps_from_dt(s.rob_res_mag, useDt);
+    p.pxPerMeter = st->pxPerM;
+    p.dtSec      = useDt;
 
-    // If frame is bad: hold last EMA (or lastSpeedMps if EMA isn't ready).
-    // We still reseed prev=cur to keep N vs N-1 pairing (no skip in the chain).
-    if (badFrame) {
-        float out = st->haveEma ? st->speedEma : st->lastSpeedMps;
-        print_speed_mps(out);
+    p.alphaHi = st->emaAlphaHi;
+    p.alphaLo = st->emaAlphaLo;
 
-        std::swap(st->prev_y8_pl, st->cur_y8_pl);
-        st->havePrev = true;
-        return;
-    }
+    p.cohExcellent    = std::min(0.85f, st->cohMin + 0.30f);
+    p.stdExcellentMax = st->stdMax * 0.60f;
 
-    // Adaptive EMA smoothing:
-    // - excellent confidence -> alphaHi (more responsive)
-    // - acceptable confidence -> alphaLo (more stable)
-    bool excellent =
-        (s.coherence >= std::min(0.85f, st->cohMin + 0.30f)) &&
-        (s.mad_mag <= st->madMax * 0.60f);
+    // GPU reduction + gating + EMA
+    mv_reduce_gating_ema_cuda(mvPtr, st->d_ema, &p, st->d_speed_out, nullptr);
 
-    float alpha = excellent ? st->emaAlphaHi : st->emaAlphaLo;
+    // Copy results to CPU (tiny)
+    cudaMemcpy(&st->speed_host, st->d_speed_out, sizeof(float), cudaMemcpyDeviceToHost);
 
-    if (!st->haveEma) {
-        st->speedEma = speed_raw_mps;
-        st->haveEma = true;
-    } else {
-        st->speedEma = (1.0f - alpha) * st->speedEma + alpha * speed_raw_mps;
-    }
+    DevEmaState emaHost{};
+    cudaMemcpy(&emaHost, st->d_ema, sizeof(DevEmaState), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
 
-    float speed_mps = st->speedEma;
-    st->lastSpeedMps = speed_mps;
+    st->res_dx_host = emaHost.lastResDx;
+    st->res_dy_host = emaHost.lastResDy;
 
-    print_speed_mps(speed_mps);
+    // Print on CPU
+    print_speed_mps(st->speed_host);
 
-    // Overlay:
-    // - Red vector field
-    // - Blue robust resultant arrow at image center
+    // Overlay on GPU
     if (st->overlayEnabled) {
-        // Red field arrows
-        std::vector<Arrow> arrows;
-        int n = build_arrow_list_cpu(st, arrows);
-        if (n > 0) {
-            overlay_draw_arrows_nv12(image, W, H, arrows.data(), n,
-                                     /*Y*/76, /*U*/85, /*V*/255);
-        }
-
-        // Blue robust resultant at center
-        int cx = W / 2;
-        int cy = H / 2;
-
-        // Use robust dx/dy (median) for a stable direction arrow.
-        float dx = s.rob_dx;
-        float dy = s.rob_dy;
-
-        float sc = st->overlayScale;
-        int x1p = cx + (int)lrintf(dx * sc);
-        int y1p = cy + (int)lrintf(dy * sc);
-
-        x1p = std::clamp(x1p, 0, W - 1);
-        y1p = std::clamp(y1p, 0, H - 1);
-
-        Arrow res = {cx, cy, x1p, y1p};
-        overlay_draw_arrows_nv12(image, W, H, &res, 1,
-                                 /*Blue (approx)*/29, 255, 107);
+        overlay_draw_mvs_nv12(image, W, H,
+                              mvPtr, mvPitchBytes,
+                              mvW, mvH, st->grid,
+                              x0, x1, y0, y1,
+                              st->overlayStep, st->overlayScale,
+                              0.30f,
+                              76, 85, 255,
+                              st->res_dx_host, st->res_dy_host,
+                              29, 255, 107);
     }
 
-    // Normal advance
+    CHECK_VPI(vpiImageUnlock(st->mv_vic_cuda_pl));
+
+    // Advance
     std::swap(st->prev_y8_pl, st->cur_y8_pl);
 }
 
@@ -783,7 +464,7 @@ static void pre_process(void **, unsigned int *inW, unsigned int *inH,
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*,
                          ColorFormat*, unsigned int, void **)
 {
-    // Intentionally do not free here.
+    // No frees here.
 }
 
 extern "C" void init(CustomerFunction *f)
@@ -792,8 +473,6 @@ extern "C" void init(CustomerFunction *f)
     f->fPreProcess  = pre_process;
     f->fGPUProcess  = gpu_process;
     f->fPostProcess = post_process;
-
-    // No prints here (keep stdout reserved for per-frame speed output).
 }
 
 extern "C" void deinit(void)

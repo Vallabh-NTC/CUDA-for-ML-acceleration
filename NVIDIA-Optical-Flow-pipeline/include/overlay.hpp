@@ -1,29 +1,26 @@
 #pragma once
 #include <cstdint>
 
-// Forward typedef to avoid pulling EGL headers in CUDA TU headers.
+// Forward typedef to avoid pulling EGL headers into CUDA TU headers.
 typedef void* EGLImageKHR;
-
-struct Arrow
-{
-    int x0, y0, x1, y1;
-};
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Draw arrows on NV12 in-place via CUDA-EGL interop.
-// Color is specified as NV12 luma/chroma (Y,U,V).
-// - eglImage: EGLImageKHR from nvivafilter callback
-// - W,H: frame size
-// - arrows: CPU array
-// - n: number of arrows
-// - Y,U,V: desired arrow color in YUV (NV12)
-void overlay_draw_arrows_nv12(EGLImageKHR eglImage,
-                              int W, int H,
-                              const Arrow *arrows, int n,
-                              uint8_t Y, uint8_t U, uint8_t V);
+// Draw MV field arrows (red) and one resultant arrow (blue-ish) directly from pitch-linear MV buffer.
+// mvPtr points to device memory: 2S16 interleaved (dx,dy) in S10.5.
+// mvPitchBytes is pitch in bytes of mvPtr.
+void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
+                           int W, int H,
+                           const int16_t *mvPtr, int mvPitchBytes,
+                           int mvW, int mvH, int grid,
+                           int x0, int x1, int y0, int y1,
+                           int step, float scale,
+                           float minMagDraw,
+                           uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
+                           float resDxPx, float resDyPx,
+                           uint8_t resY, uint8_t resU, uint8_t resV);
 
 #ifdef __cplusplus
 }
