@@ -5,39 +5,7 @@
 // NVDEC -> NVMM(NV12) -> nvivafilter (this .so) -> NVMM
 //
 // VPI 2.4 + OFA Dense Optical Flow.
-//
-// Key constraint on VPI 2.4:
-// - CUDA conversion is NOT implemented for 2S16_BL -> 2S16.
-// - Locking OFA output (2S16_BL) as CUDA_ARRAY might not be supported.
-// Therefore we use VIC to convert mv_bl -> mv_pl (2S16 pitch-linear),
-// and then lock mv_pl as CUDA_PITCH_LINEAR for GPU reduction/overlay.
-//
-// CPU does only dt timing + stdout printing.
-//
-// NEW (visual-only overlay):
-// - Direction forcing towards resultant direction with ±10° jitter (handled in overlay.cu/overlay.hpp).
-//
-// NEW (logging for plotting):
-// - Optional CSV logging of printed speeds and resultant components.
-// - Enable with env:
-//     export VPI_OF_LOG=1
-//     export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
-// - CSV columns:
-//     frame,t_sec,dt_sec,speed_mps,speed_kmh,res_dx_px,res_dy_px
-//
-// NEW (IMU overlay):
-// - Optional IMU CSV load + compute resultant (linear accel XY) and draw as green arrow.
-// - Enable with env:
-//     export VPI_OF_IMU=1
-//     export VPI_OF_IMU_PATH=/path/to/imu.csv
-// - CSV must contain columns: acc_x, acc_y, acc_z
-// - Per-frame index mapping: imu_row = frameId (clamped)
-// - IMU pipeline matches your python:
-//     1) rotate raw accel into level frame (alpha deg, default 0)
-//     2) subtract gravity in level frame
-//     3) Y bias compensation
-//     4) low-pass filter
-// - IMU arrow is visual-only: values are m/s^2, scaled by VPI_OF_IMU_OVERLAY_SCALE (pixels per m/s^2).
+
 //
 
 #include <cstdio>
