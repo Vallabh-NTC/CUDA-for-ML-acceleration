@@ -20,45 +20,58 @@ cmake -S . -B build \
 
 cmake --build build -j"$(nproc)" --verbose
 
+
+# ------------------------------------------------------------
+# VPI OF speed + overlay (Jetson Orin / VPI 2.4) - recommended
+# ------------------------------------------------------------
+
+# IMPORTANT: force size if caps are not propagated to the filter
+export VPI_OF_W=1280
+export VPI_OF_H=1720
+
+# Overlay
+export VPI_OF_OVERLAY=1
+export VPI_OF_OVERLAY_STEP=2
+export VPI_OF_OVERLAY_SCALE=3.5
+
+# ROI in MV space (normalized 0..1)
 export VPI_OF_ROI_X0=0.3487
 export VPI_OF_ROI_X1=0.6615
 export VPI_OF_ROI_Y0=0.3823
 export VPI_OF_ROI_Y1=0.6049
 
+# Magnitude band-pass (px/frame)
+export VPI_OF_MIN_MAG=0.9
+export VPI_OF_MAX_MAG=75.0
 
-export VPI_OF_OVERLAY_STEP=2
-
-
-## Strong robustness against shadow-induced random vectors
-# Robust gating
-export VPI_OF_COH_MIN=0.60
-export VPI_OF_STD_MAX=6.0
-export VPI_OF_MIN_ROBUST_SAMPLES=160
+# Gating / robustness
+export VPI_OF_MIN_ROBUST_SAMPLES=64
+export VPI_OF_COH_MIN=0.30
+export VPI_OF_STD_MAX=12.0
 
 # Tail spike rejection
 export VPI_OF_TAIL_RATIO=2.0
 export VPI_OF_TAIL_MIN_ABS=35.0
 
-# Magnitude band-pass
-export VPI_OF_MIN_MAG=0.9
-export VPI_OF_MAX_MAG=75.0
+# Calibration (px per meter) -> speed in m/s
+export VPI_OF_PX_PER_M=717.0
 
-# Luma gates
-export VPI_OF_GRAD_MIN=20
-export VPI_OF_DY_MAX=26
-
-# NEW: direction + trimming + accel limiter
-export VPI_OF_DIR_COS_MIN=0.78     # 0.70..0.85 typical
-export VPI_OF_TRIM_K=2.5           # 2.0..3.0 typical
-export VPI_OF_MAX_ACCEL=10.0       # 6..15 typical
-
-# EMA
+# EMA smoothing
 export VPI_OF_EMA_ALPHA_HI=0.45
 export VPI_OF_EMA_ALPHA_LO=0.10
 
+# Optional logging (CSV)
+export VPI_OF_LOG=1
+export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
 
-export VPI_OF_FORBID=1
-export VPI_OF_FORBID_MLOW=-0.30
-export VPI_OF_FORBID_MHIGH=+0.30
+# IMU resultant
+export VPI_OF_IMU=1
+export VPI_OF_IMU_PATH=/home/ntc-orin/Front_and_back_movement_car_test/imu.csv
 
+# optional 
+export VPI_OF_IMU_ALPHA_DEG=0.0
+export VPI_OF_IMU_G=9.81
+export VPI_OF_IMU_AY_BIAS=-2.0
+export VPI_OF_IMU_LPF_ALPHA=0.01
+export VPI_OF_IMU_OVERLAY_SCALE=40.0
 

@@ -2,6 +2,9 @@
 // CUDA overlay on NV12 EGLImage (Jetson NVMM surface-array friendly).
 // Reads MV field from a CUDA pitch-linear buffer (2S16 interleaved S10.5) and draws arrows.
 //
+// NEW: optional IMU resultant arrow (green) drawn alongside OF resultant (blue).
+// IMU vector is in m/s^2 (linear accel) and is visual-only. imuScale controls pixels per (m/s^2).
+//
 
 #include <cstdint>
 #include <cstring>
@@ -74,41 +77,6 @@ __device__ inline void drawLine_ptr(uint8_t *Y, uint8_t *UV,
     }
 }
 
-__device__ inline void putY_surf(cudaSurfaceObject_t sY, int W, int H, int x, int y, uint8_t v)
-{
-    if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H) surf2Dwrite(v, sY, x, y);
-}
-
-__device__ inline void putUV_surf(cudaSurfaceObject_t sUV, int W, int H, int x, int y, uint8_t U, uint8_t V)
-{
-    int uvx = x >> 1;
-    int uvy = y >> 1;
-    int uvW = W >> 1;
-    int uvH = H >> 1;
-    if ((unsigned)uvx < (unsigned)uvW && (unsigned)uvy < (unsigned)uvH) {
-        uint16_t uv = (uint16_t)U | ((uint16_t)V << 8);
-        surf2Dwrite(uv, sUV, uvx * 2, uvy);
-    }
-}
-
-__device__ inline void drawLine_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_t sUV,
-                                     int W, int H,
-                                     int x0, int y0, int x1, int y1,
-                                     uint8_t Yc, uint8_t Uc, uint8_t Vc)
-{
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    while (true) {
-        putY_surf(sY, W, H, x0, y0, Yc);
-        putUV_surf(sUV, W, H, x0, y0, Uc, Vc);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
 // Draw one arrow with a simple arrowhead (pointer path)
 __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
                                      int pitchY, int pitchUV,
@@ -136,34 +104,6 @@ __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
 
     drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh1, yh1, Yc, Uc, Vc);
     drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh2, yh2, Yc, Uc, Vc);
-}
-
-// Draw one arrow with a simple arrowhead (surface path)
-__device__ inline void drawArrow_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_t sUV,
-                                      int W, int H,
-                                      int x0, int y0, int x1, int y1,
-                                      uint8_t Yc, uint8_t Uc, uint8_t Vc)
-{
-    drawLine_surf(sY, sUV, W, H, x0, y0, x1, y1, Yc, Uc, Vc);
-
-    int hx = x1 - x0;
-    int hy = y1 - y0;
-    if (hx == 0 && hy == 0) return;
-
-    int px = -hy, py = hx;
-    int len = max(1, abs(hx) + abs(hy));
-    int ahx = (hx * 6) / len;
-    int ahy = (hy * 6) / len;
-    int apx = (px * 4) / len;
-    int apy = (py * 4) / len;
-
-    int xh1 = x1 - ahx + apx;
-    int yh1 = y1 - ahy + apy;
-    int xh2 = x1 - ahx - apx;
-    int yh2 = y1 - ahy - apy;
-
-    drawLine_surf(sY, sUV, W, H, x1, y1, xh1, yh1, Yc, Uc, Vc);
-    drawLine_surf(sY, sUV, W, H, x1, y1, xh2, yh2, Yc, Uc, Vc);
 }
 
 // Kernel: draw MV field arrows from pitch-linear MV buffer.
@@ -206,8 +146,8 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
     if (magL1 < minMagDraw) return;
 
     // ------------------------------------------------------------------
-    // VISUAL ONLY: If a local MV is too far from resultant direction,
-    // draw it aligned to resultant direction, with a small jitter ±forceDeg.
+    // VISUAL ONLY: If a local MV deviates too much from the OF resultant direction,
+    // draw it aligned to the resultant direction, with a small jitter ±forceDeg.
     // ------------------------------------------------------------------
     float resMagL1 = fabsf(resDxPx) + fabsf(resDyPx);
     if (forceDeg > 0.0f && resMagL1 >= forceMinResMag)
@@ -262,7 +202,7 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
     drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, px0, py0, px1, py1, Yc, Uc, Vc);
 }
 
-// Kernel: draw resultant arrow at center
+// Kernel: draw OF resultant arrow at center
 __global__ void drawResultantPitchKernel(uint8_t *Y, uint8_t *UV,
                                          int pitchY, int pitchUV,
                                          int W, int H,
@@ -284,6 +224,31 @@ __global__ void drawResultantPitchKernel(uint8_t *Y, uint8_t *UV,
     drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, cx, cy, x1, y1, Yc, Uc, Vc);
 }
 
+// Kernel: draw IMU resultant arrow (visual-only) with slight offset
+__global__ void drawImuPitchKernel(uint8_t *Y, uint8_t *UV,
+                                   int pitchY, int pitchUV,
+                                   int W, int H,
+                                   float imuDx, float imuDy,
+                                   float imuScale,
+                                   uint8_t Yc, uint8_t Uc, uint8_t Vc)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    if ((fabsf(imuDx) + fabsf(imuDy)) < 1e-6f) return;
+
+    // Offset to avoid perfect overlap with OF arrow
+    int cx = W / 2 + 14;
+    int cy = H / 2 + 14;
+
+    int x1 = cx + (int)lrintf(imuDx * imuScale);
+    int y1 = cy + (int)lrintf(imuDy * imuScale);
+
+    x1 = max(0, min(W - 1, x1));
+    y1 = max(0, min(H - 1, y1));
+
+    drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, cx, cy, x1, y1, Yc, Uc, Vc);
+}
+
 extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                                       int W, int H,
                                       const int16_t *mvPtr, int mvPitchBytes,
@@ -294,7 +259,11 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                                       uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
                                       float resDxPx, float resDyPx,
                                       uint8_t resY, uint8_t resU, uint8_t resV,
-                                      // NEW: visual forcing options
+                                      // IMU resultant (optional)
+                                      float imuDx, float imuDy,
+                                      float imuScale,
+                                      uint8_t imuY, uint8_t imuU, uint8_t imuV,
+                                      // visual forcing
                                       float forceDeg,
                                       float forceMinResMag,
                                       uint32_t frameTag)
@@ -335,7 +304,7 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
         dim3 gridD((sxN + block.x - 1) / block.x,
                    (syN + block.y - 1) / block.y);
 
-        // Field overlay with optional visual forcing
+        // Field overlay with optional visual forcing towards OF resultant direction
         drawFieldPitchKernel<<<gridD, block, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             mvPtr, mvPitchBytes, mvW, mvH, grid,
@@ -345,11 +314,17 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
             forceDeg, forceMinResMag, frameTag,
             fieldY, fieldU, fieldV);
 
-        // Resultant arrow
+        // OF resultant arrow (blue)
         drawResultantPitchKernel<<<1, 1, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             resDxPx, resDyPx, scale,
             resY, resU, resV);
+
+        // IMU resultant arrow (green) - optional; disabled if imuDx/imuDy ~ 0
+        drawImuPitchKernel<<<1, 1, 0, stream>>>(
+            Y, UV, pitchY, pitchUV, W, H,
+            imuDx, imuDy, imuScale,
+            imuY, imuU, imuV);
 
         cudaGetLastError(); // swallow
         cudaStreamSynchronize(stream);

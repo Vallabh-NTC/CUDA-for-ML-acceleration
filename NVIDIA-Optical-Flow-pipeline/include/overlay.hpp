@@ -9,9 +9,14 @@ typedef void* EGLImageKHR;
 extern "C" {
 #endif
 
-// Draw MV field arrows and one resultant arrow directly from pitch-linear MV buffer.
+// Draw MV field arrows and one OF resultant arrow + optional IMU resultant arrow.
 // mvPtr points to device memory: 2S16 interleaved (dx,dy) in S10.5.
 // mvPitchBytes is pitch in bytes of mvPtr.
+//
+// NOTE:
+// - OF resultant vector is in px/frame.
+// - IMU resultant vector (imuDx, imuDy) is in m/s^2 (linear accel) filtered,
+//   so it's purely visual. Use imuScale to convert into pixels.
 //
 void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                            int W, int H,
@@ -23,6 +28,11 @@ void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                            uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
                            float resDxPx, float resDyPx,
                            uint8_t resY, uint8_t resU, uint8_t resV,
+                           // IMU resultant (optional): pass 0,0 to disable
+                           float imuDx, float imuDy,
+                           float imuScale,
+                           uint8_t imuY, uint8_t imuU, uint8_t imuV,
+                           // Visual-only direction forcing options
                            float forceDeg,
                            float forceMinResMag,
                            uint32_t frameTag);

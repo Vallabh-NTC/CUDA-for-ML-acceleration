@@ -24,6 +24,21 @@
 //     export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
 // - CSV columns:
 //     frame,t_sec,dt_sec,speed_mps,speed_kmh,res_dx_px,res_dy_px
+//
+// NEW (IMU overlay):
+// - Optional IMU CSV load + compute resultant (linear accel XY) and draw as green arrow.
+// - Enable with env:
+//     export VPI_OF_IMU=1
+//     export VPI_OF_IMU_PATH=/path/to/imu.csv
+// - CSV must contain columns: acc_x, acc_y, acc_z
+// - Per-frame index mapping: imu_row = frameId (clamped)
+// - IMU pipeline matches your python:
+//     1) rotate raw accel into level frame (alpha deg, default 0)
+//     2) subtract gravity in level frame
+//     3) Y bias compensation
+//     4) low-pass filter
+// - IMU arrow is visual-only: values are m/s^2, scaled by VPI_OF_IMU_OVERLAY_SCALE (pixels per m/s^2).
+//
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +48,8 @@
 #include <chrono>
 #include <vector>
 #include <cmath>
+#include <string>
+#include <fstream>
 
 // For line-buffering macro _IOLBF
 #include <cstdio>
@@ -200,6 +217,30 @@ struct State
     std::chrono::steady_clock::time_point logT0;
     bool haveLogT0 = false;
     char logPath[512] = {0};
+
+    // ----------------------------
+    // IMU overlay (optional)
+    // ----------------------------
+    bool imuEnabled = false;
+    bool imuLoaded  = false;
+    char imuPath[512] = {0};
+
+    struct ImuRow { float ax, ay, az; };
+    std::vector<ImuRow> imuRows;
+
+    // IMU pipeline constants (match python defaults)
+    float imuAlphaDeg  = 0.0f;   // tilt alpha deg (default 0)
+    float imuG         = 9.81f;  // gravity magnitude
+    float imuAyBias    = -2.0f;  // AY_BIAS
+    float imuLpfAlpha  = 0.01f;  // LPF_ALPHA
+
+    // IMU LPF state
+    float imuAxFilt = 0.0f;
+    float imuAyFilt = 0.0f;
+    bool  imuLpfInit = false;
+
+    // Visual scale: pixels per (m/s^2)
+    float imuOverlayScale = 40.0f;
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -209,6 +250,10 @@ static State* get_or_create_state(void **userPtr)
     if (userPtr) *userPtr = st;
     return st;
 }
+
+// ----------------------------
+// CSV logging
+// ----------------------------
 
 // Open CSV log if enabled by env vars.
 static void log_open_if_needed(State *st)
@@ -233,7 +278,7 @@ static void log_open_if_needed(State *st)
         return;
     }
 
-    // Line-buffered: one line per frame, safe if pipeline is killed.
+    // Line-buffered: one line per frame, safer if pipeline is killed.
     std::setvbuf(st->logFile, nullptr, _IOLBF, 0);
 
     // CSV header.
@@ -278,6 +323,171 @@ static void log_close(State *st)
         std::fflush(st->logFile);
         std::fclose(st->logFile);
         st->logFile = nullptr;
+    }
+}
+
+// ----------------------------
+// IMU CSV loader + pipeline
+// ----------------------------
+
+// Very small CSV splitter: handles commas and optional quotes.
+// Good enough for numeric CSVs.
+static std::vector<std::string> split_csv_line_simple(const std::string &line)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    cur.reserve(line.size());
+    bool inQuotes = false;
+
+    for (char c : line) {
+        if (c == '"') { inQuotes = !inQuotes; continue; }
+        if (!inQuotes && c == ',') {
+            out.push_back(cur);
+            cur.clear();
+            continue;
+        }
+        cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
+}
+
+static int find_col_idx(const std::vector<std::string> &hdr, const char *name)
+{
+    for (int i = 0; i < (int)hdr.size(); ++i) {
+        if (hdr[i] == name) return i;
+    }
+    return -1;
+}
+
+// Load IMU CSV into memory if enabled.
+// Enable with:
+//   export VPI_OF_IMU=1
+//   export VPI_OF_IMU_PATH=/path/to/imu.csv
+// CSV requires columns acc_x, acc_y, acc_z.
+static void imu_load_if_needed(State *st)
+{
+    if (!st) return;
+    if (st->imuLoaded) return;
+
+    st->imuEnabled = (get_env_int("VPI_OF_IMU", 0) != 0);
+    if (!st->imuEnabled) { st->imuLoaded = true; return; }
+
+    const char *p = std::getenv("VPI_OF_IMU_PATH");
+    if (!p || !p[0]) p = "/home/ntc-orin/Front_and_back_movement_car_test/imu.csv";
+    std::snprintf(st->imuPath, sizeof(st->imuPath), "%s", p);
+
+    // Optional overrides (defaults match your python snippet)
+    st->imuAlphaDeg     = get_env_float("VPI_OF_IMU_ALPHA_DEG", 0.0f);
+    st->imuG            = get_env_float("VPI_OF_IMU_G", 9.81f);
+    st->imuAyBias       = get_env_float("VPI_OF_IMU_AY_BIAS", -2.0f);
+    st->imuLpfAlpha     = std::clamp(get_env_float("VPI_OF_IMU_LPF_ALPHA", 0.01f), 0.0f, 1.0f);
+    st->imuOverlayScale = std::max(0.1f, get_env_float("VPI_OF_IMU_OVERLAY_SCALE", 40.0f));
+
+    std::ifstream in(st->imuPath);
+    if (!in.good()) {
+        std::fprintf(stderr, "[vpi_of] WARNING: cannot open IMU CSV: %s\n", st->imuPath);
+        st->imuEnabled = false;
+        st->imuLoaded = true;
+        return;
+    }
+
+    std::string header;
+    if (!std::getline(in, header)) {
+        std::fprintf(stderr, "[vpi_of] WARNING: IMU CSV empty: %s\n", st->imuPath);
+        st->imuEnabled = false;
+        st->imuLoaded = true;
+        return;
+    }
+
+    auto hdr = split_csv_line_simple(header);
+    int ix = find_col_idx(hdr, "acc_x");
+    int iy = find_col_idx(hdr, "acc_y");
+    int iz = find_col_idx(hdr, "acc_z");
+    if (ix < 0 || iy < 0 || iz < 0) {
+        std::fprintf(stderr, "[vpi_of] WARNING: IMU CSV missing acc_x/acc_y/acc_z columns: %s\n", st->imuPath);
+        st->imuEnabled = false;
+        st->imuLoaded = true;
+        return;
+    }
+
+    st->imuRows.clear();
+    st->imuRows.reserve(10000);
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        auto cols = split_csv_line_simple(line);
+
+        int need = std::max(ix, std::max(iy, iz));
+        if ((int)cols.size() <= need) continue;
+
+        State::ImuRow r{};
+        r.ax = std::strtof(cols[ix].c_str(), nullptr);
+        r.ay = std::strtof(cols[iy].c_str(), nullptr);
+        r.az = std::strtof(cols[iz].c_str(), nullptr);
+        st->imuRows.push_back(r);
+    }
+
+    if (st->imuRows.empty()) {
+        std::fprintf(stderr, "[vpi_of] WARNING: IMU CSV has no data rows: %s\n", st->imuPath);
+        st->imuEnabled = false;
+    } else {
+        std::fprintf(stderr, "[vpi_of] IMU loaded: %zu rows from %s\n", st->imuRows.size(), st->imuPath);
+    }
+
+    st->imuLoaded = true;
+}
+
+// Update IMU filtered vector for current frameId.
+// This matches your python pipeline:
+//
+// 1) Rotate raw IMU accel into level frame: a_rot = R @ acc
+// 2) Subtract gravity in level frame: a_lin = a_rot - [0,0,-G]
+// 3) Bias compensation (Y): ay = a_lin.y - AY_BIAS
+// 4) Low-pass filter on ax/ay
+//
+// Note: this produces linear accel in m/s^2; we draw it as visual arrow only.
+static void imu_update_from_frame(State *st)
+{
+    if (!st || !st->imuEnabled) return;
+    if (st->imuRows.empty()) return;
+
+    size_t idx = (size_t)st->frameId;
+    if (idx >= st->imuRows.size()) idx = st->imuRows.size() - 1;
+
+    const auto &acc = st->imuRows[idx];
+
+    // Rotation matrix around X axis (same as your python R)
+    float alpha = st->imuAlphaDeg * 0.01745329252f;
+    float ca = std::cos(alpha);
+    float sa = std::sin(alpha);
+
+    // a_rot = R @ acc
+    float ax_r = acc.ax;
+    float ay_r =  ca * acc.ay + sa * acc.az;
+    float az_r = -sa * acc.ay + ca * acc.az;
+
+    // Subtract gravity in level frame: a_lin = a_rot - [0,0,-G]
+    // => az_lin = az_r + G
+    float ax_lin = ax_r;
+    float ay_lin = ay_r;
+    float az_lin = az_r + st->imuG;
+    (void)az_lin; // not used for XY overlay
+
+    // Bias compensation (Y axis)
+    float ax = ax_lin;
+    float ay = ay_lin - st->imuAyBias;
+
+    // Low-pass filter
+    if (!st->imuLpfInit) {
+        st->imuAxFilt = ax;
+        st->imuAyFilt = ay;
+        st->imuLpfInit = true;
+    } else {
+        float a = st->imuLpfAlpha;
+        st->imuAxFilt = a * ax + (1.0f - a) * st->imuAxFilt;
+        st->imuAyFilt = a * ay + (1.0f - a) * st->imuAyFilt;
     }
 }
 
@@ -377,6 +587,9 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
     // Optional CSV log
     log_open_if_needed(st);
+
+    // Optional IMU load (only if VPI_OF_IMU=1)
+    imu_load_if_needed(st);
 
     st->inited = true;
 }
@@ -532,6 +745,9 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     st->res_dx_host = emaHost.lastResDx;
     st->res_dy_host = emaHost.lastResDy;
 
+    // Update IMU filtered vector for this frame (optional)
+    imu_update_from_frame(st);
+
     // Print on CPU
     print_speed_mps(st->speed_host);
 
@@ -544,6 +760,10 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         const float forceDeg       = 10.0f;
         const float forceMinResMag = 0.25f;
 
+        // Colors:
+        // - MV field color: existing YUV values
+        // - OF resultant: keep your existing "blue-ish" YUV
+        // - IMU resultant: green-ish YUV (visual only)
         overlay_draw_mvs_nv12(image, W, H,
                               mvPtr, mvPitchBytes,
                               mvW, mvH, st->grid,
@@ -552,7 +772,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                               0.30f,
                               76, 85, 255,                 // field color (YUV)
                               st->res_dx_host, st->res_dy_host,
-                              29, 255, 107,                 // resultant color (YUV)
+                              29, 255, 107,                 // OF resultant color (YUV)
+                              (st->imuEnabled ? st->imuAxFilt : 0.0f),
+                              (st->imuEnabled ? st->imuAyFilt : 0.0f),
+                              st->imuOverlayScale,
+                              150, 44, 21,                  // IMU resultant color (YUV) - green-ish
                               forceDeg, forceMinResMag,
                               st->frameId);
     }
