@@ -19,3 +19,46 @@ cmake -S . -B build \
   -DCMAKE_CUDA_ARCHITECTURES=72
 
 cmake --build build -j"$(nproc)" --verbose
+
+export VPI_OF_ROI_X0=0.3487
+export VPI_OF_ROI_X1=0.6615
+export VPI_OF_ROI_Y0=0.3823
+export VPI_OF_ROI_Y1=0.6049
+
+
+export VPI_OF_OVERLAY_STEP=2
+
+
+## Strong robustness against shadow-induced random vectors
+# Robust gating
+export VPI_OF_COH_MIN=0.60
+export VPI_OF_STD_MAX=6.0
+export VPI_OF_MIN_ROBUST_SAMPLES=160
+
+# Tail spike rejection
+export VPI_OF_TAIL_RATIO=2.0
+export VPI_OF_TAIL_MIN_ABS=35.0
+
+# Magnitude band-pass
+export VPI_OF_MIN_MAG=0.9
+export VPI_OF_MAX_MAG=75.0
+
+# Luma gates
+export VPI_OF_GRAD_MIN=20
+export VPI_OF_DY_MAX=26
+
+# NEW: direction + trimming + accel limiter
+export VPI_OF_DIR_COS_MIN=0.78     # 0.70..0.85 typical
+export VPI_OF_TRIM_K=2.5           # 2.0..3.0 typical
+export VPI_OF_MAX_ACCEL=10.0       # 6..15 typical
+
+# EMA
+export VPI_OF_EMA_ALPHA_HI=0.45
+export VPI_OF_EMA_ALPHA_LO=0.10
+
+
+export VPI_OF_FORBID=1
+export VPI_OF_FORBID_MLOW=-0.30
+export VPI_OF_FORBID_MHIGH=+0.30
+
+

@@ -13,6 +13,17 @@
 // and then lock mv_pl as CUDA_PITCH_LINEAR for GPU reduction/overlay.
 //
 // CPU does only dt timing + stdout printing.
+//
+// NEW (visual-only overlay):
+// - Direction forcing towards resultant direction with ±10° jitter (handled in overlay.cu/overlay.hpp).
+//
+// NEW (logging for plotting):
+// - Optional CSV logging of printed speeds and resultant components.
+// - Enable with env:
+//     export VPI_OF_LOG=1
+//     export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
+// - CSV columns:
+//     frame,t_sec,dt_sec,speed_mps,speed_kmh,res_dx_px,res_dy_px
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +34,8 @@
 #include <vector>
 #include <cmath>
 
+// For line-buffering macro _IOLBF
+#include <cstdio>
 
 #include <EGL/egl.h>
 
@@ -135,12 +148,10 @@ struct State
     bool havePrev = false;
 
     // ROI controls in normalized coordinates [0..1] in MV space.
-    // They are applied to MV grid dimensions (mvW, mvH).
     float roiX0 = 0.15f;
     float roiX1 = 0.85f;
     float roiY0 = 0.20f;
     float roiY1 = 0.80f;
-
 
     // Overlay controls
     bool overlayEnabled = true;
@@ -177,6 +188,18 @@ struct State
     float speed_host  = 0.0f;
     float res_dx_host = 0.0f;
     float res_dy_host = 0.0f;
+
+    // Frame counter (also used as overlay jitter seed)
+    uint32_t frameId = 0;
+
+    // ----------------------------
+    // CSV logging for plotting
+    // ----------------------------
+    bool logEnabled = false;
+    FILE *logFile = nullptr;
+    std::chrono::steady_clock::time_point logT0;
+    bool haveLogT0 = false;
+    char logPath[512] = {0};
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -185,6 +208,77 @@ static State* get_or_create_state(void **userPtr)
     State *st = new State();
     if (userPtr) *userPtr = st;
     return st;
+}
+
+// Open CSV log if enabled by env vars.
+static void log_open_if_needed(State *st)
+{
+    if (!st) return;
+    if (st->logFile) return;
+
+    // Enable with env var. Example:
+    // export VPI_OF_LOG=1
+    // export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
+    st->logEnabled = (get_env_int("VPI_OF_LOG", 0) != 0);
+    if (!st->logEnabled) return;
+
+    const char *p = std::getenv("VPI_OF_LOG_PATH");
+    if (!p || !p[0]) p = "/tmp/vpi_of_speed.csv";
+    std::snprintf(st->logPath, sizeof(st->logPath), "%s", p);
+
+    st->logFile = std::fopen(st->logPath, "w");
+    if (!st->logFile) {
+        std::fprintf(stderr, "[vpi_of] WARNING: cannot open log file: %s\n", st->logPath);
+        st->logEnabled = false;
+        return;
+    }
+
+    // Line-buffered: one line per frame, safe if pipeline is killed.
+    std::setvbuf(st->logFile, nullptr, _IOLBF, 0);
+
+    // CSV header.
+    std::fprintf(st->logFile,
+                 "frame,t_sec,dt_sec,speed_mps,speed_kmh,res_dx_px,res_dy_px\n");
+    std::fflush(st->logFile);
+}
+
+// Append one CSV line for the current sample.
+static void log_speed_csv(State *st, float dtSec)
+{
+    if (!st) return;
+    if (!st->logEnabled) return;
+    if (!st->logFile) return;
+
+    if (!st->haveLogT0) {
+        st->haveLogT0 = true;
+        st->logT0 = std::chrono::steady_clock::now();
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    float tSec = std::chrono::duration<float>(now - st->logT0).count();
+
+    float speed_kmh = st->speed_host * 3.6f;
+
+    std::fprintf(st->logFile,
+                 "%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                 (unsigned)st->frameId,
+                 (double)tSec,
+                 (double)dtSec,
+                 (double)st->speed_host,
+                 (double)speed_kmh,
+                 (double)st->res_dx_host,
+                 (double)st->res_dy_host);
+}
+
+// Close CSV log file (optional cleanup).
+static void log_close(State *st)
+{
+    if (!st) return;
+    if (st->logFile) {
+        std::fflush(st->logFile);
+        std::fclose(st->logFile);
+        st->logFile = nullptr;
+    }
 }
 
 static void init_vpi_if_needed(State *st, int W, int H)
@@ -214,7 +308,6 @@ static void init_vpi_if_needed(State *st, int W, int H)
     st->emaAlphaLo = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_LO", 0.15f), 0.0f, 1.0f);
 
     // ROI (normalized) runtime controls.
-    // Example: export VPI_OF_ROI_X0=0.30 VPI_OF_ROI_X1=0.70 VPI_OF_ROI_Y0=0.35 VPI_OF_ROI_Y1=0.65
     st->roiX0 = std::clamp(get_env_float("VPI_OF_ROI_X0", 0.15f), 0.0f, 1.0f);
     st->roiX1 = std::clamp(get_env_float("VPI_OF_ROI_X1", 0.85f), 0.0f, 1.0f);
     st->roiY0 = std::clamp(get_env_float("VPI_OF_ROI_Y0", 0.20f), 0.0f, 1.0f);
@@ -223,7 +316,6 @@ static void init_vpi_if_needed(State *st, int W, int H)
     // Sanity: enforce non-empty ROI, otherwise fallback to defaults.
     if (!(st->roiX1 > st->roiX0 + 0.01f)) { st->roiX0 = 0.15f; st->roiX1 = 0.85f; }
     if (!(st->roiY1 > st->roiY0 + 0.01f)) { st->roiY0 = 0.20f; st->roiY1 = 0.80f; }
-
 
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
@@ -283,6 +375,9 @@ static void init_vpi_if_needed(State *st, int W, int H)
     cudaMemset(st->d_ema, 0, sizeof(DevEmaState));
     cudaMemset(st->d_speed_out, 0, sizeof(float));
 
+    // Optional CSV log
+    log_open_if_needed(st);
+
     st->inited = true;
 }
 
@@ -327,11 +422,22 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     CHECK_VPI(vpiImageUnlock(st->cur_y8_pl));
 
-    // First frame
+    // First frame: no optical flow yet, speed = 0.
     if (!st->havePrev) {
+        st->speed_host  = 0.0f;
+        st->res_dx_host = 0.0f;
+        st->res_dy_host = 0.0f;
+
         print_speed_mps(0.0f);
+
+        // Log a first sample too (dt=0 for first frame).
+        log_open_if_needed(st);
+        log_speed_csv(st, 0.0f);
+
         std::swap(st->prev_y8_pl, st->cur_y8_pl);
         st->havePrev = true;
+
+        st->frameId++;
         return;
     }
 
@@ -380,13 +486,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     int y0 = (int)((float)mvH * st->roiY0 + 0.5f);
     int y1 = (int)((float)mvH * st->roiY1 + 0.5f);
 
-
-    // Clamp and ensure non-empty ROI (at least a few cells).
+    // Clamp and ensure non-empty ROI.
     x0 = std::clamp(x0, 0, mvW - 1);
     x1 = std::clamp(x1, x0 + 1, mvW);
     y0 = std::clamp(y0, 0, mvH - 1);
     y1 = std::clamp(y1, y0 + 1, mvH);
-
 
     MVParams p{};
     p.mvW = mvW; p.mvH = mvH;
@@ -431,23 +535,35 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     // Print on CPU
     print_speed_mps(st->speed_host);
 
+    // Log for plotting (CSV)
+    log_speed_csv(st, useDt);
+
     // Overlay on GPU
     if (st->overlayEnabled) {
+        // Visual-only forcing parameters:
+        const float forceDeg       = 10.0f;
+        const float forceMinResMag = 0.25f;
+
         overlay_draw_mvs_nv12(image, W, H,
                               mvPtr, mvPitchBytes,
                               mvW, mvH, st->grid,
                               x0, x1, y0, y1,
                               st->overlayStep, st->overlayScale,
                               0.30f,
-                              76, 85, 255,
+                              76, 85, 255,                 // field color (YUV)
                               st->res_dx_host, st->res_dy_host,
-                              29, 255, 107);
+                              29, 255, 107,                 // resultant color (YUV)
+                              forceDeg, forceMinResMag,
+                              st->frameId);
     }
 
     CHECK_VPI(vpiImageUnlock(st->mv_vic_cuda_pl));
 
     // Advance
     std::swap(st->prev_y8_pl, st->cur_y8_pl);
+
+    // Advance frame counter (used for logging + overlay jitter seed)
+    st->frameId++;
 }
 
 static void pre_process(void **, unsigned int *inW, unsigned int *inH,
@@ -462,9 +578,16 @@ static void pre_process(void **, unsigned int *inW, unsigned int *inH,
 }
 
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*,
-                         ColorFormat*, unsigned int, void **)
+                         ColorFormat*, unsigned int, void **userPtr)
 {
-    // No frees here.
+    // Optional: close log file when pipeline tears down (if post_process is called).
+    if (userPtr && *userPtr) {
+        State *st = reinterpret_cast<State*>(*userPtr);
+        log_close(st);
+    }
+
+    // No frees here (keep consistent with your original design).
+    // If you decide to free, do it carefully and ensure GStreamer lifecycle is correct.
 }
 
 extern "C" void init(CustomerFunction *f)

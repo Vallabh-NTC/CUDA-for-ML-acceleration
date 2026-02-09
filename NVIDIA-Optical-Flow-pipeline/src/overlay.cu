@@ -1,6 +1,7 @@
 // overlay.cu
 // CUDA overlay on NV12 EGLImage (Jetson NVMM surface-array friendly).
 // Reads MV field from a CUDA pitch-linear buffer (2S16 interleaved S10.5) and draws arrows.
+//
 
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,29 @@
 #include "overlay.hpp"
 
 __device__ __forceinline__ float s10_5_to_px(int16_t v) { return (float)v * (1.0f/32.0f); }
+
+// Safe rsqrt to avoid division by 0.
+__device__ __forceinline__ float fast_rsqrtf_safe(float x)
+{
+    return rsqrtf(fmaxf(x, 1e-12f));
+}
+
+// Deterministic hash -> float in [0, 1).
+// Used to add stable per-cell jitter (and optionally per-frame).
+__device__ __forceinline__ float hash01_u32(uint32_t x)
+{
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return (x & 0x00FFFFFFu) * (1.0f / 16777216.0f);
+}
+
+// Rotate a 2D vector (x,y) by angle with cos/sin.
+__device__ __forceinline__ void rotate2(float x, float y, float c, float s, float &ox, float &oy)
+{
+    ox = c * x - s * y;
+    oy = s * x + c * y;
+}
 
 __device__ inline void putY_ptr(uint8_t *Y, int pitch, int W, int H, int x, int y, uint8_t v)
 {
@@ -85,7 +109,7 @@ __device__ inline void drawLine_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_t
     }
 }
 
-// Draw one arrow with simple arrowhead
+// Draw one arrow with a simple arrowhead (pointer path)
 __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
                                      int pitchY, int pitchUV,
                                      int W, int H,
@@ -114,6 +138,7 @@ __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
     drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh2, yh2, Yc, Uc, Vc);
 }
 
+// Draw one arrow with a simple arrowhead (surface path)
 __device__ inline void drawArrow_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_t sUV,
                                       int W, int H,
                                       int x0, int y0, int x1, int y1,
@@ -141,7 +166,8 @@ __device__ inline void drawArrow_surf(cudaSurfaceObject_t sY, cudaSurfaceObject_
     drawLine_surf(sY, sUV, W, H, x1, y1, xh2, yh2, Yc, Uc, Vc);
 }
 
-// Kernel: draw MV field arrows from pitch-linear MV buffer
+// Kernel: draw MV field arrows from pitch-linear MV buffer.
+// Optional visual "direction forcing" towards resultant direction with ±forceDeg jitter.
 __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
                                      int pitchY, int pitchUV,
                                      int W, int H,
@@ -150,6 +176,13 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
                                      int x0, int x1, int y0, int y1,
                                      int step, float scale,
                                      float minMagDraw,
+                                     // resultant direction (px/frame) for visual forcing
+                                     float resDxPx, float resDyPx,
+                                     // forcing parameters
+                                     float forceDeg,
+                                     float forceMinResMag,
+                                     uint32_t frameTag,
+                                     // colors
                                      uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
     int sx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -169,8 +202,52 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
     float dx = s10_5_to_px(fx);
     float dy = s10_5_to_px(fy);
 
-    float mag = fabsf(dx) + fabsf(dy);
-    if (mag < minMagDraw) return;
+    float magL1 = fabsf(dx) + fabsf(dy);
+    if (magL1 < minMagDraw) return;
+
+    // ------------------------------------------------------------------
+    // VISUAL ONLY: If a local MV is too far from resultant direction,
+    // draw it aligned to resultant direction, with a small jitter ±forceDeg.
+    // ------------------------------------------------------------------
+    float resMagL1 = fabsf(resDxPx) + fabsf(resDyPx);
+    if (forceDeg > 0.0f && resMagL1 >= forceMinResMag)
+    {
+        // Normalize resultant direction.
+        float rx = resDxPx;
+        float ry = resDyPx;
+        float rinv = fast_rsqrtf_safe(rx*rx + ry*ry);
+        rx *= rinv;
+        ry *= rinv;
+
+        // Normalize local vector direction.
+        float v2 = dx*dx + dy*dy;
+        float vinv = fast_rsqrtf_safe(v2);
+        float vx = dx * vinv;
+        float vy = dy * vinv;
+
+        // dot = cos(theta). If dot < cos(forceDeg) then deviation > forceDeg.
+        float maxRad = forceDeg * 0.01745329252f;
+        float cosTh  = cosf(maxRad);
+        float dot    = vx*rx + vy*ry;
+
+        if (dot < cosTh)
+        {
+            // Deterministic jitter per (mx,my,frameTag).
+            uint32_t h = (uint32_t)(mx * 73856093u) ^ (uint32_t)(my * 19349663u) ^ (uint32_t)(frameTag * 83492791u);
+            float u = hash01_u32(h);                 // [0,1)
+            float a = (u * 2.0f - 1.0f) * maxRad;    // [-maxRad, +maxRad]
+            float c = cosf(a), s = sinf(a);
+
+            // Rotate resultant direction by jitter.
+            float fx2, fy2;
+            rotate2(rx, ry, c, s, fx2, fy2);
+
+            // Keep original magnitude (L2) so arrows still look "natural".
+            float vmag = sqrtf(v2);
+            dx = fx2 * vmag;
+            dy = fy2 * vmag;
+        }
+    }
 
     // Arrow in pixel space
     int px0 = mx * grid;
@@ -216,7 +293,11 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                                       float minMagDraw,
                                       uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
                                       float resDxPx, float resDyPx,
-                                      uint8_t resY, uint8_t resU, uint8_t resV)
+                                      uint8_t resY, uint8_t resU, uint8_t resV,
+                                      // NEW: visual forcing options
+                                      float forceDeg,
+                                      float forceMinResMag,
+                                      uint32_t frameTag)
 {
     if (!eglImage || !mvPtr) return;
 
@@ -246,7 +327,7 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
         int pitchY  = (int)eglFrame.pitch;
         int pitchUV = (int)eglFrame.pitch;
 
-        // Grid for sampled points
+        // Grid for sampled points in MV space
         int sxN = (x1 - x0 + step - 1) / step;
         int syN = (y1 - y0 + step - 1) / step;
 
@@ -254,13 +335,17 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
         dim3 gridD((sxN + block.x - 1) / block.x,
                    (syN + block.y - 1) / block.y);
 
+        // Field overlay with optional visual forcing
         drawFieldPitchKernel<<<gridD, block, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             mvPtr, mvPitchBytes, mvW, mvH, grid,
             x0, x1, y0, y1,
             step, scale, minMagDraw,
+            resDxPx, resDyPx,
+            forceDeg, forceMinResMag, frameTag,
             fieldY, fieldU, fieldV);
 
+        // Resultant arrow
         drawResultantPitchKernel<<<1, 1, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             resDxPx, resDyPx, scale,
@@ -269,8 +354,7 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
         cudaGetLastError(); // swallow
         cudaStreamSynchronize(stream);
     }
-    // ARRAY surface path can be added similarly if needed (your previous code had it).
-    // Many Jetson NVMM surfaces come as ARRAY; if yours does, tell me and I'll add it back.
+    // ARRAY surface path can be added similarly if needed.
 
     cuGraphicsUnregisterResource(cuRes);
 }

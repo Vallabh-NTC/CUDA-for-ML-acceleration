@@ -1,3 +1,4 @@
+// overlay.hpp
 #pragma once
 #include <cstdint>
 
@@ -8,9 +9,10 @@ typedef void* EGLImageKHR;
 extern "C" {
 #endif
 
-// Draw MV field arrows (red) and one resultant arrow (blue-ish) directly from pitch-linear MV buffer.
+// Draw MV field arrows and one resultant arrow directly from pitch-linear MV buffer.
 // mvPtr points to device memory: 2S16 interleaved (dx,dy) in S10.5.
 // mvPitchBytes is pitch in bytes of mvPtr.
+//
 void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                            int W, int H,
                            const int16_t *mvPtr, int mvPitchBytes,
@@ -20,7 +22,10 @@ void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                            float minMagDraw,
                            uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
                            float resDxPx, float resDyPx,
-                           uint8_t resY, uint8_t resU, uint8_t resV);
+                           uint8_t resY, uint8_t resU, uint8_t resV,
+                           float forceDeg,
+                           float forceMinResMag,
+                           uint32_t frameTag);
 
 #ifdef __cplusplus
 }
