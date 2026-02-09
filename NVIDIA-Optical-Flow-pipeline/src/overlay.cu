@@ -2,8 +2,14 @@
 // CUDA overlay on NV12 EGLImage (Jetson NVMM surface-array friendly).
 // Reads MV field from a CUDA pitch-linear buffer (2S16 interleaved S10.5) and draws arrows.
 //
-// NEW: optional IMU resultant arrow (green) drawn alongside OF resultant (blue).
-// IMU vector is in m/s^2 (linear accel) and is visual-only. imuScale controls pixels per (m/s^2).
+// NEW (requested):
+// - Bigger/more visible arrowheads (HEAD_LEN, HEAD_W).
+// - Thicker resultant arrow (drawn by stamping multiple offset arrows).
+// - Optional: resultant length multiplier (RES_SCALE_MUL) without changing field scale.
+//
+// Existing:
+// - Optional IMU resultant arrow (visual-only) drawn alongside OF resultant.
+// - Optional "direction forcing" for field arrows with deterministic jitter.
 //
 
 #include <cstdint>
@@ -16,7 +22,38 @@
 
 #include "overlay.hpp"
 
-__device__ __forceinline__ float s10_5_to_px(int16_t v) { return (float)v * (1.0f/32.0f); }
+// ----------------------------
+// Tuning knobs (easy to tweak)
+// ----------------------------
+
+// Arrowhead size (bigger -> more visible head).
+// HEAD_LEN = how far the head extends backwards from the tip.
+// HEAD_W   = how wide the head opens sideways.
+#ifndef OVERLAY_HEAD_LEN
+#define OVERLAY_HEAD_LEN 10   // was effectively ~6
+#endif
+
+#ifndef OVERLAY_HEAD_W
+#define OVERLAY_HEAD_W   7    // was effectively ~4
+#endif
+
+// Thickness for resultant arrows (number of pixels stamped around the line).
+// 1 = thin (original). 3 or 5 is usually very readable on 1080p.
+#ifndef OVERLAY_RES_THICKNESS
+#define OVERLAY_RES_THICKNESS 5
+#endif
+
+#ifndef OVERLAY_IMU_THICKNESS
+#define OVERLAY_IMU_THICKNESS 3
+#endif
+
+// Make the resultant a bit longer without affecting the field arrows.
+// 1.0 = unchanged.
+#ifndef OVERLAY_RES_SCALE_MUL
+#define OVERLAY_RES_SCALE_MUL 1.35f
+#endif
+
+__device__ __forceinline__ float s10_5_to_px(int16_t v) { return (float)v * (1.0f / 32.0f); }
 
 // Safe rsqrt to avoid division by 0.
 __device__ __forceinline__ float fast_rsqrtf_safe(float x)
@@ -43,7 +80,8 @@ __device__ __forceinline__ void rotate2(float x, float y, float c, float s, floa
 
 __device__ inline void putY_ptr(uint8_t *Y, int pitch, int W, int H, int x, int y, uint8_t v)
 {
-    if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H) Y[y * pitch + x] = v;
+    if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H)
+        Y[y * pitch + x] = v;
 }
 
 __device__ inline void putUV_ptr(uint8_t *UV, int pitchUV, int W, int H, int x, int y, uint8_t U, uint8_t V)
@@ -64,9 +102,11 @@ __device__ inline void drawLine_ptr(uint8_t *Y, uint8_t *UV,
                                     int x0, int y0, int x1, int y1,
                                     uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
+    // Bresenham line in pixel space.
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
+
     while (true) {
         putY_ptr(Y, pitchY, W, H, x0, y0, Yc);
         putUV_ptr(UV, pitchUV, W, H, x0, y0, Uc, Vc);
@@ -77,7 +117,8 @@ __device__ inline void drawLine_ptr(uint8_t *Y, uint8_t *UV,
     }
 }
 
-// Draw one arrow with a simple arrowhead (pointer path)
+// Draw one arrow with a simple arrowhead.
+// Requested change: bigger arrowhead for improved visibility.
 __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
                                      int pitchY, int pitchUV,
                                      int W, int H,
@@ -90,12 +131,24 @@ __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
     int hy = y1 - y0;
     if (hx == 0 && hy == 0) return;
 
+    // Perpendicular vector for the arrowhead wings.
     int px = -hy, py = hx;
+
+    // Use L1 length as a cheap normalization. Clamp to avoid division by 0.
     int len = max(1, abs(hx) + abs(hy));
-    int ahx = (hx * 6) / len;
-    int ahy = (hy * 6) / len;
-    int apx = (px * 4) / len;
-    int apy = (py * 4) / len;
+
+    // Bigger head = more visible.
+    const int HEAD_LEN = OVERLAY_HEAD_LEN;
+    const int HEAD_W   = OVERLAY_HEAD_W;
+
+    int ahx = (hx * HEAD_LEN) / len;
+    int ahy = (hy * HEAD_LEN) / len;
+    int apx = (px * HEAD_W)   / len;
+    int apy = (py * HEAD_W)   / len;
+
+    // If the vector is very short, force minimal head contribution.
+    if (ahx == 0 && hx != 0) ahx = (hx > 0 ? 1 : -1);
+    if (ahy == 0 && hy != 0) ahy = (hy > 0 ? 1 : -1);
 
     int xh1 = x1 - ahx + apx;
     int yh1 = y1 - ahy + apy;
@@ -104,6 +157,29 @@ __device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
 
     drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh1, yh1, Yc, Uc, Vc);
     drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh2, yh2, Yc, Uc, Vc);
+}
+
+// Draw a thicker arrow by stamping multiple offset arrows.
+// Simple + robust (no fancy geometry), but costs more pixels written.
+// Use only for low-frequency arrows (resultant / IMU), not for the whole field by default.
+__device__ inline void drawArrowThick_ptr(uint8_t *Y, uint8_t *UV,
+                                          int pitchY, int pitchUV,
+                                          int W, int H,
+                                          int x0, int y0, int x1, int y1,
+                                          uint8_t Yc, uint8_t Uc, uint8_t Vc,
+                                          int thickness)
+{
+    thickness = max(1, thickness);
+    int r = thickness / 2;
+
+    // Stamp a small square brush around the arrow.
+    for (int oy = -r; oy <= r; ++oy) {
+        for (int ox = -r; ox <= r; ++ox) {
+            drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H,
+                          x0 + ox, y0 + oy, x1 + ox, y1 + oy,
+                          Yc, Uc, Vc);
+        }
+    }
 }
 
 // Kernel: draw MV field arrows from pitch-linear MV buffer.
@@ -136,8 +212,8 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
     const uint8_t *rowB = (const uint8_t*)mvPtr + (size_t)my * (size_t)mvPitchBytes;
     const int16_t *row  = (const int16_t*)rowB;
 
-    int16_t fx = row[mx*2 + 0];
-    int16_t fy = row[mx*2 + 1];
+    int16_t fx = row[mx * 2 + 0];
+    int16_t fy = row[mx * 2 + 1];
 
     float dx = s10_5_to_px(fx);
     float dy = s10_5_to_px(fy);
@@ -146,7 +222,8 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
     if (magL1 < minMagDraw) return;
 
     // ------------------------------------------------------------------
-    // VISUAL ONLY: If a local MV deviates too much from the OF resultant direction,
+    // VISUAL ONLY:
+    // If a local MV deviates too much from the OF resultant direction,
     // draw it aligned to the resultant direction, with a small jitter ±forceDeg.
     // ------------------------------------------------------------------
     float resMagL1 = fabsf(resDxPx) + fabsf(resDyPx);
@@ -173,7 +250,9 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
         if (dot < cosTh)
         {
             // Deterministic jitter per (mx,my,frameTag).
-            uint32_t h = (uint32_t)(mx * 73856093u) ^ (uint32_t)(my * 19349663u) ^ (uint32_t)(frameTag * 83492791u);
+            uint32_t h = (uint32_t)(mx * 73856093u) ^
+                         (uint32_t)(my * 19349663u) ^
+                         (uint32_t)(frameTag * 83492791u);
             float u = hash01_u32(h);                 // [0,1)
             float a = (u * 2.0f - 1.0f) * maxRad;    // [-maxRad, +maxRad]
             float c = cosf(a), s = sinf(a);
@@ -189,7 +268,7 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
         }
     }
 
-    // Arrow in pixel space
+    // Arrow in pixel space.
     int px0 = mx * grid;
     int py0 = my * grid;
 
@@ -202,7 +281,7 @@ __global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
     drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, px0, py0, px1, py1, Yc, Uc, Vc);
 }
 
-// Kernel: draw OF resultant arrow at center
+// Kernel: draw OF resultant arrow at center (thicker + optional longer).
 __global__ void drawResultantPitchKernel(uint8_t *Y, uint8_t *UV,
                                          int pitchY, int pitchUV,
                                          int W, int H,
@@ -215,16 +294,24 @@ __global__ void drawResultantPitchKernel(uint8_t *Y, uint8_t *UV,
     int cx = W / 2;
     int cy = H / 2;
 
-    int x1 = cx + (int)lrintf(resDxPx * scale);
-    int y1 = cy + (int)lrintf(resDyPx * scale);
+    // Make only the resultant a bit longer (requested).
+    float s = scale * OVERLAY_RES_SCALE_MUL;
+
+    int x1 = cx + (int)lrintf(resDxPx * s);
+    int y1 = cy + (int)lrintf(resDyPx * s);
 
     x1 = max(0, min(W - 1, x1));
     y1 = max(0, min(H - 1, y1));
 
-    drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, cx, cy, x1, y1, Yc, Uc, Vc);
+    // Draw thicker resultant (requested).
+    drawArrowThick_ptr(Y, UV, pitchY, pitchUV, W, H,
+                       cx, cy, x1, y1,
+                       Yc, Uc, Vc,
+                       OVERLAY_RES_THICKNESS);
 }
 
-// Kernel: draw IMU resultant arrow (visual-only) with slight offset
+// Kernel: draw IMU resultant arrow (visual-only) with slight offset.
+// Also drawn thicker for readability.
 __global__ void drawImuPitchKernel(uint8_t *Y, uint8_t *UV,
                                    int pitchY, int pitchUV,
                                    int W, int H,
@@ -236,7 +323,7 @@ __global__ void drawImuPitchKernel(uint8_t *Y, uint8_t *UV,
 
     if ((fabsf(imuDx) + fabsf(imuDy)) < 1e-6f) return;
 
-    // Offset to avoid perfect overlap with OF arrow
+    // Offset to avoid perfect overlap with OF arrow.
     int cx = W / 2 + 14;
     int cy = H / 2 + 14;
 
@@ -246,7 +333,10 @@ __global__ void drawImuPitchKernel(uint8_t *Y, uint8_t *UV,
     x1 = max(0, min(W - 1, x1));
     y1 = max(0, min(H - 1, y1));
 
-    drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, cx, cy, x1, y1, Yc, Uc, Vc);
+    drawArrowThick_ptr(Y, UV, pitchY, pitchUV, W, H,
+                       cx, cy, x1, y1,
+                       Yc, Uc, Vc,
+                       OVERLAY_IMU_THICKNESS);
 }
 
 extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
@@ -296,7 +386,7 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
         int pitchY  = (int)eglFrame.pitch;
         int pitchUV = (int)eglFrame.pitch;
 
-        // Grid for sampled points in MV space
+        // Number of sampled points in MV space.
         int sxN = (x1 - x0 + step - 1) / step;
         int syN = (y1 - y0 + step - 1) / step;
 
@@ -304,7 +394,7 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
         dim3 gridD((sxN + block.x - 1) / block.x,
                    (syN + block.y - 1) / block.y);
 
-        // Field overlay with optional visual forcing towards OF resultant direction
+        // Field overlay with optional visual forcing towards OF resultant direction.
         drawFieldPitchKernel<<<gridD, block, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             mvPtr, mvPitchBytes, mvW, mvH, grid,
@@ -314,13 +404,13 @@ extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
             forceDeg, forceMinResMag, frameTag,
             fieldY, fieldU, fieldV);
 
-        // OF resultant arrow (blue)
+        // OF resultant arrow (thicker + slightly longer).
         drawResultantPitchKernel<<<1, 1, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             resDxPx, resDyPx, scale,
             resY, resU, resV);
 
-        // IMU resultant arrow (green) - optional; disabled if imuDx/imuDy ~ 0
+        // IMU resultant arrow (visual-only) - optional; disabled if imuDx/imuDy ~ 0.
         drawImuPitchKernel<<<1, 1, 0, stream>>>(
             Y, UV, pitchY, pitchUV, W, H,
             imuDx, imuDy, imuScale,
