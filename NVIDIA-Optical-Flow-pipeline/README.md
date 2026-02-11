@@ -1,10 +1,10 @@
-rsync -avz ntc-orin@192.168.1.10:/opt/nvidia/vpi2/ /l4t/targetfs/opt/nvidia/vpi2/
-rsync -avz --delete   ntc-orin@192.168.1.10:/opt/nvidia/vpi2/include/   /l4t/targetfs/opt/nvidia/vpi2/include/
+rsync -avz ntc-orin@192.168.1.20:/opt/nvidia/vpi2/ /l4t/targetfs/opt/nvidia/vpi2/
+rsync -avz --delete   ntc-orin@192.168.1.20:/opt/nvidia/vpi2/include/   /l4t/targetfs/opt/nvidia/vpi2/include/
  
- rsync -avz   ntc-orin@192.168.1.10:/opt/nvidia/cupva-2.3/   /l4t/targetfs/opt/nvidia/cupva-2.3/
- rsync -avz --delete ntc-orin@192.168.1.10:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/  /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/
+ rsync -avz   ntc-orin@192.168.1.20:/opt/nvidia/cupva-2.3/   /l4t/targetfs/opt/nvidia/cupva-2.3/
+ rsync -avz --delete ntc-orin@192.168.1.20:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/  /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/
 
-rsync -avz   ntc-orin@192.168.1.10:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv/   /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv/
+rsync -avz   ntc-orin@192.168.1.20:/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv/   /l4t/targetfs/opt/nvidia/vpi2/lib/aarch64-linux-gnu/priv/
 
 cmake -S . -B build \
   -DPROJECT=NVIDIA-Optical-Flow-pipeline \
@@ -27,7 +27,7 @@ cmake --build build -j"$(nproc)" --verbose
 
 # IMPORTANT: force size if caps are not propagated to the filter
 export VPI_OF_W=1280
-export VPI_OF_H=1720
+export VPI_OF_H=720
 
 # Overlay
 export VPI_OF_OVERLAY=1

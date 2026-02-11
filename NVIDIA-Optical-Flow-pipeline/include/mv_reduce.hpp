@@ -1,67 +1,43 @@
 #pragma once
 #include <cstdint>
 
-// Persistent per-instance device state stored on GPU.
-struct DevEmaState
+// Output of the pure reduction (no gating, no EMA).
+struct MVPureOut
 {
-    float speedEma;   // EMA filtered speed (m/s)
-    int   haveEma;    // 0/1
-    float lastOut;    // last output (hold on bad frames)
-
-    // Last global motion direction (px/frame) for overlay resultant arrow.
-    float lastResDx;
-    float lastResDy;
+    int   count;
+    float mean_dx;   // px/frame
+    float mean_dy;   // px/frame
+    float res_mag;   // px/frame (hypot(mean_dx, mean_dy))
+    float speed_mps; // m/s
 };
 
-// Per-frame reduction outputs (computed on GPU).
-struct MVReduceOut
-{
-    int   count;       // robust samples count (after mag band-pass)
-    float sum_dx;
-    float sum_dy;
-    float sum_mag;
-    float sum_mag2;
-    float max_mag;     // max magnitude across sampled points
-};
-
-// Parameters passed to GPU reducer.
-struct MVParams
+// Parameters for pure reduction.
+struct MVPureParams
 {
     int mvW, mvH;
-    int mvPitchBytes;  // pitch in bytes (CUDA pitch-linear)
-    int grid;          // MV cell -> pixels
+    int mvPitchBytes; // pitch in bytes (CUDA pitch-linear)
+    int grid;         // MV cell -> pixels (OFA grid)
 
-    int x0, x1, y0, y1; // ROI in MV cells
-    int step;           // sampling step in MV cells
+    // ROI in MV cells [x0,x1), [y0,y1)
+    int x0, x1, y0, y1;
 
-    float minMag;
-    float maxMag;
+    // Sampling step in MV cells (1 = all, 2 = every 2 cells, ...)
+    int step;
 
-    int   minSamples;
-    float cohMin;
-    float stdMax;
-    float tailRatio;
-    float tailMinAbs;
-
+    // Conversion to speed
     float pxPerMeter;
     float dtSec;
-
-    float alphaHi;
-    float alphaLo;
-
-    float cohExcellent;
-    float stdExcellentMax;
 };
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void mv_reduce_gating_ema_cuda(const int16_t *mvPtr,
-                              DevEmaState   *devState,
-                              const MVParams *params,
-                              float         *d_outSpeed,
-                              MVReduceOut   *d_outDiag);
+// Pure reduction: computes mean dx/dy over ROI and speed from resultant.
+// mvPtr is pitch-linear int16 interleaved dx,dy in S10.5 (same as your OFA output after VIC BL->PL).
+void mv_reduce_pure_cuda(const int16_t *mvPtr,
+                         const MVPureParams *params,
+                         MVPureOut *d_out);
 
 #ifdef __cplusplus
 }

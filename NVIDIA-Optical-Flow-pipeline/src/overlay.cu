@@ -2,15 +2,6 @@
 // CUDA overlay on NV12 EGLImage (Jetson NVMM surface-array friendly).
 // Reads MV field from a CUDA pitch-linear buffer (2S16 interleaved S10.5) and draws arrows.
 //
-// NEW (requested):
-// - Bigger/more visible arrowheads (HEAD_LEN, HEAD_W).
-// - Thicker resultant arrow (drawn by stamping multiple offset arrows).
-// - Optional: resultant length multiplier (RES_SCALE_MUL) without changing field scale.
-//
-// Existing:
-// - Optional IMU resultant arrow (visual-only) drawn alongside OF resultant.
-// - Optional "direction forcing" for field arrows with deterministic jitter.
-//
 
 #include <cstdint>
 #include <cstring>

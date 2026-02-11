@@ -1,12 +1,12 @@
 // nvivafilter_vpi_of.cpp
 //
-// Jetson Orin / JetPack 5.4.1 / VPI 2.4.x
+// PURE DOF (Dense Optical Flow) + OVERLAY
 //
+// Pipeline:
 // NVDEC -> NVMM(NV12) -> nvivafilter (this .so) -> NVMM
 //
-// VPI 2.4 + OFA Dense Optical Flow.
+// - Uses VPI 2.4.x + OFA Dense Optical Flow.
 
-//
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,11 +16,6 @@
 #include <chrono>
 #include <vector>
 #include <cmath>
-#include <string>
-#include <fstream>
-
-// For line-buffering macro _IOLBF
-#include <cstdio>
 
 #include <EGL/egl.h>
 
@@ -37,22 +32,28 @@
 
 #include "nvivafilter_customer_api.hpp"
 #include "egl_copy.hpp"
-#include "overlay.hpp"
 #include "mv_reduce.hpp"
+#include "overlay.hpp"
 
+// ----------------------------
+// VPI error helper
+// ----------------------------
 #define CHECK_VPI(stmt)                                                         \
     do {                                                                        \
         VPIStatus _st = (stmt);                                                 \
         if (_st != VPI_SUCCESS) {                                               \
             char msg[512];                                                      \
             vpiGetLastStatusMessage(msg, sizeof(msg));                          \
-            std::fprintf(stderr, "[vpi_of] VPI error: %s at %s\n",              \
+            std::fprintf(stderr, "[vpi_of_pure] VPI error: %s at %s\n",         \
                          vpiStatusGetName(_st), #stmt);                         \
-            std::fprintf(stderr, "[vpi_of] Message: %s\n", msg);                \
+            std::fprintf(stderr, "[vpi_of_pure] Message: %s\n", msg);           \
             std::abort();                                                       \
         }                                                                       \
     } while (0)
 
+// ----------------------------
+// Env helpers
+// ----------------------------
 static int get_env_int(const char *k, int defv)
 {
     const char *v = std::getenv(k);
@@ -91,13 +92,9 @@ static int max_levels_scale_half_min32(int W, int H)
     return levels;
 }
 
-static inline void print_speed_mps(float speed_mps)
-{
-    float speed_kmh = speed_mps * 3.6f;
-    std::fprintf(stdout, "%.3f m/s (%.2f km/h)\n", speed_mps, speed_kmh);
-    std::fflush(stdout);
-}
-
+// ----------------------------
+// State
+// ----------------------------
 struct State
 {
     bool inited = false;
@@ -124,91 +121,41 @@ struct State
     VPIPayload ofa_payload = nullptr;
     int grid = 2;
 
-    // OFA output MV in block-linear
+    // OFA output MV in block-linear + pitch-linear for CUDA read
     VPIImage mv_bl = nullptr;
-
-    // VIC->pitch-linear MV that is also CUDA-accessible (for GPU read)
     VPIImage mv_vic_cuda_pl = nullptr;
 
     bool havePrev = false;
 
-    // ROI controls in normalized coordinates [0..1] in MV space.
-    float roiX0 = 0.15f;
-    float roiX1 = 0.85f;
-    float roiY0 = 0.20f;
-    float roiY1 = 0.80f;
+    // ROI in normalized coordinates [0..1] in MV space
+    float roiX0 = 0.15f, roiX1 = 0.85f;
+    float roiY0 = 0.20f, roiY1 = 0.80f;
 
-    // Overlay controls
-    bool overlayEnabled = true;
-    int overlayStep = 12;
-    float overlayScale = 3.5f;
+    // Sampling step in MV cells (1 = use every MV cell)
+    int step = 1;
 
-    // Band-pass for MV magnitudes (px/frame)
-    float mvMinMag = 0.5f;
-    float mvMaxMag = 120.0f;
-
-    // Gating thresholds
-    int   minSamples = 64;
-    float cohMin     = 0.30f;
-    float stdMax     = 12.0f;
-    float tailRatio  = 3.0f;
-    float tailMinAbs = 60.0f;
-
-    // Calibration
+    // Calibration (pixels per meter)
     float pxPerM = 717.0f;
 
-    // Adaptive EMA
-    float emaAlphaHi = 0.50f;
-    float emaAlphaLo = 0.15f;
+    // dt policy:
+    // - If forceFps > 0, dtSec = 1/forceFps (deterministic)
+    // - else dtSec measured from CPU clock (best effort)
+    int forceFps = 15; // default assume 15 FPS; set 0 to use measured dt
 
     // Timing
     bool haveTime = false;
     std::chrono::steady_clock::time_point lastTime;
 
-    // GPU EMA state and speed output
-    DevEmaState *d_ema = nullptr;
-    float       *d_speed_out = nullptr;
+    // Pure reducer output on GPU + host copy
+    MVPureOut *d_pure = nullptr;
+    MVPureOut  pure_h{};
 
-    // CPU-side
-    float speed_host  = 0.0f;
-    float res_dx_host = 0.0f;
-    float res_dy_host = 0.0f;
+    // Overlay controls
+    bool  overlayEnabled = true;
+    float overlayScale   = 3.5f;  // arrow length scale
+    float minMagDraw     = 0.30f; // min L1 magnitude to draw a field arrow
 
-    // Frame counter (also used as overlay jitter seed)
     uint32_t frameId = 0;
-
-    // ----------------------------
-    // CSV logging for plotting
-    // ----------------------------
-    bool logEnabled = false;
-    FILE *logFile = nullptr;
-    std::chrono::steady_clock::time_point logT0;
-    bool haveLogT0 = false;
-    char logPath[512] = {0};
-
-    // ----------------------------
-    // IMU overlay (optional)
-    // ----------------------------
-    bool imuEnabled = false;
-    bool imuLoaded  = false;
-    char imuPath[512] = {0};
-
-    struct ImuRow { float ax, ay, az; };
-    std::vector<ImuRow> imuRows;
-
-    // IMU pipeline constants (match python defaults)
-    float imuAlphaDeg  = 0.0f;   // tilt alpha deg (default 0)
-    float imuG         = 9.81f;  // gravity magnitude
-    float imuAyBias    = -2.0f;  // AY_BIAS
-    float imuLpfAlpha  = 0.01f;  // LPF_ALPHA
-
-    // IMU LPF state
-    float imuAxFilt = 0.0f;
-    float imuAyFilt = 0.0f;
-    bool  imuLpfInit = false;
-
-    // Visual scale: pixels per (m/s^2)
-    float imuOverlayScale = 40.0f;
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -220,284 +167,35 @@ static State* get_or_create_state(void **userPtr)
 }
 
 // ----------------------------
-// CSV logging
+// Init VPI
 // ----------------------------
-
-// Open CSV log if enabled by env vars.
-static void log_open_if_needed(State *st)
-{
-    if (!st) return;
-    if (st->logFile) return;
-
-    // Enable with env var. Example:
-    // export VPI_OF_LOG=1
-    // export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
-    st->logEnabled = (get_env_int("VPI_OF_LOG", 0) != 0);
-    if (!st->logEnabled) return;
-
-    const char *p = std::getenv("VPI_OF_LOG_PATH");
-    if (!p || !p[0]) p = "/tmp/vpi_of_speed.csv";
-    std::snprintf(st->logPath, sizeof(st->logPath), "%s", p);
-
-    st->logFile = std::fopen(st->logPath, "w");
-    if (!st->logFile) {
-        std::fprintf(stderr, "[vpi_of] WARNING: cannot open log file: %s\n", st->logPath);
-        st->logEnabled = false;
-        return;
-    }
-
-    // Line-buffered: one line per frame, safer if pipeline is killed.
-    std::setvbuf(st->logFile, nullptr, _IOLBF, 0);
-
-    // CSV header.
-    std::fprintf(st->logFile,
-                 "frame,t_sec,dt_sec,speed_mps,speed_kmh,res_dx_px,res_dy_px\n");
-    std::fflush(st->logFile);
-}
-
-// Append one CSV line for the current sample.
-static void log_speed_csv(State *st, float dtSec)
-{
-    if (!st) return;
-    if (!st->logEnabled) return;
-    if (!st->logFile) return;
-
-    if (!st->haveLogT0) {
-        st->haveLogT0 = true;
-        st->logT0 = std::chrono::steady_clock::now();
-    }
-
-    auto now = std::chrono::steady_clock::now();
-    float tSec = std::chrono::duration<float>(now - st->logT0).count();
-
-    float speed_kmh = st->speed_host * 3.6f;
-
-    std::fprintf(st->logFile,
-                 "%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                 (unsigned)st->frameId,
-                 (double)tSec,
-                 (double)dtSec,
-                 (double)st->speed_host,
-                 (double)speed_kmh,
-                 (double)st->res_dx_host,
-                 (double)st->res_dy_host);
-}
-
-// Close CSV log file (optional cleanup).
-static void log_close(State *st)
-{
-    if (!st) return;
-    if (st->logFile) {
-        std::fflush(st->logFile);
-        std::fclose(st->logFile);
-        st->logFile = nullptr;
-    }
-}
-
-// ----------------------------
-// IMU CSV loader + pipeline
-// ----------------------------
-
-// Very small CSV splitter: handles commas and optional quotes.
-// Good enough for numeric CSVs.
-static std::vector<std::string> split_csv_line_simple(const std::string &line)
-{
-    std::vector<std::string> out;
-    std::string cur;
-    cur.reserve(line.size());
-    bool inQuotes = false;
-
-    for (char c : line) {
-        if (c == '"') { inQuotes = !inQuotes; continue; }
-        if (!inQuotes && c == ',') {
-            out.push_back(cur);
-            cur.clear();
-            continue;
-        }
-        cur.push_back(c);
-    }
-    out.push_back(cur);
-    return out;
-}
-
-static int find_col_idx(const std::vector<std::string> &hdr, const char *name)
-{
-    for (int i = 0; i < (int)hdr.size(); ++i) {
-        if (hdr[i] == name) return i;
-    }
-    return -1;
-}
-
-// Load IMU CSV into memory if enabled.
-// Enable with:
-//   export VPI_OF_IMU=1
-//   export VPI_OF_IMU_PATH=/path/to/imu.csv
-// CSV requires columns acc_x, acc_y, acc_z.
-static void imu_load_if_needed(State *st)
-{
-    if (!st) return;
-    if (st->imuLoaded) return;
-
-    st->imuEnabled = (get_env_int("VPI_OF_IMU", 0) != 0);
-    if (!st->imuEnabled) { st->imuLoaded = true; return; }
-
-    const char *p = std::getenv("VPI_OF_IMU_PATH");
-    if (!p || !p[0]) p = "/home/ntc-orin/Front_and_back_movement_car_test/imu.csv";
-    std::snprintf(st->imuPath, sizeof(st->imuPath), "%s", p);
-
-    // Optional overrides (defaults match your python snippet)
-    st->imuAlphaDeg     = get_env_float("VPI_OF_IMU_ALPHA_DEG", 0.0f);
-    st->imuG            = get_env_float("VPI_OF_IMU_G", 9.81f);
-    st->imuAyBias       = get_env_float("VPI_OF_IMU_AY_BIAS", -2.0f);
-    st->imuLpfAlpha     = std::clamp(get_env_float("VPI_OF_IMU_LPF_ALPHA", 0.01f), 0.0f, 1.0f);
-    st->imuOverlayScale = std::max(0.1f, get_env_float("VPI_OF_IMU_OVERLAY_SCALE", 40.0f));
-
-    std::ifstream in(st->imuPath);
-    if (!in.good()) {
-        std::fprintf(stderr, "[vpi_of] WARNING: cannot open IMU CSV: %s\n", st->imuPath);
-        st->imuEnabled = false;
-        st->imuLoaded = true;
-        return;
-    }
-
-    std::string header;
-    if (!std::getline(in, header)) {
-        std::fprintf(stderr, "[vpi_of] WARNING: IMU CSV empty: %s\n", st->imuPath);
-        st->imuEnabled = false;
-        st->imuLoaded = true;
-        return;
-    }
-
-    auto hdr = split_csv_line_simple(header);
-    int ix = find_col_idx(hdr, "acc_x");
-    int iy = find_col_idx(hdr, "acc_y");
-    int iz = find_col_idx(hdr, "acc_z");
-    if (ix < 0 || iy < 0 || iz < 0) {
-        std::fprintf(stderr, "[vpi_of] WARNING: IMU CSV missing acc_x/acc_y/acc_z columns: %s\n", st->imuPath);
-        st->imuEnabled = false;
-        st->imuLoaded = true;
-        return;
-    }
-
-    st->imuRows.clear();
-    st->imuRows.reserve(10000);
-
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        auto cols = split_csv_line_simple(line);
-
-        int need = std::max(ix, std::max(iy, iz));
-        if ((int)cols.size() <= need) continue;
-
-        State::ImuRow r{};
-        r.ax = std::strtof(cols[ix].c_str(), nullptr);
-        r.ay = std::strtof(cols[iy].c_str(), nullptr);
-        r.az = std::strtof(cols[iz].c_str(), nullptr);
-        st->imuRows.push_back(r);
-    }
-
-    if (st->imuRows.empty()) {
-        std::fprintf(stderr, "[vpi_of] WARNING: IMU CSV has no data rows: %s\n", st->imuPath);
-        st->imuEnabled = false;
-    } else {
-        std::fprintf(stderr, "[vpi_of] IMU loaded: %zu rows from %s\n", st->imuRows.size(), st->imuPath);
-    }
-
-    st->imuLoaded = true;
-}
-
-// Update IMU filtered vector for current frameId.
-// This matches your python pipeline:
-//
-// 1) Rotate raw IMU accel into level frame: a_rot = R @ acc
-// 2) Subtract gravity in level frame: a_lin = a_rot - [0,0,-G]
-// 3) Bias compensation (Y): ay = a_lin.y - AY_BIAS
-// 4) Low-pass filter on ax/ay
-//
-// Note: this produces linear accel in m/s^2; we draw it as visual arrow only.
-static void imu_update_from_frame(State *st)
-{
-    if (!st || !st->imuEnabled) return;
-    if (st->imuRows.empty()) return;
-
-    size_t idx = (size_t)st->frameId;
-    if (idx >= st->imuRows.size()) idx = st->imuRows.size() - 1;
-
-    const auto &acc = st->imuRows[idx];
-
-    // Rotation matrix around X axis (same as your python R)
-    float alpha = st->imuAlphaDeg * 0.01745329252f;
-    float ca = std::cos(alpha);
-    float sa = std::sin(alpha);
-
-    // a_rot = R @ acc
-    float ax_r = acc.ax;
-    float ay_r =  ca * acc.ay + sa * acc.az;
-    float az_r = -sa * acc.ay + ca * acc.az;
-
-    // Subtract gravity in level frame: a_lin = a_rot - [0,0,-G]
-    // => az_lin = az_r + G
-    float ax_lin = ax_r;
-    float ay_lin = ay_r;
-    float az_lin = az_r + st->imuG;
-    (void)az_lin; // not used for XY overlay
-
-    // Bias compensation (Y axis)
-    float ax = ax_lin;
-    float ay = ay_lin - st->imuAyBias;
-
-    // Low-pass filter
-    if (!st->imuLpfInit) {
-        st->imuAxFilt = ax;
-        st->imuAyFilt = ay;
-        st->imuLpfInit = true;
-    } else {
-        float a = st->imuLpfAlpha;
-        st->imuAxFilt = a * ax + (1.0f - a) * st->imuAxFilt;
-        st->imuAyFilt = a * ay + (1.0f - a) * st->imuAyFilt;
-    }
-}
-
 static void init_vpi_if_needed(State *st, int W, int H)
 {
     if (st->inited) return;
 
     st->W = W; st->H = H;
 
-    // Env runtime controls
+    // Runtime knobs
+    st->roiX0    = std::clamp(get_env_float("VPI_OF_ROI_X0", st->roiX0), 0.0f, 1.0f);
+    st->roiX1    = std::clamp(get_env_float("VPI_OF_ROI_X1", st->roiX1), 0.0f, 1.0f);
+    st->roiY0    = std::clamp(get_env_float("VPI_OF_ROI_Y0", st->roiY0), 0.0f, 1.0f);
+    st->roiY1    = std::clamp(get_env_float("VPI_OF_ROI_Y1", st->roiY1), 0.0f, 1.0f);
+    st->step     = std::max(1, get_env_int("VPI_OF_STEP", st->step));
+    st->pxPerM   = std::max(1.0f, get_env_float("VPI_OF_PX_PER_M", st->pxPerM));
+    st->forceFps = get_env_int("VPI_OF_FORCE_FPS", st->forceFps); // 0 = use measured dt
+
+    // Overlay knobs
     st->overlayEnabled = (get_env_int("VPI_OF_OVERLAY", 1) != 0);
-    st->overlayStep    = std::max(1, get_env_int("VPI_OF_OVERLAY_STEP", 12));
-    st->overlayScale   = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", 3.5f));
+    st->overlayScale   = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", st->overlayScale));
+    st->minMagDraw     = std::max(0.0f, get_env_float("VPI_OF_MIN_MAG_DRAW", st->minMagDraw));
 
-    st->mvMinMag = std::max(0.0f, get_env_float("VPI_OF_MIN_MAG", 0.5f));
-    st->mvMaxMag = std::max(st->mvMinMag + 0.1f, get_env_float("VPI_OF_MAX_MAG", 120.0f));
-
-    st->minSamples = std::max(16, get_env_int("VPI_OF_MIN_ROBUST_SAMPLES", 64));
-    st->cohMin     = std::clamp(get_env_float("VPI_OF_COH_MIN", 0.30f), 0.0f, 1.0f);
-    st->stdMax     = std::max(0.0f, get_env_float("VPI_OF_STD_MAX", 12.0f));
-
-    st->tailRatio  = std::max(1.0f, get_env_float("VPI_OF_TAIL_RATIO", 3.0f));
-    st->tailMinAbs = std::max(0.0f, get_env_float("VPI_OF_TAIL_MIN_ABS", 60.0f));
-
-    st->pxPerM = std::max(1.0f, get_env_float("VPI_OF_PX_PER_M", 717.0f));
-
-    st->emaAlphaHi = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_HI", 0.50f), 0.0f, 1.0f);
-    st->emaAlphaLo = std::clamp(get_env_float("VPI_OF_EMA_ALPHA_LO", 0.15f), 0.0f, 1.0f);
-
-    // ROI (normalized) runtime controls.
-    st->roiX0 = std::clamp(get_env_float("VPI_OF_ROI_X0", 0.15f), 0.0f, 1.0f);
-    st->roiX1 = std::clamp(get_env_float("VPI_OF_ROI_X1", 0.85f), 0.0f, 1.0f);
-    st->roiY0 = std::clamp(get_env_float("VPI_OF_ROI_Y0", 0.20f), 0.0f, 1.0f);
-    st->roiY1 = std::clamp(get_env_float("VPI_OF_ROI_Y1", 0.80f), 0.0f, 1.0f);
-
-    // Sanity: enforce non-empty ROI, otherwise fallback to defaults.
+    // Sanity ROI
     if (!(st->roiX1 > st->roiX0 + 0.01f)) { st->roiX0 = 0.15f; st->roiX1 = 0.85f; }
     if (!(st->roiY1 > st->roiY0 + 0.01f)) { st->roiY0 = 0.20f; st->roiY1 = 0.80f; }
 
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
-    // CUDA-backed Y8 for CUDA-EGL copy
+    // CUDA-backed Y8 images
     CHECK_VPI(vpiImageCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
                              VPI_BACKEND_CUDA | VPI_BACKEND_CPU, &st->prev_y8_pl));
     CHECK_VPI(vpiImageCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
@@ -505,12 +203,13 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
     st->numLevels = max_levels_scale_half_min32(W, H);
 
-    // Pyramids
+    // Pitch-linear pyramids (CUDA)
     CHECK_VPI(vpiPyramidCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
                               st->numLevels, st->pyrScale, 0, &st->prev_pyr_pl));
     CHECK_VPI(vpiPyramidCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER,
                               st->numLevels, st->pyrScale, 0, &st->cur_pyr_pl));
 
+    // Block-linear pyramids (VIC->OFA)
     CHECK_VPI(vpiPyramidCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER_BL,
                               st->numLevels, st->pyrScale, 0, &st->prev_pyr_bl));
     CHECK_VPI(vpiPyramidCreate(W, H, VPI_IMAGE_FORMAT_Y8_ER_BL,
@@ -543,25 +242,20 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
     CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16_BL, 0, &st->mv_bl));
 
-    // IMPORTANT: destination supports VIC (writer) + CUDA (reader)
+    // BL -> pitch-linear via VIC, and readable by CUDA
     CHECK_VPI(vpiImageCreate(mvW, mvH, VPI_IMAGE_FORMAT_2S16,
                              VPI_BACKEND_VIC | VPI_BACKEND_CUDA, &st->mv_vic_cuda_pl));
 
-    // Persistent GPU EMA + speed output
-    cudaMalloc(&st->d_ema, sizeof(DevEmaState));
-    cudaMalloc(&st->d_speed_out, sizeof(float));
-    cudaMemset(st->d_ema, 0, sizeof(DevEmaState));
-    cudaMemset(st->d_speed_out, 0, sizeof(float));
-
-    // Optional CSV log
-    log_open_if_needed(st);
-
-    // Optional IMU load (only if VPI_OF_IMU=1)
-    imu_load_if_needed(st);
+    // Pure reducer output on GPU
+    cudaMalloc(&st->d_pure, sizeof(MVPureOut));
+    cudaMemset(st->d_pure, 0, sizeof(MVPureOut));
 
     st->inited = true;
 }
 
+// ----------------------------
+// Main GPU process
+// ----------------------------
 static void gpu_process(EGLImageKHR image, void **userPtr)
 {
     State *st = get_or_create_state(userPtr);
@@ -569,7 +263,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     static bool cu_inited = false;
     if (!cu_inited) { cuInit(0); cu_inited = true; }
 
-    // Size from caps or env fallback
     int W = st->W, H = st->H;
     if (W <= 0 || H <= 0) {
         if (!get_size_from_env(W, H)) return;
@@ -578,20 +271,24 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     init_vpi_if_needed(st, W, H);
 
-    // dt on CPU
-    auto now = std::chrono::steady_clock::now();
-    float dtSec = 0.0f;
-    if (!st->haveTime) {
-        st->haveTime = true;
-        st->lastTime = now;
+    // dtSec
+    float useDt = 1.0f / 15.0f;
+    if (st->forceFps > 0) {
+        useDt = 1.0f / (float)st->forceFps;
     } else {
-        dtSec = std::chrono::duration<float>(now - st->lastTime).count();
-        st->lastTime = now;
-        dtSec = std::clamp(dtSec, 1.0f/80.0f, 1.0f/10.0f);
+        auto now = std::chrono::steady_clock::now();
+        float dtSec = 0.0f;
+        if (!st->haveTime) {
+            st->haveTime = true;
+            st->lastTime = now;
+        } else {
+            dtSec = std::chrono::duration<float>(now - st->lastTime).count();
+            st->lastTime = now;
+        }
+        useDt = (dtSec > 0.0f) ? std::clamp(dtSec, 1.0f/120.0f, 1.0f/5.0f) : (1.0f/15.0f);
     }
-    float useDt = (dtSec > 0.0f) ? dtSec : (1.0f / 30.0f);
 
-    // Copy NV12 luma (Y) from EGLImage to CUDA-backed VPI Y8
+    // Copy NV12 luma (Y) from EGLImage into CUDA-backed VPI Y8
     VPIImageData ydata{};
     CHECK_VPI(vpiImageLockData(st->cur_y8_pl, VPI_LOCK_WRITE,
                               VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &ydata));
@@ -603,33 +300,22 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     CHECK_VPI(vpiImageUnlock(st->cur_y8_pl));
 
-    // First frame: no optical flow yet, speed = 0.
+    // First frame: no flow.
     if (!st->havePrev) {
-        st->speed_host  = 0.0f;
-        st->res_dx_host = 0.0f;
-        st->res_dy_host = 0.0f;
-
-        print_speed_mps(0.0f);
-
-        // Log a first sample too (dt=0 for first frame).
-        log_open_if_needed(st);
-        log_speed_csv(st, 0.0f);
-
         std::swap(st->prev_y8_pl, st->cur_y8_pl);
         st->havePrev = true;
-
         st->frameId++;
         return;
     }
 
-    // Phase A (CUDA): pyramids
+    // Phase A: CUDA pyramids
     CHECK_VPI(vpiSubmitGaussianPyramidGenerator(st->stream, VPI_BACKEND_CUDA,
                                                st->prev_y8_pl, st->prev_pyr_pl, VPI_BORDER_CLAMP));
     CHECK_VPI(vpiSubmitGaussianPyramidGenerator(st->stream, VPI_BACKEND_CUDA,
                                                st->cur_y8_pl,  st->cur_pyr_pl,  VPI_BORDER_CLAMP));
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Phase B (VIC): PL->BL per level
+    // Phase B: VIC PL->BL for OFA
     for (int lvl = 0; lvl < st->numLevels; ++lvl) {
         CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
                                              st->prevLvlPL[lvl], st->prevLvlBL[lvl], nullptr));
@@ -638,19 +324,19 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     }
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Phase C (OFA): dense optical flow
+    // Phase C: OFA dense optical flow
     CHECK_VPI(vpiSubmitOpticalFlowDensePyramid(st->stream, VPI_BACKEND_OFA,
                                               st->ofa_payload,
                                               st->prev_pyr_bl, st->cur_pyr_bl,
                                               st->mv_bl));
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Convert MV: BL -> pitch-linear using VIC (CUDA conversion not available in VPI 2.4)
+    // Phase D: BL -> pitch-linear MV via VIC
     CHECK_VPI(vpiSubmitConvertImageFormat(st->stream, VPI_BACKEND_VIC,
                                          st->mv_bl, st->mv_vic_cuda_pl, nullptr));
     CHECK_VPI(vpiStreamSync(st->stream));
 
-    // Lock pitch-linear MV as CUDA
+    // Lock MV as CUDA pitch-linear
     VPIImageData mvdata{};
     CHECK_VPI(vpiImageLockData(st->mv_vic_cuda_pl, VPI_LOCK_READ,
                               VPI_IMAGE_BUFFER_CUDA_PITCH_LINEAR, &mvdata));
@@ -661,103 +347,69 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     const int mvW = (W + st->grid - 1) / st->grid;
     const int mvH = (H + st->grid - 1) / st->grid;
 
-    // ROI in MV space derived from normalized settings.
+    // ROI in MV space
     int x0 = (int)((float)mvW * st->roiX0 + 0.5f);
     int x1 = (int)((float)mvW * st->roiX1 + 0.5f);
     int y0 = (int)((float)mvH * st->roiY0 + 0.5f);
     int y1 = (int)((float)mvH * st->roiY1 + 0.5f);
 
-    // Clamp and ensure non-empty ROI.
     x0 = std::clamp(x0, 0, mvW - 1);
     x1 = std::clamp(x1, x0 + 1, mvW);
     y0 = std::clamp(y0, 0, mvH - 1);
     y1 = std::clamp(y1, y0 + 1, mvH);
 
-    MVParams p{};
+    // Pure reduction on GPU
+    MVPureParams p{};
     p.mvW = mvW; p.mvH = mvH;
     p.mvPitchBytes = mvPitchBytes;
     p.grid = st->grid;
-
     p.x0 = x0; p.x1 = x1;
     p.y0 = y0; p.y1 = y1;
-    p.step = st->overlayStep;
-
-    p.minMag = st->mvMinMag;
-    p.maxMag = st->mvMaxMag;
-
-    p.minSamples = st->minSamples;
-    p.cohMin     = st->cohMin;
-    p.stdMax     = st->stdMax;
-    p.tailRatio  = st->tailRatio;
-    p.tailMinAbs = st->tailMinAbs;
-
+    p.step = st->step;
     p.pxPerMeter = st->pxPerM;
-    p.dtSec      = useDt;
+    p.dtSec = useDt;
 
-    p.alphaHi = st->emaAlphaHi;
-    p.alphaLo = st->emaAlphaLo;
+    mv_reduce_pure_cuda(mvPtr, &p, st->d_pure);
 
-    p.cohExcellent    = std::min(0.85f, st->cohMin + 0.30f);
-    p.stdExcellentMax = st->stdMax * 0.60f;
-
-    // GPU reduction + gating + EMA
-    mv_reduce_gating_ema_cuda(mvPtr, st->d_ema, &p, st->d_speed_out, nullptr);
-
-    // Copy results to CPU (tiny)
-    cudaMemcpy(&st->speed_host, st->d_speed_out, sizeof(float), cudaMemcpyDeviceToHost);
-
-    DevEmaState emaHost{};
-    cudaMemcpy(&emaHost, st->d_ema, sizeof(DevEmaState), cudaMemcpyDeviceToHost);
+    // Copy output to CPU and print
+    cudaMemcpy(&st->pure_h, st->d_pure, sizeof(MVPureOut), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
-    st->res_dx_host = emaHost.lastResDx;
-    st->res_dy_host = emaHost.lastResDy;
+    std::fprintf(stdout,
+                 "speed=%.3f m/s (%.2f km/h)  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f\n",
+                 st->pure_h.speed_mps, st->pure_h.speed_mps * 3.6f,
+                 st->pure_h.mean_dx, st->pure_h.mean_dy,
+                 st->pure_h.count, useDt);
+    std::fflush(stdout);
 
-    // Update IMU filtered vector for this frame (optional)
-    imu_update_from_frame(st);
-
-    // Print on CPU
-    print_speed_mps(st->speed_host);
-
-    // Log for plotting (CSV)
-    log_speed_csv(st, useDt);
-
-    // Overlay on GPU
+    // OVERLAY (visual only): field + resultant at center.
     if (st->overlayEnabled) {
-        // Visual-only forcing parameters:
-        const float forceDeg       = 10.0f;
-        const float forceMinResMag = 0.25f;
-
-        // Colors:
-        // - MV field color: existing YUV values
-        // - OF resultant: keep your existing "blue-ish" YUV
-        // - IMU resultant: green-ish YUV (visual only)
-        overlay_draw_mvs_nv12(image, W, H,
-                              mvPtr, mvPitchBytes,
-                              mvW, mvH, st->grid,
-                              x0, x1, y0, y1,
-                              st->overlayStep, st->overlayScale,
-                              0.30f,
-                              76, 85, 255,                 // field color (YUV)
-                              st->res_dx_host, st->res_dy_host,
-                              29, 255, 107,                 // OF resultant color (YUV)
-                              (st->imuEnabled ? st->imuAxFilt : 0.0f),
-                              (st->imuEnabled ? st->imuAyFilt : 0.0f),
-                              st->imuOverlayScale,
-                              150, 44, 21,                  // IMU resultant color (YUV) - green-ish
-                              forceDeg, forceMinResMag,
-                              st->frameId);
+        overlay_draw_mvs_nv12(
+            image, W, H,
+            mvPtr, mvPitchBytes,
+            mvW, mvH, st->grid,
+            x0, x1, y0, y1,
+            st->step, st->overlayScale,
+            st->minMagDraw,
+            76, 85, 255,                        // field color (YUV)
+            st->pure_h.mean_dx, st->pure_h.mean_dy,
+            29, 255, 107,                       // resultant color (YUV)
+            0.0f, 0.0f, 0.0f,                   // IMU disabled
+            150, 44, 21,                        // (unused)
+            0.0f, 1e9f,                         // forceDeg=0 disables forcing
+            st->frameId);
     }
 
     CHECK_VPI(vpiImageUnlock(st->mv_vic_cuda_pl));
 
     // Advance
     std::swap(st->prev_y8_pl, st->cur_y8_pl);
-
-    // Advance frame counter (used for logging + overlay jitter seed)
     st->frameId++;
 }
 
+// ----------------------------
+// nvivafilter hooks
+// ----------------------------
 static void pre_process(void **, unsigned int *inW, unsigned int *inH,
                         unsigned int*, unsigned int*, ColorFormat*,
                         unsigned int, void **userPtr)
@@ -772,14 +424,9 @@ static void pre_process(void **, unsigned int *inW, unsigned int *inH,
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*,
                          ColorFormat*, unsigned int, void **userPtr)
 {
-    // Optional: close log file when pipeline tears down (if post_process is called).
-    if (userPtr && *userPtr) {
-        State *st = reinterpret_cast<State*>(*userPtr);
-        log_close(st);
-    }
-
-    // No frees here (keep consistent with your original design).
-    // If you decide to free, do it carefully and ensure GStreamer lifecycle is correct.
+    // Optional cleanup could go here (VPI destroy, cudaFree, delete st).
+    // Kept minimal intentionally.
+    (void)userPtr;
 }
 
 extern "C" void init(CustomerFunction *f)
@@ -790,7 +437,4 @@ extern "C" void init(CustomerFunction *f)
     f->fPostProcess = post_process;
 }
 
-extern "C" void deinit(void)
-{
-    // No prints here.
-}
+extern "C" void deinit(void) {}
