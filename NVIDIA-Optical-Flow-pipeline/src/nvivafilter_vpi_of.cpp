@@ -1,12 +1,19 @@
 // nvivafilter_vpi_of.cpp
 //
-// PURE DOF (Dense Optical Flow) + OVERLAY
+// PURE DOF (Dense Optical Flow) + OVERLAY + GPU ANTI-SPIKE FILTER (NO QUALITY GATE)
 //
 // Pipeline:
-// NVDEC -> NVMM(NV12) -> nvivafilter (this .so) -> NVMM
+// NVDEC -> NVMM(NV12 EGLImage) -> nvivafilter (this .so) -> NVMM
 //
-// - Uses VPI 2.4.x + OFA Dense Optical Flow.
-
+// - VPI 2.4.x + OFA Dense Optical Flow
+// - Motion vector reduction on GPU
+// - Anti-spike filtering on GPU (stateful) to reject huge speed jumps
+// - (Optional) EMA smoothing on the filtered vector
+//
+// NOTE: All "quality metric" gating logic has been REMOVED as requested.
+//       Env vars disabled/ignored now:
+//         VPI_OF_QUAL_MAX, VPI_OF_QUAL_LOW, VPI_OF_MIN_COUNT, VPI_OF_BAD_RESET_FRAMES
+//
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +23,7 @@
 #include <chrono>
 #include <vector>
 #include <cmath>
+#include <mutex>
 
 #include <EGL/egl.h>
 
@@ -34,6 +42,7 @@
 #include "egl_copy.hpp"
 #include "mv_reduce.hpp"
 #include "overlay.hpp"
+#include "mv_spike_filter.hpp"
 
 // ----------------------------
 // VPI error helper
@@ -131,7 +140,7 @@ struct State
     float roiX0 = 0.15f, roiX1 = 0.85f;
     float roiY0 = 0.20f, roiY1 = 0.80f;
 
-    // Sampling step in MV cells (1 = use every MV cell)
+    // Sampling step in MV cells
     int step = 1;
 
     // Calibration (pixels per meter)
@@ -139,8 +148,8 @@ struct State
 
     // dt policy:
     // - If forceFps > 0, dtSec = 1/forceFps (deterministic)
-    // - else dtSec measured from CPU clock (best effort)
-    int forceFps = 15; // default assume 15 FPS; set 0 to use measured dt
+    // - else dtSec measured from CPU clock
+    int forceFps = 15; // set 0 to use measured dt
 
     // Timing
     bool haveTime = false;
@@ -150,12 +159,44 @@ struct State
     MVPureOut *d_pure = nullptr;
     MVPureOut  pure_h{};
 
+    // ----------------------------
+    // CSV logging
+    // ----------------------------
+    bool  csvEnabled = false;
+    int   csvEveryN  = 1;             // write every N frames (1 = every frame)
+    FILE *csvFp      = nullptr;
+
+    bool  csvHaveT0 = false;
+    std::chrono::steady_clock::time_point csvT0;
+
+    std::mutex csvMutex;
+
+    // ----------------------------
+    // GPU anti-spike (stateful)
+    // ----------------------------
+    MVSpikeFilterState *d_spikeState = nullptr;
+    MVPureOut          *d_pure_filt  = nullptr;
+
+    // Anti-spike knobs:
+    // Treat jump >= spikeKmh as spike unless it persists stableFrames frames.
+    float spikeKmh = 10.0f;
+    float okKmh    = 2.0f;   // kept for env compatibility; kernel currently doesn't use it
+    int   stableFrames = 80;
+
     // Overlay controls
     bool  overlayEnabled = true;
-    float overlayScale   = 3.5f;  // arrow length scale
-    float minMagDraw     = 0.30f; // min L1 magnitude to draw a field arrow
+    float overlayScale   = 3.5f;
+    float minMagDraw     = 0.30f;
 
     uint32_t frameId = 0;
+
+    // ----------------------------
+    // Low-pass filter (EMA)
+    // ----------------------------
+    bool  emaHave = false;
+    float ema_dx = 0.0f;
+    float ema_dy = 0.0f;
+    float emaTauSec = 0.25f;   // time constant in seconds
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -189,9 +230,36 @@ static void init_vpi_if_needed(State *st, int W, int H)
     st->overlayScale   = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", st->overlayScale));
     st->minMagDraw     = std::max(0.0f, get_env_float("VPI_OF_MIN_MAG_DRAW", st->minMagDraw));
 
+    // Anti-spike knobs (ONLY)
+    st->spikeKmh     = std::max(0.0f, get_env_float("VPI_OF_SPIKE_KMH", st->spikeKmh));
+    st->okKmh        = std::max(0.0f, get_env_float("VPI_OF_OK_KMH", st->okKmh));
+    st->stableFrames = std::max(1,    get_env_int  ("VPI_OF_STABLE_FRAMES", st->stableFrames));
+
+    // EMA knob
+    st->emaTauSec = std::max(0.0f, get_env_float("VPI_OF_EMA_TAU", st->emaTauSec));
+
     // Sanity ROI
     if (!(st->roiX1 > st->roiX0 + 0.01f)) { st->roiX0 = 0.15f; st->roiX1 = 0.85f; }
     if (!(st->roiY1 > st->roiY0 + 0.01f)) { st->roiY0 = 0.20f; st->roiY1 = 0.80f; }
+
+    // CSV knobs
+    st->csvEnabled = (get_env_int("VPI_OF_CSV", 0) != 0);
+    st->csvEveryN  = std::max(1, get_env_int("VPI_OF_CSV_EVERY", 1));
+
+    if (st->csvEnabled && !st->csvFp) {
+        const char *path = std::getenv("VPI_OF_CSV_PATH");
+        if (!path) path = "/tmp/vpi_of_speed.csv";
+
+        st->csvFp = std::fopen(path, "w");
+        if (st->csvFp) {
+            std::fprintf(st->csvFp,
+                "t_sec,speed_mps,speed_kmh,dx_pxpf,dy_pxpf,count,dt_sec\n");
+            std::fflush(st->csvFp);
+        } else {
+            std::fprintf(stderr, "[vpi_of_pure] ERROR: cannot open CSV at %s\n", path);
+            st->csvEnabled = false;
+        }
+    }
 
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
@@ -250,6 +318,13 @@ static void init_vpi_if_needed(State *st, int W, int H)
     cudaMalloc(&st->d_pure, sizeof(MVPureOut));
     cudaMemset(st->d_pure, 0, sizeof(MVPureOut));
 
+    // GPU anti-spike state + filtered output
+    cudaMalloc(&st->d_spikeState, sizeof(MVSpikeFilterState));
+    cudaMemset(st->d_spikeState, 0, sizeof(MVSpikeFilterState));
+
+    cudaMalloc(&st->d_pure_filt, sizeof(MVPureOut));
+    cudaMemset(st->d_pure_filt, 0, sizeof(MVPureOut));
+
     st->inited = true;
 }
 
@@ -271,7 +346,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     init_vpi_if_needed(st, W, H);
 
-    // dtSec
+    // Compute dtSec
     float useDt = 1.0f / 15.0f;
     if (st->forceFps > 0) {
         useDt = 1.0f / (float)st->forceFps;
@@ -358,7 +433,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     y0 = std::clamp(y0, 0, mvH - 1);
     y1 = std::clamp(y1, y0 + 1, mvH);
 
-    // Pure reduction on GPU
+    // Pure reduction params
     MVPureParams p{};
     p.mvW = mvW; p.mvH = mvH;
     p.mvPitchBytes = mvPitchBytes;
@@ -369,20 +444,83 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     p.pxPerMeter = st->pxPerM;
     p.dtSec = useDt;
 
+    // 1) Raw reduction on GPU
     mv_reduce_pure_cuda(mvPtr, &p, st->d_pure);
 
-    // Copy output to CPU and print
-    cudaMemcpy(&st->pure_h, st->d_pure, sizeof(MVPureOut), cudaMemcpyDeviceToHost);
+    // 2) Anti-spike on GPU (stateful) - ONLY
+    MVSpikeFilterParams sfp{};
+    sfp.ok_kmh        = st->okKmh;
+    sfp.spike_kmh     = st->spikeKmh;
+    sfp.stable_frames = st->stableFrames;
+
+    mv_spike_filter_cuda(st->d_pure, &sfp, st->d_spikeState, st->d_pure_filt);
+
+    // Copy FILTERED result to host
+    MVPureOut filt_h{};
+    cudaMemcpy(&filt_h, st->d_pure_filt, sizeof(MVPureOut), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
+    // Base output = filtered
+    st->pure_h = filt_h;
+
+    // Optional EMA on the filtered vector (FIXED: do NOT overwrite after)
+    if (st->emaTauSec > 0.0f) {
+        float alpha = useDt / (st->emaTauSec + useDt);
+
+        if (!st->emaHave) {
+            st->emaHave = true;
+            st->ema_dx = st->pure_h.mean_dx;
+            st->ema_dy = st->pure_h.mean_dy;
+        } else {
+            st->ema_dx += alpha * (st->pure_h.mean_dx - st->ema_dx);
+            st->ema_dy += alpha * (st->pure_h.mean_dy - st->ema_dy);
+        }
+
+        st->pure_h.mean_dx = st->ema_dx;
+        st->pure_h.mean_dy = st->ema_dy;
+        st->pure_h.res_mag = std::sqrt(st->ema_dx*st->ema_dx + st->ema_dy*st->ema_dy);
+        st->pure_h.speed_mps = (st->pure_h.res_mag / st->pxPerM) / useDt;
+    }
+
+    // Write CSV (filtered/EMA values only)
+    if (st->csvEnabled && st->csvFp && (st->frameId % (uint32_t)st->csvEveryN == 0)) {
+        std::lock_guard<std::mutex> lk(st->csvMutex);
+
+        auto now = std::chrono::steady_clock::now();
+        if (!st->csvHaveT0) {
+            st->csvHaveT0 = true;
+            st->csvT0 = now;
+        }
+        double t_sec = std::chrono::duration<double>(now - st->csvT0).count();
+        double kmh = (double)st->pure_h.speed_mps * 3.6;
+
+        std::fprintf(st->csvFp,
+                     "%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.6f\n",
+                     t_sec,
+                     (double)st->pure_h.speed_mps,
+                     kmh,
+                     (double)st->pure_h.mean_dx,
+                     (double)st->pure_h.mean_dy,
+                     st->pure_h.count,
+                     (double)useDt);
+
+        if ((st->frameId % 120) == 0) {
+            std::fflush(st->csvFp);
+        }
+    }
+
+    // Debug line
     std::fprintf(stdout,
-                 "speed=%.3f m/s (%.2f km/h)  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f\n",
-                 st->pure_h.speed_mps, st->pure_h.speed_mps * 3.6f,
-                 st->pure_h.mean_dx, st->pure_h.mean_dy,
-                 st->pure_h.count, useDt);
+                "speed=%.3f m/s (%.2f km/h)  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f\n",
+                st->pure_h.speed_mps,
+                st->pure_h.speed_mps * 3.6f,
+                st->pure_h.mean_dx,
+                st->pure_h.mean_dy,
+                st->pure_h.count,
+                useDt);
     std::fflush(stdout);
 
-    // OVERLAY (visual only): field + resultant at center.
+    // OVERLAY: use filtered/EMA resultant
     if (st->overlayEnabled) {
         overlay_draw_mvs_nv12(
             image, W, H,
@@ -424,9 +562,17 @@ static void pre_process(void **, unsigned int *inW, unsigned int *inH,
 static void post_process(void **, unsigned int*, unsigned int*, unsigned int*, unsigned int*,
                          ColorFormat*, unsigned int, void **userPtr)
 {
-    // Optional cleanup could go here (VPI destroy, cudaFree, delete st).
-    // Kept minimal intentionally.
-    (void)userPtr;
+    State *st = (userPtr && *userPtr) ? reinterpret_cast<State*>(*userPtr) : nullptr;
+    if (!st) return;
+
+    if (st->csvFp) {
+        std::fflush(st->csvFp);
+        std::fclose(st->csvFp);
+        st->csvFp = nullptr;
+    }
+
+    // NOTE: you can free VPI/CUDA resources here if you want.
+    // Keeping minimal to match your existing behavior.
 }
 
 extern "C" void init(CustomerFunction *f)

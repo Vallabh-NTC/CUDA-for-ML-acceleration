@@ -25,53 +25,32 @@ cmake --build build -j"$(nproc)" --verbose
 # VPI OF speed + overlay (Jetson Orin / VPI 2.4) - recommended
 # ------------------------------------------------------------
 
-# IMPORTANT: force size if caps are not propagated to the filter
-export VPI_OF_W=1280
-export VPI_OF_H=720
+export VPI_OF_W=1280  #672 for 100FPS
+export VPI_OF_H=720   #376 for 100 FPS
 
 # Overlay
 export VPI_OF_OVERLAY=1
 export VPI_OF_OVERLAY_STEP=2
 export VPI_OF_OVERLAY_SCALE=3.5
 
-# ROI in MV space (normalized 0..1)
-export VPI_OF_ROI_X0=0.3487
-export VPI_OF_ROI_X1=0.6615
-export VPI_OF_ROI_Y0=0.3823
-export VPI_OF_ROI_Y1=0.6049
+export VPI_OF_ROI_X0=0.35
+export VPI_OF_ROI_X1=0.80
+export VPI_OF_ROI_Y0=0.70
+export VPI_OF_ROI_Y1=0.90
 
-# Magnitude band-pass (px/frame)
-export VPI_OF_MIN_MAG=0.9
-export VPI_OF_MAX_MAG=75.0
+export VPI_OF_FORCE_FPS=100 #or 30,60
+export VPI_OF_PX_PER_M=330 #based on the calibration
 
-# Gating / robustness
-export VPI_OF_MIN_ROBUST_SAMPLES=64
-export VPI_OF_COH_MIN=0.30
-export VPI_OF_STD_MAX=12.0
+export VPI_OF_OK_KMH=2
+export VPI_OF_SPIKE_KMH=10
+export VPI_OF_STABLE_FRAMES=80
+export VPI_OF_EMA_TAU=0.60
 
-# Tail spike rejection
-export VPI_OF_TAIL_RATIO=2.0
-export VPI_OF_TAIL_MIN_ABS=35.0
+export VPI_OF_CSV=1
+export VPI_OF_CSV_PATH=/home/ntc-orin/Straight_back_100kmph_100FPS/speed_dof.csv   #change the name of the folder based on the specific scenario
+export VPI_OF_CSV_EVERY=1
 
-# Calibration (px per meter) -> speed in m/s
-export VPI_OF_PX_PER_M=717.0
 
-# EMA smoothing
-export VPI_OF_EMA_ALPHA_HI=0.45
-export VPI_OF_EMA_ALPHA_LO=0.10
 
-# Optional logging (CSV)
-export VPI_OF_LOG=1
-export VPI_OF_LOG_PATH=/tmp/vpi_of_speed.csv
-
-# IMU resultant
-export VPI_OF_IMU=1
-export VPI_OF_IMU_PATH=/home/ntc-orin/Front_and_back_movement_car_test/imu.csv
-
-# optional 
-export VPI_OF_IMU_ALPHA_DEG=0.0
-export VPI_OF_IMU_G=9.81
-export VPI_OF_IMU_AY_BIAS=-2.0
-export VPI_OF_IMU_LPF_ALPHA=0.01
-export VPI_OF_IMU_OVERLAY_SCALE=40.0
+gst-launch-1.0 -e filesrc location="/home/ntc-orin/Videos/Straight_back_100kmph_100fps.mp4" ! qtdemux name=dem dem.video_0 ! queue ! h264parse ! nvv4l2decoder ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12,width=672,height=376' ! nvivafilter cuda-process=true customer-lib-name=/home/ntc-orin/libvpi_of.so ! 'video/x-raw(memory:NVMM),format=NV12' ! nvv4l2h264enc bitrate=4000000 insert-sps-pps=true iframeinterval=30 ! h264parse ! rtph264pay config-interval=1 pt=96 ! udpsink host=192.168.1.100 port=5000 sync=false async=false
 

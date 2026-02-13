@@ -1,14 +1,22 @@
 #pragma once
 #include <cstdint>
 
-// Output of the pure reduction (no gating, no EMA).
+// Output of the pure reduction (no gating here).
+// mean_* are in px/frame.
 struct MVPureOut
 {
     int   count;
+
     float mean_dx;   // px/frame
     float mean_dy;   // px/frame
     float res_mag;   // px/frame (hypot(mean_dx, mean_dy))
-    float speed_mps; // m/s
+
+    // Quality metrics (dispersion in ROI)
+    float std_dx;    // px/frame
+    float std_dy;    // px/frame
+    float std_mag;   // px/frame (hypot(std_dx, std_dy))
+
+    float speed_mps; // m/s computed from res_mag, pxPerMeter and dtSec
 };
 
 // Parameters for pure reduction.
@@ -33,8 +41,7 @@ struct MVPureParams
 extern "C" {
 #endif
 
-// Pure reduction: computes mean dx/dy over ROI and speed from resultant.
-// mvPtr is pitch-linear int16 interleaved dx,dy in S10.5 (same as your OFA output after VIC BL->PL).
+// Computes mean dx/dy, std dx/dy (population std), resultant magnitude and speed.
 void mv_reduce_pure_cuda(const int16_t *mvPtr,
                          const MVPureParams *params,
                          MVPureOut *d_out);

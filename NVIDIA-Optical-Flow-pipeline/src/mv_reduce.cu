@@ -2,16 +2,20 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+
 #include "mv_reduce.hpp"
 
+// OFA MV are S10.5 -> px = v/32
 __device__ __forceinline__ float s10_5_to_px(int16_t v) { return (float)v * (1.0f/32.0f); }
-__device__ __forceinline__ float hypotf2(float x, float y) { return sqrtf(x*x + y*y); }
+__device__ __forceinline__ float hypot2(float x, float y) { return sqrtf(x*x + y*y); }
 
 struct MVPureAcc
 {
     int   count;
     float sum_dx;
     float sum_dy;
+    float sum_dx2;
+    float sum_dy2;
 };
 
 __global__ void mv_pure_accum_kernel(const int16_t *mvPtr, MVPureParams p, MVPureAcc *acc)
@@ -42,9 +46,11 @@ __global__ void mv_pure_accum_kernel(const int16_t *mvPtr, MVPureParams p, MVPur
     float dx = s10_5_to_px(fx);
     float dy = s10_5_to_px(fy);
 
-    atomicAdd(&acc->count, 1);
+    atomicAdd(&acc->count,  1);
     atomicAdd(&acc->sum_dx, dx);
     atomicAdd(&acc->sum_dy, dy);
+    atomicAdd(&acc->sum_dx2, dx*dx);
+    atomicAdd(&acc->sum_dy2, dy*dy);
 }
 
 __global__ void mv_pure_finalize_kernel(const MVPureAcc *acc, MVPureParams p, MVPureOut *out)
@@ -56,13 +62,33 @@ __global__ void mv_pure_finalize_kernel(const MVPureAcc *acc, MVPureParams p, MV
 
     if (o.count > 0 && p.dtSec > 0.0f && p.pxPerMeter > 0.0f) {
         float invn = 1.0f / (float)o.count;
+
+        // Means
         o.mean_dx = acc->sum_dx * invn;
         o.mean_dy = acc->sum_dy * invn;
-        o.res_mag = hypotf2(o.mean_dx, o.mean_dy);               // px/frame
-        o.speed_mps = (o.res_mag / p.pxPerMeter) / p.dtSec;      // m/s
+
+        // Population variance = E[x^2] - (E[x])^2
+        float ex2_dx = acc->sum_dx2 * invn;
+        float ex2_dy = acc->sum_dy2 * invn;
+
+        float var_dx = ex2_dx - o.mean_dx * o.mean_dx;
+        float var_dy = ex2_dy - o.mean_dy * o.mean_dy;
+
+        // Numerical safety
+        var_dx = fmaxf(var_dx, 0.0f);
+        var_dy = fmaxf(var_dy, 0.0f);
+
+        o.std_dx = sqrtf(var_dx);
+        o.std_dy = sqrtf(var_dy);
+        o.std_mag = hypot2(o.std_dx, o.std_dy);
+
+        // Resultant + speed
+        o.res_mag = hypot2(o.mean_dx, o.mean_dy);
+        o.speed_mps = (o.res_mag / p.pxPerMeter) / p.dtSec;
     } else {
-        o.mean_dx = 0.0f;
-        o.mean_dy = 0.0f;
+        o.mean_dx = o.mean_dy = 0.0f;
+        o.std_dx  = o.std_dy  = 0.0f;
+        o.std_mag = 0.0f;
         o.res_mag = 0.0f;
         o.speed_mps = 0.0f;
     }

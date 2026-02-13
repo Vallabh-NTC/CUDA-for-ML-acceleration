@@ -43,6 +43,7 @@ add_library(vpi_of SHARED
   src/overlay.cu
   src/egl_copy.cu
   src/mv_reduce.cu
+  src/mv_spike_filter.cu
 
   
 )
