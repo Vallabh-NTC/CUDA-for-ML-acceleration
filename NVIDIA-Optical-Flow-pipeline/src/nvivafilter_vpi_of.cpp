@@ -1,6 +1,7 @@
 // nvivafilter_vpi_of.cpp
 //
 // PURE DOF (Dense Optical Flow) + OVERLAY + GPU ANTI-SPIKE FILTER (NO QUALITY GATE)
+// + Telemetry CSV integration (ax -> v) and visualize IMU velocity vector in green.
 //
 // Pipeline:
 // NVDEC -> NVMM(NV12 EGLImage) -> nvivafilter (this .so) -> NVMM
@@ -14,6 +15,11 @@
 //       Env vars disabled/ignored now:
 //         VPI_OF_QUAL_MAX, VPI_OF_QUAL_LOW, VPI_OF_MIN_COUNT, VPI_OF_BAD_RESET_FRAMES
 //
+// NEW:
+// - Telemetry CSV (VPI_OF_TELEM_CSV) containing unix_sec/unix_nsec + ax (+ optional v_corrected)
+// - Integrate ax -> v_mps (optionally lightly anchored to v_corrected to limit drift)
+// - Draw IMU velocity vector (green) with direction from DOF resultant and magnitude from telemetry.
+//
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +30,7 @@
 #include <vector>
 #include <cmath>
 #include <mutex>
+#include <string>
 
 #include <EGL/egl.h>
 
@@ -99,6 +106,34 @@ static int max_levels_scale_half_min32(int W, int H)
         levels++;
     }
     return levels;
+}
+
+// ----------------------------
+// Tiny CSV helper
+// ----------------------------
+static std::vector<std::string> csv_split_line(const char *s)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (const char *p = s; ; ++p) {
+        char c = *p;
+        if (c == ',' || c == '\n' || c == '\r' || c == 0) {
+            out.push_back(cur);
+            cur.clear();
+            if (c == 0 || c == '\n' || c == '\r') break;
+        } else {
+            cur.push_back(c);
+        }
+    }
+    return out;
+}
+
+static bool str_isfinite_float(const char *s)
+{
+    if (!s || !*s) return false;
+    // crude: rely on atof + isfinite
+    float v = std::atof(s);
+    return std::isfinite(v);
 }
 
 // ----------------------------
@@ -197,6 +232,15 @@ struct State
     float ema_dx = 0.0f;
     float ema_dy = 0.0f;
     float emaTauSec = 0.25f;   // time constant in seconds
+
+    // ----------------------------
+    // Telemetry CSV integration
+    // ----------------------------
+    bool telemEnabled = false;
+    int  telemFrameOffset = 0;
+    float telemAnchorK = 0.05f;              // 0..1
+    std::vector<double> telemTsec;           // unix timestamp (sec)
+    std::vector<float>  telemSpeedMps;       // integrated speed (m/s)
 };
 
 static State* get_or_create_state(void **userPtr)
@@ -205,6 +249,110 @@ static State* get_or_create_state(void **userPtr)
     State *st = new State();
     if (userPtr) *userPtr = st;
     return st;
+}
+
+// ----------------------------
+// Telemetry loader (ax -> v)
+// ----------------------------
+static void load_telemetry_if_any(State *st)
+{
+    const char *path = std::getenv("VPI_OF_TELEM_CSV");
+    if (!path || !path[0]) return;
+
+    st->telemFrameOffset = get_env_int("VPI_OF_TELEM_FRAME_OFFSET", 0);
+    st->telemAnchorK     = std::clamp(get_env_float("VPI_OF_TELEM_ANCHOR_K", st->telemAnchorK), 0.0f, 1.0f);
+
+    FILE *fp = std::fopen(path, "r");
+    if (!fp) {
+        std::fprintf(stderr, "[vpi_of_pure] ERROR: cannot open telemetry CSV: %s\n", path);
+        return;
+    }
+
+    char line[4096];
+    if (!std::fgets(line, sizeof(line), fp)) { std::fclose(fp); return; }
+
+    std::vector<std::string> hdr = csv_split_line(line);
+
+    auto col = [&](const char *name)->int {
+        for (int i = 0; i < (int)hdr.size(); ++i) {
+            if (hdr[i] == name) return i;
+        }
+        return -1;
+    };
+
+    int c_sec  = col("unix_sec");
+    int c_nsec = col("unix_nsec");
+    int c_ax   = col("ax");
+    int c_vcor = col("v_corrected");
+    int c_v    = col("v");
+
+    if (c_sec < 0 || c_nsec < 0 || c_ax < 0) {
+        std::fprintf(stderr, "[vpi_of_pure] ERROR: telemetry CSV missing unix_sec/unix_nsec/ax\n");
+        std::fclose(fp);
+        return;
+    }
+
+    std::vector<double> tsec;
+    std::vector<float>  ax;
+    std::vector<float>  vref_kmh;
+
+    while (std::fgets(line, sizeof(line), fp)) {
+        std::vector<std::string> f = csv_split_line(line);
+        if ((int)f.size() < (int)hdr.size()) continue;
+
+        double sec  = std::atof(f[c_sec].c_str());
+        double nsec = std::atof(f[c_nsec].c_str());
+        double ts   = sec + nsec * 1e-9;
+
+        float axv = std::atof(f[c_ax].c_str());
+
+        float vck = NAN;
+        if (c_vcor >= 0 && str_isfinite_float(f[c_vcor].c_str())) {
+            vck = std::atof(f[c_vcor].c_str());
+        } else if (c_v >= 0 && str_isfinite_float(f[c_v].c_str())) {
+            vck = std::atof(f[c_v].c_str());
+        }
+
+        tsec.push_back(ts);
+        ax.push_back(axv);
+        vref_kmh.push_back(vck);
+    }
+
+    std::fclose(fp);
+
+    if (tsec.size() < 2) {
+        std::fprintf(stderr, "[vpi_of_pure] Telemetry CSV too short\n");
+        return;
+    }
+
+    std::vector<float> v_mps(tsec.size(), 0.0f);
+
+    // init v0 from first available reference speed if present
+    for (size_t i = 0; i < tsec.size(); ++i) {
+        if (std::isfinite(vref_kmh[i])) {
+            v_mps[0] = vref_kmh[i] * (1000.0f / 3600.0f);
+            break;
+        }
+    }
+
+    for (size_t i = 1; i < tsec.size(); ++i) {
+        double dt = tsec[i] - tsec[i - 1];
+        if (!(dt > 0.0 && dt < 0.5)) dt = 1.0 / 50.0; // safe clamp
+        v_mps[i] = v_mps[i - 1] + ax[i] * (float)dt;
+
+        if (st->telemAnchorK > 0.0f && std::isfinite(vref_kmh[i])) {
+            float vref = vref_kmh[i] * (1000.0f / 3600.0f);
+            v_mps[i] = (1.0f - st->telemAnchorK) * v_mps[i] + st->telemAnchorK * vref;
+        }
+    }
+
+    st->telemEnabled = true;
+    st->telemTsec = std::move(tsec);
+    st->telemSpeedMps = std::move(v_mps);
+
+    std::fprintf(stderr,
+                 "[vpi_of_pure] Telemetry loaded: %zu samples from %s (offset=%d, anchorK=%.3f)\n",
+                 st->telemSpeedMps.size(), path, st->telemFrameOffset, st->telemAnchorK);
 }
 
 // ----------------------------
@@ -260,6 +408,9 @@ static void init_vpi_if_needed(State *st, int W, int H)
             st->csvEnabled = false;
         }
     }
+
+    // Telemetry (optional)
+    load_telemetry_if_any(st);
 
     CHECK_VPI(vpiStreamCreate(0, &st->stream));
 
@@ -463,7 +614,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     // Base output = filtered
     st->pure_h = filt_h;
 
-    // Optional EMA on the filtered vector (FIXED: do NOT overwrite after)
+    // Optional EMA on the filtered vector (do NOT overwrite after)
     if (st->emaTauSec > 0.0f) {
         float alpha = useDt / (st->emaTauSec + useDt);
 
@@ -480,6 +631,36 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         st->pure_h.mean_dy = st->ema_dy;
         st->pure_h.res_mag = std::sqrt(st->ema_dx*st->ema_dx + st->ema_dy*st->ema_dy);
         st->pure_h.speed_mps = (st->pure_h.res_mag / st->pxPerM) / useDt;
+    }
+
+    // ---------------------------------------------------------
+    // Telemetry vector (IMU) in px/frame:
+    // direction = DOF resultant, magnitude = integrated v (m/s)
+    // ---------------------------------------------------------
+    float imuDxPx = 0.0f, imuDyPx = 0.0f;
+    float imuScale = 5.0f; // we pass px/frame already
+
+    if (st->telemEnabled && !st->telemSpeedMps.empty()) {
+        int ti = (int)st->frameId + st->telemFrameOffset;
+        if (ti >= 0 && ti < (int)st->telemSpeedMps.size()) {
+            float v_mps = st->telemSpeedMps[ti];
+
+            float rx = st->pure_h.mean_dx;
+            float ry = st->pure_h.mean_dy;
+            float r2 = rx*rx + ry*ry;
+
+            if (r2 > 1e-8f) {
+                float rinv = 1.0f / std::sqrt(r2);
+                float dirx = rx * rinv;
+                float diry = ry * rinv;
+
+                // m/s -> px/frame
+                float v_pxpf = v_mps * st->pxPerM * useDt;
+
+                imuDxPx = dirx * v_pxpf;
+                imuDyPx = diry * v_pxpf;
+            }
+        }
     }
 
     // Write CSV (filtered/EMA values only)
@@ -511,16 +692,17 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     // Debug line
     std::fprintf(stdout,
-                "speed=%.3f m/s (%.2f km/h)  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f\n",
+                "speed=%.3f m/s (%.2f km/h)  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f  telem=(%.3f,%.3f)\n",
                 st->pure_h.speed_mps,
                 st->pure_h.speed_mps * 3.6f,
                 st->pure_h.mean_dx,
                 st->pure_h.mean_dy,
                 st->pure_h.count,
-                useDt);
+                useDt,
+                imuDxPx, imuDyPx);
     std::fflush(stdout);
 
-    // OVERLAY: use filtered/EMA resultant
+    // OVERLAY: use filtered/EMA resultant + telemetry IMU vector
     if (st->overlayEnabled) {
         overlay_draw_mvs_nv12(
             image, W, H,
@@ -531,9 +713,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
             st->minMagDraw,
             76, 85, 255,                        // field color (YUV)
             st->pure_h.mean_dx, st->pure_h.mean_dy,
-            29, 255, 107,                       // resultant color (YUV)
-            0.0f, 0.0f, 0.0f,                   // IMU disabled
-            150, 44, 21,                        // (unused)
+            29, 255, 107,                       // resultant color (YUV) - blu-ish (come tuo)
+            // IMU / Telemetry vector (px/frame)
+            imuDxPx, imuDyPx,
+            imuScale,
+            145, 54, 34,                        // IMU color (YUV) ~ green-ish (tweak if needed)
             0.0f, 1e9f,                         // forceDeg=0 disables forcing
             st->frameId);
     }
