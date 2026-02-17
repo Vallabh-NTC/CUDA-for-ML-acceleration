@@ -1,3 +1,4 @@
+// src/mv_reduce.cu
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cmath>

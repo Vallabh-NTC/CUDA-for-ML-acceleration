@@ -1,7 +1,12 @@
 // nvivafilter_vpi_of.cpp
 //
 // PURE DOF (Dense Optical Flow) + OVERLAY + GPU ANTI-SPIKE FILTER (NO QUALITY GATE)
-// + Telemetry CSV integration (ax -> v) and visualize IMU velocity vector in green.
+// + Telemetry CSV integration (ax -> v) and visualize IMU velocity vector.
+//
+// NEW (requested):
+// - Compute per-frame angle between the image horizontal axis (+X) and the DOF resultant vector.
+// - Print that angle together with speed.
+// - Save that angle into the runtime CSV.
 //
 // Pipeline:
 // NVDEC -> NVMM(NV12 EGLImage) -> nvivafilter (this .so) -> NVMM
@@ -12,13 +17,11 @@
 // - (Optional) EMA smoothing on the filtered vector
 //
 // NOTE: All "quality metric" gating logic has been REMOVED as requested.
-//       Env vars disabled/ignored now:
-//         VPI_OF_QUAL_MAX, VPI_OF_QUAL_LOW, VPI_OF_MIN_COUNT, VPI_OF_BAD_RESET_FRAMES
 //
-// NEW:
-// - Telemetry CSV (VPI_OF_TELEM_CSV) containing unix_sec/unix_nsec + ax (+ optional v_corrected)
+// Telemetry:
+// - Telemetry CSV (VPI_OF_TELEM_CSV) containing unix_sec/unix_nsec + ax (+ optional v_corrected or v)
 // - Integrate ax -> v_mps (optionally lightly anchored to v_corrected to limit drift)
-// - Draw IMU velocity vector (green) with direction from DOF resultant and magnitude from telemetry.
+// - Draw IMU velocity vector with direction from DOF resultant and magnitude from telemetry.
 //
 
 #include <cstdio>
@@ -109,6 +112,38 @@ static int max_levels_scale_half_min32(int W, int H)
 }
 
 // ----------------------------
+// Small math helpers
+// ----------------------------
+static inline float rad2deg(float r) { return r * (180.0f / 3.14159265358979323846f); }
+
+// Signed included angle between the horizontal *line* and the DOF resultant vector.
+// Left/right are equivalent.
+// Sign convention (requested):
+//   dy < 0  => positive angle  (vector points DOWN)
+//   dy > 0  => negative angle  (vector points UP)
+// Range: [-90 .. +90] degrees.
+static inline float dof_angle_deg(float dx, float dy)
+{
+    // If vector is ~zero, return 0.
+    if ((std::fabs(dx) + std::fabs(dy)) < 1e-9f) return 0.0f;
+
+    // Fold left/right using |dx|
+    float a = rad2deg(std::atan2(dy, std::fabs(dx)));
+
+    // Invert sign (THIS is the only change)
+    a = -a;
+
+    // Safety clamp
+    if (a >  90.0f) a =  90.0f;
+    if (a < -90.0f) a = -90.0f;
+
+    return a;
+}
+
+
+
+
+// ----------------------------
 // Tiny CSV helper
 // ----------------------------
 static std::vector<std::string> csv_split_line(const char *s)
@@ -145,6 +180,8 @@ struct State
     int W = 0, H = 0;
 
     VPIStream stream = nullptr;
+    float steerRatio = 1.0f;   // conversion DOF_angle -> steering angle
+
 
     VPIImage prev_y8_pl = nullptr;
     VPIImage cur_y8_pl  = nullptr;
@@ -340,6 +377,7 @@ static void load_telemetry_if_any(State *st)
         if (!(dt > 0.0 && dt < 0.5)) dt = 1.0 / 50.0; // safe clamp
         v_mps[i] = v_mps[i - 1] + ax[i] * (float)dt;
 
+        // Optional anchoring to external speed to reduce drift
         if (st->telemAnchorK > 0.0f && std::isfinite(vref_kmh[i])) {
             float vref = vref_kmh[i] * (1000.0f / 3600.0f);
             v_mps[i] = (1.0f - st->telemAnchorK) * v_mps[i] + st->telemAnchorK * vref;
@@ -373,6 +411,9 @@ static void init_vpi_if_needed(State *st, int W, int H)
     st->pxPerM   = std::max(1.0f, get_env_float("VPI_OF_PX_PER_M", st->pxPerM));
     st->forceFps = get_env_int("VPI_OF_FORCE_FPS", st->forceFps); // 0 = use measured dt
 
+    st->steerRatio = get_env_float("VPI_OF_STEER_RATIO", 1.0f);
+
+
     // Overlay knobs
     st->overlayEnabled = (get_env_int("VPI_OF_OVERLAY", 1) != 0);
     st->overlayScale   = std::max(0.1f, get_env_float("VPI_OF_OVERLAY_SCALE", st->overlayScale));
@@ -400,8 +441,9 @@ static void init_vpi_if_needed(State *st, int W, int H)
 
         st->csvFp = std::fopen(path, "w");
         if (st->csvFp) {
+            // NEW: angle_deg
             std::fprintf(st->csvFp,
-                "t_sec,speed_mps,speed_kmh,dx_pxpf,dy_pxpf,count,dt_sec\n");
+                "t_sec,speed_mps,speed_kmh,angle_deg,dof_steer,dx_pxpf,dy_pxpf,count,dt_sec\n");
             std::fflush(st->csvFp);
         } else {
             std::fprintf(stderr, "[vpi_of_pure] ERROR: cannot open CSV at %s\n", path);
@@ -598,7 +640,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     // 1) Raw reduction on GPU
     mv_reduce_pure_cuda(mvPtr, &p, st->d_pure);
 
-    // 2) Anti-spike on GPU (stateful) - ONLY
+    // 2) Anti-spike on GPU (stateful)
     MVSpikeFilterParams sfp{};
     sfp.ok_kmh        = st->okKmh;
     sfp.spike_kmh     = st->spikeKmh;
@@ -632,6 +674,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         st->pure_h.res_mag = std::sqrt(st->ema_dx*st->ema_dx + st->ema_dy*st->ema_dy);
         st->pure_h.speed_mps = (st->pure_h.res_mag / st->pxPerM) / useDt;
     }
+
+    // NEW: compute DOF angle w.r.t. horizontal axis (+X)
+    float angle_deg = dof_angle_deg(st->pure_h.mean_dx, st->pure_h.mean_dy);
+    // Convert DOF angle into steering estimate using calibration ratio
+    float dof_steer = angle_deg * st->steerRatio;
+
 
     // ---------------------------------------------------------
     // Telemetry vector (IMU) in px/frame:
@@ -675,11 +723,14 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         double t_sec = std::chrono::duration<double>(now - st->csvT0).count();
         double kmh = (double)st->pure_h.speed_mps * 3.6;
 
+        // NEW: angle_deg column
         std::fprintf(st->csvFp,
-                     "%.6f,%.6f,%.6f,%.6f,%.6f,%d,%.6f\n",
+                     "%.6f,%.6f,%.6f,%.3f,%.3f,%.6f,%.6f,%d,%.6f\n",
                      t_sec,
                      (double)st->pure_h.speed_mps,
                      kmh,
+                     (double)angle_deg,
+                     dof_steer,
                      (double)st->pure_h.mean_dx,
                      (double)st->pure_h.mean_dy,
                      st->pure_h.count,
@@ -690,11 +741,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
         }
     }
 
-    // Debug line
+    // Debug line (NEW: angle)
     std::fprintf(stdout,
-                "speed=%.3f m/s (%.2f km/h)  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f  telem=(%.3f,%.3f)\n",
+                "speed=%.3f m/s (%.2f km/h)  angle=%.2f deg DOF_steer=%.2f  res=(%.3f,%.3f) px/frame  n=%d  dt=%.4f  telem=(%.3f,%.3f)\n",
                 st->pure_h.speed_mps,
                 st->pure_h.speed_mps * 3.6f,
+                angle_deg,
+                dof_steer,
                 st->pure_h.mean_dx,
                 st->pure_h.mean_dy,
                 st->pure_h.count,
@@ -713,11 +766,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
             st->minMagDraw,
             76, 85, 255,                        // field color (YUV)
             st->pure_h.mean_dx, st->pure_h.mean_dy,
-            29, 255, 107,                       // resultant color (YUV) - blu-ish (come tuo)
+            29, 255, 107,                       // OF resultant color (YUV)
             // IMU / Telemetry vector (px/frame)
             imuDxPx, imuDyPx,
             imuScale,
-            145, 54, 34,                        // IMU color (YUV) ~ green-ish (tweak if needed)
+            145, 54, 34,                        // IMU color (YUV) (tweak if needed)
             0.0f, 1e9f,                         // forceDeg=0 disables forcing
             st->frameId);
     }

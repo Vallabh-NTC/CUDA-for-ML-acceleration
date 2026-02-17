@@ -8,7 +8,7 @@ __global__ void mv_spike_filter_kernel(const MVPureOut *in,
                                        MVSpikeFilterState *st,
                                        MVPureOut *out)
 {
-    // single-thread stateful filter
+    // Single-thread stateful filter
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     MVPureOut x = *in;
@@ -41,7 +41,7 @@ __global__ void mv_spike_filter_kernel(const MVPureOut *in,
         // Count persistence
         st->stable_cnt += 1;
 
-        // Until stable_frames reached: HOLD last accepted
+        // Until stable_frames reached: HOLD last accepted values
         if (st->stable_cnt < params.stable_frames) {
             MVPureOut y = x;
             y.mean_dx   = st->last_dx;

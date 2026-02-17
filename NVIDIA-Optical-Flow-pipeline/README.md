@@ -47,7 +47,7 @@ export VPI_OF_STABLE_FRAMES=80
 export VPI_OF_EMA_TAU=0.60
 
 export VPI_OF_CSV=1
-export VPI_OF_CSV_PATH=/home/ntc-orin/Straight_back_100kmph_100FPS/speed_dof.csv   #change the name of the folder based on the specific scenario
+export VPI_OF_CSV_PATH=/home/ntc-orin/Eight_manouver_1/speed_dof.csv   #change the name of the folder based on the specific scenario
 export VPI_OF_CSV_EVERY=1
 
 export VPI_OF_TELEM_CSV=/home/ntc-orin/Straight_back_90kmph_100FPS/telemetry.csv
@@ -55,5 +55,8 @@ export VPI_OF_TELEM_FRAME_OFFSET=0
 export VPI_OF_TELEM_ANCHOR_K=0.05
 
 
-gst-launch-1.0 -e filesrc location="/home/ntc-orin/Videos/Straight_back_90kmph_100fps.mp4" ! qtdemux name=dem dem.video_0 ! queue ! h264parse ! nvv4l2decoder ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12,width=672,height=376' ! nvivafilter cuda-process=true customer-lib-name=/home/ntc-orin/libvpi_of.so ! 'video/x-raw(memory:NVMM),format=NV12' ! nvv4l2h264enc bitrate=4000000 insert-sps-pps=true iframeinterval=30 ! h264parse ! rtph264pay config-interval=1 pt=96 ! udpsink host=192.168.1.100 port=5000 sync=false async=false
+export VPI_OF_STEER_LUT_CSV=/home/ntc-orin/Eight_manouver_1/steering_local_ratios.csv
+
+
+gst-launch-1.0 -e filesrc location="/home/ntc-orin/Videos/Eight_manouver_1.mp4" ! qtdemux name=dem dem.video_0 ! queue ! h264parse ! nvv4l2decoder ! nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12,width=672,height=376' ! nvivafilter cuda-process=true customer-lib-name=/home/ntc-orin/libvpi_of.so ! 'video/x-raw(memory:NVMM),format=NV12' ! nvv4l2h264enc bitrate=4000000 insert-sps-pps=true iframeinterval=30 ! h264parse ! rtph264pay config-interval=1 pt=96 ! udpsink host=192.168.1.100 port=5000 sync=false async=false
 

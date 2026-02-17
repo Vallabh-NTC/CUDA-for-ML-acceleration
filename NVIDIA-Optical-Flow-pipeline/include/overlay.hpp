@@ -15,8 +15,7 @@ extern "C" {
 //
 // NOTE:
 // - OF resultant vector is in px/frame.
-// - IMU resultant vector (imuDx, imuDy) is in m/s^2 (linear accel) filtered,
-//   so it's purely visual. Use imuScale to convert into pixels.
+// - IMU/Telemetry vector is expected in px/frame (already scaled from m/s using pxPerM*dt).
 //
 void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                            int W, int H,
@@ -28,7 +27,7 @@ void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
                            uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
                            float resDxPx, float resDyPx,
                            uint8_t resY, uint8_t resU, uint8_t resV,
-                           // IMU resultant (optional): pass 0,0 to disable
+                           // IMU/Telemetry resultant (optional): pass 0,0 to disable
                            float imuDx, float imuDy,
                            float imuScale,
                            uint8_t imuY, uint8_t imuU, uint8_t imuV,

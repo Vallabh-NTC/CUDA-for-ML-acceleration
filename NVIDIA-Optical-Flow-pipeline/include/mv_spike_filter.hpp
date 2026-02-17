@@ -2,7 +2,7 @@
 #pragma once
 
 #include <stdint.h>
-#include "mv_reduce.hpp"   // <-- usa MVPureOut definito qui
+#include "mv_reduce.hpp"   // uses MVPureOut
 
 #ifdef __cplusplus
 extern "C" {
@@ -10,18 +10,18 @@ extern "C" {
 
 typedef struct MVSpikeFilterParams
 {
-    float spike_kmh;      // salto considerato spike (km/h)
-    float ok_kmh;         // (opzionale) tolleranza, qui non usata per gating complesso
-    int   stable_frames;  // quanti frame deve persistere per accettare il nuovo regime
+    float spike_kmh;      // jump considered a spike (km/h)
+    float ok_kmh;         // kept for compatibility; currently not used
+    int   stable_frames;  // how many frames the jump must persist to be accepted
 } MVSpikeFilterParams;
 
 typedef struct MVSpikeFilterState
 {
-    int   have;            // abbiamo già un last-good?
-    int   stable_cnt;      // contatore persistenza spike
-    float last_speed_kmh;  // ultimo speed accettato (km/h)
+    int   have;            // do we already have a last-good?
+    int   stable_cnt;      // persistence counter
+    float last_speed_kmh;  // last accepted speed (km/h)
 
-    // ultimo vettore accettato
+    // last accepted vector
     float last_dx;
     float last_dy;
     float last_mag;
