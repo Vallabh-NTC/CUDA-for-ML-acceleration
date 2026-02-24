@@ -50,7 +50,7 @@ export VPI_OF_CSV=1
 export VPI_OF_CSV_PATH=/home/ntc-orin/Eight_manouver_1/speed_dof.csv   #change the name of the folder based on the specific scenario
 export VPI_OF_CSV_EVERY=1
 
-export VPI_OF_TELEM_CSV=/home/ntc-orin/Straight_back_90kmph_100FPS/telemetry.csv
+export VPI_OF_TELEM_CSV=/home/ntc-orin/Eight_manouver_1/telemetry.csv
 export VPI_OF_TELEM_FRAME_OFFSET=0
 export VPI_OF_TELEM_ANCHOR_K=0.05
 

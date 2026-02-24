@@ -32,7 +32,6 @@ add_executable(udp_decoder
     src/SARA_08.cpp
 )
 
-# set_source_files_properties(src/photo_edit.cu PROPERTIES LANGUAGE CUDA)
 set_source_files_properties(src/KernelExec.cu PROPERTIES LANGUAGE CUDA)
 
 # ---- Includes ----
@@ -63,8 +62,34 @@ if(NOT CUDART_LIBRARY)
     message(FATAL_ERROR "Could not find libcudart.so — check CUDA_TOOLKIT_ROOT_DIR and CMAKE_SYSROOT.")
 endif()
 
+# -------------------- GStreamer (gst + appsink) --------------------
+find_package(PkgConfig REQUIRED)
+
+# If you are cross-compiling and pkg-config must point to the sysroot,
+# ensure PKG_CONFIG_SYSROOT_DIR / PKG_CONFIG_LIBDIR are set in your toolchain/env.
+pkg_check_modules(GST REQUIRED
+    gstreamer-1.0
+    gstreamer-app-1.0
+)
+
+# Add include dirs and compile flags for GStreamer
+target_include_directories(udp_decoder PRIVATE
+    ${GST_INCLUDE_DIRS}
+)
+
+target_compile_options(udp_decoder PRIVATE
+    ${GST_CFLAGS_OTHER}
+)
+
+# Add link dirs (if any) + libs
+target_link_directories(udp_decoder PRIVATE
+    ${GST_LIBRARY_DIRS}
+)
+
 target_link_libraries(udp_decoder
-    PRIVATE ${CUDART_LIBRARY}
+    PRIVATE
+        ${CUDART_LIBRARY}
+        ${GST_LIBRARIES}
 )
 
 # ---- Linker options (cross-link against Jetson sysroot) ----
@@ -85,22 +110,6 @@ target_link_options(udp_decoder PRIVATE
     -L${CUDA_TOOLKIT_ROOT_DIR}/targets/aarch64-linux/lib
 )
 
-# ---- Runtime RPATH on the target (optional) ----
-# set_target_properties(udp_decoder PROPERTIES
-#     BUILD_WITH_INSTALL_RPATH ON
-#     INSTALL_RPATH "/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/lib64"
-# )
-
-# ---- Optional: harden ELF after build (if patchelf is available) ----
-# find_program(PATCHELF patchelf)
-# if (PATCHELF)
-#   add_custom_command(TARGET udp_decoder POST_BUILD
-#     COMMAND ${PATCHELF} --set-interpreter /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 $<TARGET_FILE:udp_decoder>
-#     COMMAND ${PATCHELF} --set-rpath "/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/lib64" $<TARGET_FILE:udp_decoder>
-#     VERBATIM
-#   )
-# endif()
-
 # ---- Install (optional) ----
 install(TARGETS udp_decoder
     RUNTIME DESTINATION usr/local/bin
@@ -110,3 +119,6 @@ install(TARGETS udp_decoder
 message(STATUS "CUDA_TOOLKIT_ROOT_DIR = ${CUDA_TOOLKIT_ROOT_DIR}")
 message(STATUS "CMAKE_SYSROOT          = ${CMAKE_SYSROOT}")
 message(STATUS "Found cudart:          ${CUDART_LIBRARY}")
+message(STATUS "GStreamer includes:    ${GST_INCLUDE_DIRS}")
+message(STATUS "GStreamer libs:        ${GST_LIBRARIES}")
+message(STATUS "GStreamer lib dirs:    ${GST_LIBRARY_DIRS}")
