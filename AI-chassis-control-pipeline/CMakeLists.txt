@@ -22,6 +22,8 @@ add_executable(udp_decoder
     src/BitExtractor.cpp
     src/LWI01.cpp
     src/UdpReceiver.cpp
+    src/AdmaDecoder.cpp
+    src/AdmaUdpReceiver.cpp
     src/main.cpp
     src/KernelExec.cu
     src/UdpSender.cpp

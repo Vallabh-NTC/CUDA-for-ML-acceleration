@@ -25,11 +25,14 @@
 #include <filesystem>
 #include <string>
 #include <sstream>
+#include <optional>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 
 #include "UdpReceiver.hpp"
+#include "AdmaDecoder.hpp"
+#include "AdmaUdpReceiver.hpp"
 #include "SARA_10.hpp"
 #include "SARA_08.hpp"
 #include "LWI01.hpp"
@@ -272,7 +275,8 @@ int main(int argc, char** argv)
         return 1;
     }
     csv << "idx,unix_sec,unix_nsec,cluster,"
-           "ax,ay,az,ox,oy,oz,steer,steer_spd,gas,brake,v,image\n";
+            "ax,ay,az,ox,oy,oz,steer,steer_spd,gas,brake,v,"
+            "admaAccX,admaAccY,admaAccZ,admaYaw,admaPitch,admaRoll,admaKmh,image\n";
     csv.flush();
 
     // -------- Parse args --------
@@ -319,10 +323,25 @@ int main(int argc, char** argv)
     UdpReceiver receiver(1500);
     unsigned char buf[65536];
 
+    // -------- ADMA receiver (v3.3.4) --------
+    adma::AdmaPacketDecoder adma_decoder(adma::ProtocolVersion::V334);
+    adma::AdmaUdpReceiver adma_receiver(
+        "195.0.5.4",
+        static_cast<uint16_t>(1021),
+        std::optional<std::string>{"195.0.5.50"});
+
     float ax=NAN, ay=NAN, az=NAN;
     float ox=NAN, oy=NAN, oz=NAN;
     float steer=NAN, steer_spd=NAN;
     float gas=NAN, brake=NAN, v=NAN;
+
+    double adma_acc_x = NAN;
+    double adma_acc_y = NAN;
+    double adma_acc_z = NAN;
+    double adma_yaw = NAN;
+    double adma_pitch = NAN;
+    double adma_roll = NAN;
+    double adma_kmh = NAN;
 
     uint64_t idx = 0;
 
@@ -1048,6 +1067,32 @@ int main(int argc, char** argv)
 
         if (!has) continue;
 
+        try {
+            const auto adma_payload = adma_receiver.receive();
+            const auto decoded = adma_decoder.decode(adma_payload);
+
+            adma_acc_x = decoded.kinematics.accx_g;
+            adma_acc_y = decoded.kinematics.accy_g;
+            adma_acc_z = decoded.kinematics.accz_g;
+            adma_kmh = decoded.kinematics.speed_kmh;
+
+            if (decoded.v334.has_value()) {
+                const auto& adma_packet = decoded.v334.value();
+                adma_roll = static_cast<double>(adma_packet.insroll) * 0.01;
+                adma_pitch = static_cast<double>(adma_packet.inspitch) * 0.01;
+                adma_yaw = static_cast<double>(adma_packet.insyaw) * 0.01;
+            }
+        } catch (const std::exception& ex) {
+            std::cerr << "WARN: ADMA receive/decode failed: " << ex.what() << "\n";
+            adma_acc_x = NAN;
+            adma_acc_y = NAN;
+            adma_acc_z = NAN;
+            adma_yaw = NAN;
+            adma_pitch = NAN;
+            adma_roll = NAN;
+            adma_kmh = NAN;
+        }
+
         ++idx;
 
         char img_path[256];
@@ -1073,6 +1118,8 @@ int main(int argc, char** argv)
             << ox << "," << oy << "," << oz << ","
             << steer << "," << steer_spd << ","
             << gas << "," << brake << "," << v << ","
+            << adma_acc_x << "," << adma_acc_y << "," << adma_acc_z << ","
+            << adma_yaw << "," << adma_pitch << "," << adma_roll << "," << adma_kmh << ","
             << img_path << "\n";
         csv.flush();
     }
