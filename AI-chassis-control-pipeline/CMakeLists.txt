@@ -30,8 +30,14 @@ add_executable(udp_decoder
     src/Motor20.cpp
     src/BrakeEV01.cpp
     src/ESP21.cpp
+    src/ESP03.cpp
+    src/ESP05.cpp
     src/SARA_10.cpp
+    src/SARA_06.cpp
     src/SARA_08.cpp
+    src/Motor14.cpp
+    src/LHEPS03.cpp
+    src/KlimaSensor02.cpp
 )
 
 set_source_files_properties(src/KernelExec.cu PROPERTIES LANGUAGE CUDA)

@@ -39,6 +39,12 @@
 #include "Motor20.hpp"
 #include "BrakeEV01.hpp"
 #include "ESP21.hpp"
+#include "ESP03.hpp"
+#include "ESP05.hpp"
+#include "Motor14.hpp"
+#include "LHEPS03.hpp"
+#include "KlimaSensor02.hpp"
+#include "SARA_06.hpp"
 
 static inline void print_line(
     int cluster,
@@ -263,6 +269,88 @@ static std::string build_pipeline(const Opts& o)
     return ss.str();
 }
 
+struct ClusterSignalOffsets {
+    int sara06;
+    int sara10;
+    int esp21;
+    int esp03;
+    int esp05;
+    int lwi01;
+    int lheps03;
+    int klima_sensor_02;
+    int motor20;
+    int bremse_ev01;
+    int motor14;
+};
+
+static const ClusterSignalOffsets kClusterSignalOffsets[65] = {
+    {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    {-1, 412, 542, 518, -1, 677, 597, -1, 629, 364, -1},
+    {291, 274, -1, -1, -1, -1, -1, -1, -1, -1, 1098},
+    {-1, 326, -1, -1, 1111, 56, 646, -1, 434, 261, -1},
+    {294, 128, -1, -1, -1, -1, -1, 56, -1, -1, 120},
+    {-1, 213, 375, 343, -1, 470, 1112, -1, 841, 48, -1},
+    {98, 48, -1, -1, -1, -1, -1, -1, -1, -1, 65},
+    {-1, 366, -1, -1, 48, 96, 290, -1, 233, 196, -1},
+    {290, 1202, -1, -1, -1, -1, -1, -1, -1, -1, 1010},
+    {-1, 620, 0, 577, -1, 172, 130, -1, 204, 536, -1},
+    {890, 420, -1, -1, -1, -1, -1, -1, -1, -1, 833},
+    {-1, 27, -1, -1, 1166, 1142, 1036, -1, 1158, 537, -1},
+    {573, 436, -1, -1, -1, -1, -1, -1, -1, -1, 327},
+    {-1, 671, 150, 1124, -1, 348, 1243, -1, 79, 958, -1},
+    {48, 694, -1, -1, -1, -1, -1, -1, -1, -1, 40},
+    {-1, 130, -1, -1, 665, 715, 45, -1, 612, 254, -1},
+    {645, 1187, -1, -1, -1, -1, -1, -1, -1, -1, 83},
+    {-1, 340, 202, 93, -1, 637, 16, -1, 349, 593, -1},
+    {35, 749, -1, -1, -1, -1, -1, -1, -1, -1, 1147},
+    {-1, 522, -1, -1, 161, 416, 649, -1, 359, 177, -1},
+    {168, 214, -1, -1, -1, -1, -1, 488, -1, -1, 496},
+    {-1, 792, 1179, 1203, -1, 242, 313, -1, 689, 1235, -1},
+    {119, 207, -1, -1, -1, -1, -1, -1, -1, -1, 583},
+    {-1, 552, -1, -1, 446, 802, 641, -1, 598, 284, -1},
+    {319, 856, -1, -1, -1, -1, -1, -1, -1, -1, 652},
+    {-1, 48, 341, 561, -1, 162, 40, -1, 78, 661, -1},
+    {1194, 894, -1, -1, -1, -1, -1, -1, -1, -1, 617},
+    {-1, 682, -1, -1, 254, 625, 1147, -1, 617, 392, -1},
+    {116, 8, -1, -1, -1, -1, -1, -1, -1, -1, 41},
+    {-1, 596, 74, 842, -1, 1027, 438, -1, 1003, 422, -1},
+    {8, 457, -1, -1, -1, -1, -1, -1, -1, -1, 508},
+    {-1, 367, -1, -1, 109, 32, 134, -1, 179, 16, -1},
+    {45, 684, -1, -1, -1, -1, -1, -1, -1, -1, 781},
+    {-1, 631, 196, 425, -1, 575, 188, -1, 559, 172, -1},
+    {148, 348, -1, -1, -1, -1, -1, -1, -1, -1, 558},
+    {-1, 457, -1, -1, 848, 192, 157, -1, 65, 116, -1},
+    {398, 306, -1, -1, -1, -1, -1, 189, -1, -1, 515},
+    {-1, 222, 1106, 312, -1, 1061, 842, -1, 1098, 544, -1},
+    {395, 111, -1, -1, -1, -1, -1, -1, -1, -1, 573},
+    {-1, 398, -1, -1, 468, 357, 729, -1, 349, 684, -1},
+    {460, 747, -1, -1, -1, -1, -1, -1, -1, -1, 1200},
+    {-1, 0, 340, 409, -1, 653, 553, -1, 497, 372, -1},
+    {43, 1108, -1, -1, -1, -1, -1, -1, -1, -1, 719},
+    {-1, 402, -1, -1, 692, 151, 1141, -1, 8, 454, -1},
+    {21, 242, -1, -1, -1, -1, -1, -1, -1, -1, 427},
+    {-1, 324, 628, 219, -1, 678, 45, -1, 964, 248, -1},
+    {703, 156, -1, -1, -1, -1, -1, -1, -1, -1, 674},
+    {-1, 424, -1, -1, 533, 305, 717, -1, 117, 582, -1},
+    {497, 880, -1, -1, -1, -1, -1, -1, -1, -1, 100},
+    {-1, 96, 270, 24, -1, 185, 8, -1, 374, 48, -1},
+    {448, 84, -1, -1, -1, -1, -1, -1, -1, -1, 137},
+    {-1, 1057, -1, -1, 1128, 511, 1163, -1, 68, 1029, -1},
+    {229, 88, -1, -1, -1, -1, -1, 460, -1, -1, 54},
+    {-1, 683, 659, 606, -1, 389, 222, -1, 365, 381, -1},
+    {165, 261, -1, -1, -1, -1, -1, -1, -1, -1, 608},
+    {-1, 112, -1, -1, 604, 83, 472, -1, 620, 728, -1},
+    {1176, 497, -1, -1, -1, -1, -1, -1, -1, -1, 820},
+    {-1, 660, 434, 402, -1, 221, 335, -1, 213, 40, -1},
+    {1200, 1075, -1, -1, -1, -1, -1, -1, -1, -1, 1192},
+    {-1, 943, -1, -1, 758, 418, 524, -1, 446, 894, -1},
+    {132, 189, -1, -1, -1, -1, -1, -1, -1, -1, 68},
+    {-1, 16, 480, 562, -1, 818, 1080, -1, 1064, 728, -1},
+    {210, 568, -1, -1, -1, -1, -1, -1, -1, -1, 36},
+    {-1, 16, -1, -1, 41, 250, 137, -1, 170, 57, -1},
+    {152, 341, -1, -1, -1, -1, -1, -1, -1, -1, 208}
+};
+
 int main(int argc, char** argv)
 {
     // -------- Output folders --------
@@ -276,6 +364,10 @@ int main(int argc, char** argv)
     }
     csv << "idx,unix_sec,unix_nsec,cluster,"
             "ax,ay,az,ox,oy,oz,steer,steer_spd,gas,brake,v,"
+            "esp_v_signal,sara06_accel_x,sara10_accel_x,sara06_accel_y,sara10_accel_y,sara06_omega_z,sara10_omega_z,"
+            "lwi_angle,lwi_angle_sign,lwi_speed,lwi_speed_sign,eps_torque,eps_torque_sign,external_temp,"
+            "gas_pedal_pos,brake_driver,brake_pedal_pos,esp_brake_pressure,motor14_mo_bls,"
+            "wheel_fl,wheel_fr,wheel_rl,wheel_rr,esp_eingriff,"
             "admaAccX,admaAccY,admaAccZ,admaYaw,admaPitch,admaRoll,admaKmh,image\n";
     csv.flush();
 
@@ -335,6 +427,28 @@ int main(int argc, char** argv)
     float steer=NAN, steer_spd=NAN;
     float gas=NAN, brake=NAN, v=NAN;
 
+    float sara06_ax = NAN, sara06_ay = NAN, sara06_oz = NAN;
+    float sara10_ax = NAN, sara10_ay = NAN, sara10_oz = NAN;
+    float esp_v_signal = NAN;
+    uint8_t esp_eingriff = 0;
+
+    float lwi_angle = NAN;
+    uint8_t lwi_angle_sign = 0;
+    float lwi_speed = NAN;
+    uint8_t lwi_speed_sign = 0;
+
+    float eps_torque = NAN;
+    uint8_t eps_torque_sign = 0;
+    float external_temp = NAN;
+
+    float gas_pedal_pos = NAN;
+    uint8_t brake_driver = 0;
+    float brake_pedal_pos = NAN;
+    float esp_brake_pressure = NAN;
+    uint8_t motor14_mo_bls = 0;
+
+    float wheel_fl = NAN, wheel_fr = NAN, wheel_rl = NAN, wheel_rr = NAN;
+
     double adma_acc_x = NAN;
     double adma_acc_y = NAN;
     double adma_acc_z = NAN;
@@ -361,6 +475,107 @@ int main(int argc, char** argv)
         clock_gettime(CLOCK_REALTIME, &ts);
 
         bool has = false;
+
+        sara06_ax = NAN; sara06_ay = NAN; sara06_oz = NAN;
+        sara10_ax = NAN; sara10_ay = NAN; sara10_oz = NAN;
+        esp_v_signal = NAN; esp_eingriff = 0;
+        lwi_angle = NAN; lwi_angle_sign = 0; lwi_speed = NAN; lwi_speed_sign = 0;
+        eps_torque = NAN; eps_torque_sign = 0;
+        external_temp = NAN;
+        gas_pedal_pos = NAN;
+        brake_driver = 0;
+        brake_pedal_pos = NAN;
+        esp_brake_pressure = NAN;
+        motor14_mo_bls = 0;
+        wheel_fl = NAN; wheel_fr = NAN; wheel_rl = NAN; wheel_rr = NAN;
+
+        if (cluster >= 1 && cluster <= 64) {
+            const ClusterSignalOffsets& off = kClusterSignalOffsets[cluster];
+
+            if (off.sara06 >= 0) {
+                SARA_06 s06;
+                s06.decode(pdus + off.sara06);
+                sara06_ax = s06.data().accel_x;
+                sara06_ay = s06.data().accel_y;
+                sara06_oz = s06.data().omega_z;
+            }
+
+            if (off.sara10 >= 0) {
+                SARA_10 s10;
+                s10.decode(pdus + off.sara10);
+                sara10_ax = s10.data().accel_x;
+                sara10_ay = s10.data().accel_y;
+                sara10_oz = s10.data().omega_z;
+            }
+
+            if (off.esp21 >= 0) {
+                ESP21 e;
+                e.decode(pdus + off.esp21);
+                esp_v_signal = e.data().vehicle_speed;
+                esp_eingriff = e.data().esp_intervention;
+                v = esp_v_signal;
+            }
+
+            if (off.esp03 >= 0) {
+                ESP03 e3;
+                e3.decode(pdus + off.esp03);
+                wheel_fl = e3.data().wheel_speed_fl;
+                wheel_fr = e3.data().wheel_speed_fr;
+                wheel_rl = e3.data().wheel_speed_rl;
+                wheel_rr = e3.data().wheel_speed_rr;
+            }
+
+            if (off.esp05 >= 0) {
+                ESP05 e5;
+                e5.decode(pdus + off.esp05);
+                esp_brake_pressure = e5.data().brake_pressure;
+            }
+
+            if (off.lwi01 >= 0) {
+                LWI01 lwi;
+                lwi.decode(pdus + off.lwi01);
+                lwi_angle = lwi.angle;
+                lwi_angle_sign = lwi.angle_sign;
+                lwi_speed = lwi.speed;
+                lwi_speed_sign = lwi.speed_sign;
+                steer = lwi_angle;
+                steer_spd = lwi_speed;
+            }
+
+            if (off.lheps03 >= 0) {
+                LHEPS03 eps;
+                eps.decode(pdus + off.lheps03);
+                eps_torque = eps.data().steering_torque;
+                eps_torque_sign = eps.data().steering_torque_sign;
+            }
+
+            if (off.klima_sensor_02 >= 0) {
+                KlimaSensor02 k;
+                k.decode(pdus + off.klima_sensor_02);
+                external_temp = k.data().external_temperature;
+            }
+
+            if (off.motor20 >= 0) {
+                Motor20 m20;
+                m20.decode(pdus + off.motor20);
+                gas_pedal_pos = m20.data().gas_percent;
+                gas = gas_pedal_pos;
+            }
+
+            if (off.bremse_ev01 >= 0) {
+                BrakeEV01 br;
+                br.decode(pdus + off.bremse_ev01);
+                brake_driver = br.driver_brakes;
+                brake_pedal_pos = br.pedal_position;
+                brake = brake_pedal_pos;
+            }
+
+            if (off.motor14 >= 0) {
+                Motor14 m14;
+                m14.decode(pdus + off.motor14);
+                motor14_mo_bls = m14.data().mo_bls;
+            }
+        }
 
         switch (cluster) {
 
@@ -1118,6 +1333,19 @@ int main(int argc, char** argv)
             << ox << "," << oy << "," << oz << ","
             << steer << "," << steer_spd << ","
             << gas << "," << brake << "," << v << ","
+            << esp_v_signal << ","
+            << sara06_ax << "," << sara10_ax << ","
+            << sara06_ay << "," << sara10_ay << ","
+            << sara06_oz << "," << sara10_oz << ","
+            << lwi_angle << "," << static_cast<unsigned>(lwi_angle_sign) << ","
+            << lwi_speed << "," << static_cast<unsigned>(lwi_speed_sign) << ","
+            << eps_torque << "," << static_cast<unsigned>(eps_torque_sign) << ","
+            << external_temp << ","
+            << gas_pedal_pos << "," << static_cast<unsigned>(brake_driver) << ","
+            << brake_pedal_pos << "," << esp_brake_pressure << ","
+            << static_cast<unsigned>(motor14_mo_bls) << ","
+            << wheel_fl << "," << wheel_fr << "," << wheel_rl << "," << wheel_rr << ","
+            << static_cast<unsigned>(esp_eingriff) << ","
             << adma_acc_x << "," << adma_acc_y << "," << adma_acc_z << ","
             << adma_yaw << "," << adma_pitch << "," << adma_roll << "," << adma_kmh << ","
             << img_path << "\n";

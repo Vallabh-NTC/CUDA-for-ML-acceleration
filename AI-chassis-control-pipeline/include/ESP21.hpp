@@ -10,6 +10,7 @@ public:
     struct Data {
         float vehicle_speed;     // esp_v_signal.phy
         bool valid;
+        uint8_t esp_intervention;
     };
 
     const Data& data() const { return d; }
