@@ -439,9 +439,9 @@ int main(int argc, char** argv)
     // -------- ADMA receiver (v3.3.4) --------
     adma::AdmaPacketDecoder adma_decoder(adma::ProtocolVersion::V334);
     adma::AdmaUdpReceiver adma_receiver(
-        "195.0.5.4",
+        "192.168.1.20",
         static_cast<uint16_t>(1021),
-        std::optional<std::string>{"195.0.5.50"});
+        std::optional<std::string>{"192.168.1.55"});
 
     float flex_SARA_06_SARA_Accel_X_010 = NAN, flex_SARA_06_SARA_Accel_Y_010 = NAN, flex_SARA_06_SARA_Omega_Z_010 = NAN;
     float flex_SARA_10_SARA_Accel_X_b = NAN, flex_SARA_10_SARA_Accel_Y_b = NAN, flex_SARA_10_SARA_Omega_Z_b = NAN;
