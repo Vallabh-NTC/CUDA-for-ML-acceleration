@@ -13,4 +13,6 @@ void ESP21::decode(const unsigned char* data)
         d.vehicle_speed = raw * 0.01f;   // m/s
     else
         d.vehicle_speed = NAN;
+
+    d.esp_intervention = static_cast<uint8_t>(BitExtractor::extract(data, 7, 5, 1));
 }

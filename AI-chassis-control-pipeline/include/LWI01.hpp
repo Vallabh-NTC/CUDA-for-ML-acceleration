@@ -6,6 +6,8 @@ public:
     uint8_t crc = 0;
     float angle = 0;
     float speed = 0;
+    uint8_t angle_sign = 0;
+    uint8_t speed_sign = 0;
 
     void decode(const unsigned char* data);
     void print() const;
