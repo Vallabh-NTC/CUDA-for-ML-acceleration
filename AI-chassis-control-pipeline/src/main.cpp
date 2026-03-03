@@ -363,12 +363,33 @@ int main(int argc, char** argv)
         return 1;
     }
     csv << "idx,unix_sec,unix_nsec,cluster,"
-            "ax,ay,az,ox,oy,oz,steer,steer_spd,gas,brake,v,"
-            "esp_v_signal,sara06_accel_x,sara10_accel_x,sara06_accel_y,sara10_accel_y,sara06_omega_z,sara10_omega_z,"
-            "lwi_angle,lwi_angle_sign,lwi_speed,lwi_speed_sign,eps_torque,eps_torque_sign,external_temp,"
-            "gas_pedal_pos,brake_driver,brake_pedal_pos,esp_brake_pressure,motor14_mo_bls,"
-            "wheel_fl,wheel_fr,wheel_rl,wheel_rr,esp_eingriff,"
-            "admaAccX,admaAccY,admaAccZ,admaYaw,admaPitch,admaRoll,admaKmh,image\n";
+            "flex_ESP_21_ESP_v_Signal,flex_SARA_06_SARA_Accel_X_010,flex_SARA_10_SARA_Accel_X_b,"
+            "flex_SARA_06_SARA_Accel_Y_010,flex_SARA_10_SARA_Accel_Y_b,flex_SARA_06_SARA_Omega_Z_010,flex_SARA_10_SARA_Omega_Z_b,"
+            "flex_LWI_01_LWI_Lenkradwinkel,flex_LWI_01_LWI_VZ_Lenkradwinkel,"
+            "flex_LWI_01_LWI_Lenkradw_Geschw,flex_LWI_01_LWI_VZ_Lenkradw_Geschw,"
+            "flex_LH_EPS_03_EPS_Lenkmoment,flex_LH_EPS_03_EPS_VZ_Lenkmoment,flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef,"
+            "flex_Motor_20_MO_Fahrpedalrohwert_01,flex_Bremse_EV_01_EBKV_Fahrer_bremst,flex_Bremse_EV_01_EBKV_Bremspedalweg,"
+            "flex_ESP_05_ESP_Bremsdruck,flex_Motor_14_MO_BLS,"
+            "flex_ESP_03_ESP_VL_Radgeschw,flex_ESP_03_ESP_VR_Radgeschw,flex_ESP_03_ESP_HL_Radgeschw,flex_ESP_03_ESP_HR_Radgeschw,"
+            "flex_ESP_21_ESP_Eingriff,"
+            "adma_ins_vel_hor_x,adma_ins_vel_hor_y,adma_ins_vel_hor_z,"
+            "adma_ins_vel_frame_x,adma_ins_vel_frame_y,adma_ins_vel_frame_z,"
+            "adma_ins_vel_hor_poi1_x,adma_ins_vel_hor_poi1_y,adma_ins_vel_hor_poi1_z,"
+            "adma_gnss_vel_frame_x,adma_gnss_vel_frame_y,adma_gnss_vel_frame_z,"
+            "adma_acc_body_x,adma_acc_body_y,adma_acc_body_z,"
+            "adma_acc_horizontal_x,adma_acc_horizontal_y,adma_acc_horizontal_z,"
+            "adma_acc_body_poi1_x,adma_acc_body_poi1_y,adma_acc_body_poi1_z,"
+            "adma_acc_horizontal_poi1_x,adma_acc_horizontal_poi1_y,adma_acc_horizontal_poi1_z,"
+            "adma_ins_roll,adma_ins_pitch,adma_ins_yaw,"
+            "adma_rates_body_x,adma_rates_body_y,adma_rates_body_z,"
+            "adma_rates_horizontal_x,adma_rates_horizontal_y,adma_rates_horizontal_z,"
+            "adma_misc_side_slip_angle,adma_misc_distance_traveled,"
+            "adma_misc_poi1_side_slip_angle,adma_misc_poi1_distance_traveled,"
+            "adma_ins_pos_lat,adma_ins_pos_lon,adma_ins_height,"
+            "adma_ins_pos_poi1_lat,adma_ins_pos_poi1_lon,adma_ins_height_poi1,"
+            "adma_gnss_sats_used,adma_gnss_sats_visible,"
+            "adma_kf_status,adma_kf_lat_stimulated,adma_kf_long_stimulated,adma_kf_steady_state,"
+            "image\n";
     csv.flush();
 
     // -------- Parse args --------
@@ -422,40 +443,60 @@ int main(int argc, char** argv)
         static_cast<uint16_t>(1021),
         std::optional<std::string>{"195.0.5.50"});
 
-    float ax=NAN, ay=NAN, az=NAN;
-    float ox=NAN, oy=NAN, oz=NAN;
-    float steer=NAN, steer_spd=NAN;
-    float gas=NAN, brake=NAN, v=NAN;
+    float flex_SARA_06_SARA_Accel_X_010 = NAN, flex_SARA_06_SARA_Accel_Y_010 = NAN, flex_SARA_06_SARA_Omega_Z_010 = NAN;
+    float flex_SARA_10_SARA_Accel_X_b = NAN, flex_SARA_10_SARA_Accel_Y_b = NAN, flex_SARA_10_SARA_Omega_Z_b = NAN;
+    float flex_ESP_21_ESP_v_Signal = NAN;
+    uint8_t flex_ESP_21_ESP_Eingriff = 0;
 
-    float sara06_ax = NAN, sara06_ay = NAN, sara06_oz = NAN;
-    float sara10_ax = NAN, sara10_ay = NAN, sara10_oz = NAN;
-    float esp_v_signal = NAN;
-    uint8_t esp_eingriff = 0;
+    float flex_LWI_01_LWI_Lenkradwinkel = NAN;
+    uint8_t flex_LWI_01_LWI_VZ_Lenkradwinkel = 0;
+    float flex_LWI_01_LWI_Lenkradw_Geschw = NAN;
+    uint8_t flex_LWI_01_LWI_VZ_Lenkradw_Geschw = 0;
 
-    float lwi_angle = NAN;
-    uint8_t lwi_angle_sign = 0;
-    float lwi_speed = NAN;
-    uint8_t lwi_speed_sign = 0;
+    float flex_LH_EPS_03_EPS_Lenkmoment = NAN;
+    uint8_t flex_LH_EPS_03_EPS_VZ_Lenkmoment = 0;
+    float flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = NAN;
 
-    float eps_torque = NAN;
-    uint8_t eps_torque_sign = 0;
-    float external_temp = NAN;
+    float flex_Motor_20_MO_Fahrpedalrohwert_01 = NAN;
+    uint8_t flex_Bremse_EV_01_EBKV_Fahrer_bremst = 0;
+    float flex_Bremse_EV_01_EBKV_Bremspedalweg = NAN;
+    float flex_ESP_05_ESP_Bremsdruck = NAN;
+    uint8_t flex_Motor_14_MO_BLS = 0;
 
-    float gas_pedal_pos = NAN;
-    uint8_t brake_driver = 0;
-    float brake_pedal_pos = NAN;
-    float esp_brake_pressure = NAN;
-    uint8_t motor14_mo_bls = 0;
+    float flex_ESP_03_ESP_VL_Radgeschw = NAN, flex_ESP_03_ESP_VR_Radgeschw = NAN,
+        flex_ESP_03_ESP_HL_Radgeschw = NAN, flex_ESP_03_ESP_HR_Radgeschw = NAN;
 
-    float wheel_fl = NAN, wheel_fr = NAN, wheel_rl = NAN, wheel_rr = NAN;
+    double adma_ins_roll = NAN;
+    double adma_ins_pitch = NAN;
+    double adma_ins_yaw = NAN;
 
-    double adma_acc_x = NAN;
-    double adma_acc_y = NAN;
-    double adma_acc_z = NAN;
-    double adma_yaw = NAN;
-    double adma_pitch = NAN;
-    double adma_roll = NAN;
-    double adma_kmh = NAN;
+    double adma_ins_vel_hor_x = NAN, adma_ins_vel_hor_y = NAN, adma_ins_vel_hor_z = NAN;
+    double adma_ins_vel_frame_x = NAN, adma_ins_vel_frame_y = NAN, adma_ins_vel_frame_z = NAN;
+    double adma_ins_vel_hor_poi1_x = NAN, adma_ins_vel_hor_poi1_y = NAN, adma_ins_vel_hor_poi1_z = NAN;
+    double adma_gnss_vel_frame_x = NAN, adma_gnss_vel_frame_y = NAN, adma_gnss_vel_frame_z = NAN;
+
+    double adma_acc_body_x = NAN, adma_acc_body_y = NAN, adma_acc_body_z = NAN;
+    double adma_acc_horizontal_x = NAN, adma_acc_horizontal_y = NAN, adma_acc_horizontal_z = NAN;
+    double adma_acc_body_poi1_x = NAN, adma_acc_body_poi1_y = NAN, adma_acc_body_poi1_z = NAN;
+    double adma_acc_horizontal_poi1_x = NAN, adma_acc_horizontal_poi1_y = NAN, adma_acc_horizontal_poi1_z = NAN;
+
+    double adma_rates_body_x = NAN, adma_rates_body_y = NAN, adma_rates_body_z = NAN;
+    double adma_rates_horizontal_x = NAN, adma_rates_horizontal_y = NAN, adma_rates_horizontal_z = NAN;
+
+    double adma_misc_side_slip_angle = NAN;
+    double adma_misc_distance_traveled = NAN;
+    double adma_misc_poi1_side_slip_angle = NAN;
+    double adma_misc_poi1_distance_traveled = NAN;
+
+    double adma_ins_pos_lat = NAN, adma_ins_pos_lon = NAN, adma_ins_height = NAN;
+    double adma_ins_pos_poi1_lat = NAN, adma_ins_pos_poi1_lon = NAN, adma_ins_height_poi1 = NAN;
+
+    int adma_gnss_sats_used = -1;
+    int adma_gnss_sats_visible = -1;
+    int adma_kf_status = -1;
+    int adma_kf_lat_stimulated = -1;
+    int adma_kf_long_stimulated = -1;
+    int adma_kf_steady_state = -1;
 
     uint64_t idx = 0;
 
@@ -474,20 +515,20 @@ int main(int argc, char** argv)
         timespec ts{};
         clock_gettime(CLOCK_REALTIME, &ts);
 
-        bool has = false;
-
-        sara06_ax = NAN; sara06_ay = NAN; sara06_oz = NAN;
-        sara10_ax = NAN; sara10_ay = NAN; sara10_oz = NAN;
-        esp_v_signal = NAN; esp_eingriff = 0;
-        lwi_angle = NAN; lwi_angle_sign = 0; lwi_speed = NAN; lwi_speed_sign = 0;
-        eps_torque = NAN; eps_torque_sign = 0;
-        external_temp = NAN;
-        gas_pedal_pos = NAN;
-        brake_driver = 0;
-        brake_pedal_pos = NAN;
-        esp_brake_pressure = NAN;
-        motor14_mo_bls = 0;
-        wheel_fl = NAN; wheel_fr = NAN; wheel_rl = NAN; wheel_rr = NAN;
+        flex_SARA_06_SARA_Accel_X_010 = NAN; flex_SARA_06_SARA_Accel_Y_010 = NAN; flex_SARA_06_SARA_Omega_Z_010 = NAN;
+        flex_SARA_10_SARA_Accel_X_b = NAN; flex_SARA_10_SARA_Accel_Y_b = NAN; flex_SARA_10_SARA_Omega_Z_b = NAN;
+        flex_ESP_21_ESP_v_Signal = NAN; flex_ESP_21_ESP_Eingriff = 0;
+        flex_LWI_01_LWI_Lenkradwinkel = NAN; flex_LWI_01_LWI_VZ_Lenkradwinkel = 0;
+        flex_LWI_01_LWI_Lenkradw_Geschw = NAN; flex_LWI_01_LWI_VZ_Lenkradw_Geschw = 0;
+        flex_LH_EPS_03_EPS_Lenkmoment = NAN; flex_LH_EPS_03_EPS_VZ_Lenkmoment = 0;
+        flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = NAN;
+        flex_Motor_20_MO_Fahrpedalrohwert_01 = NAN;
+        flex_Bremse_EV_01_EBKV_Fahrer_bremst = 0;
+        flex_Bremse_EV_01_EBKV_Bremspedalweg = NAN;
+        flex_ESP_05_ESP_Bremsdruck = NAN;
+        flex_Motor_14_MO_BLS = 0;
+        flex_ESP_03_ESP_VL_Radgeschw = NAN; flex_ESP_03_ESP_VR_Radgeschw = NAN;
+        flex_ESP_03_ESP_HL_Radgeschw = NAN; flex_ESP_03_ESP_HR_Radgeschw = NAN;
 
         if (cluster >= 1 && cluster <= 64) {
             const ClusterSignalOffsets& off = kClusterSignalOffsets[cluster];
@@ -495,817 +536,189 @@ int main(int argc, char** argv)
             if (off.sara06 >= 0) {
                 SARA_06 s06;
                 s06.decode(pdus + off.sara06);
-                sara06_ax = s06.data().accel_x;
-                sara06_ay = s06.data().accel_y;
-                sara06_oz = s06.data().omega_z;
+                flex_SARA_06_SARA_Accel_X_010 = s06.data().accel_x;
+                flex_SARA_06_SARA_Accel_Y_010 = s06.data().accel_y;
+                flex_SARA_06_SARA_Omega_Z_010 = s06.data().omega_z;
             }
 
             if (off.sara10 >= 0) {
                 SARA_10 s10;
                 s10.decode(pdus + off.sara10);
-                sara10_ax = s10.data().accel_x;
-                sara10_ay = s10.data().accel_y;
-                sara10_oz = s10.data().omega_z;
+                flex_SARA_10_SARA_Accel_X_b = s10.data().accel_x;
+                flex_SARA_10_SARA_Accel_Y_b = s10.data().accel_y;
+                flex_SARA_10_SARA_Omega_Z_b = s10.data().omega_z;
             }
 
             if (off.esp21 >= 0) {
                 ESP21 e;
                 e.decode(pdus + off.esp21);
-                esp_v_signal = e.data().vehicle_speed;
-                esp_eingriff = e.data().esp_intervention;
-                v = esp_v_signal;
+                flex_ESP_21_ESP_v_Signal = e.data().vehicle_speed;
+                flex_ESP_21_ESP_Eingriff = e.data().esp_intervention;
             }
 
             if (off.esp03 >= 0) {
                 ESP03 e3;
                 e3.decode(pdus + off.esp03);
-                wheel_fl = e3.data().wheel_speed_fl;
-                wheel_fr = e3.data().wheel_speed_fr;
-                wheel_rl = e3.data().wheel_speed_rl;
-                wheel_rr = e3.data().wheel_speed_rr;
+                flex_ESP_03_ESP_VL_Radgeschw = e3.data().wheel_speed_fl;
+                flex_ESP_03_ESP_VR_Radgeschw = e3.data().wheel_speed_fr;
+                flex_ESP_03_ESP_HL_Radgeschw = e3.data().wheel_speed_rl;
+                flex_ESP_03_ESP_HR_Radgeschw = e3.data().wheel_speed_rr;
             }
 
             if (off.esp05 >= 0) {
                 ESP05 e5;
                 e5.decode(pdus + off.esp05);
-                esp_brake_pressure = e5.data().brake_pressure;
+                flex_ESP_05_ESP_Bremsdruck = e5.data().brake_pressure;
             }
 
             if (off.lwi01 >= 0) {
                 LWI01 lwi;
                 lwi.decode(pdus + off.lwi01);
-                lwi_angle = lwi.angle;
-                lwi_angle_sign = lwi.angle_sign;
-                lwi_speed = lwi.speed;
-                lwi_speed_sign = lwi.speed_sign;
-                steer = lwi_angle;
-                steer_spd = lwi_speed;
+                flex_LWI_01_LWI_Lenkradwinkel = lwi.angle;
+                flex_LWI_01_LWI_VZ_Lenkradwinkel = lwi.angle_sign;
+                flex_LWI_01_LWI_Lenkradw_Geschw = lwi.speed;
+                flex_LWI_01_LWI_VZ_Lenkradw_Geschw = lwi.speed_sign;
             }
 
             if (off.lheps03 >= 0) {
                 LHEPS03 eps;
                 eps.decode(pdus + off.lheps03);
-                eps_torque = eps.data().steering_torque;
-                eps_torque_sign = eps.data().steering_torque_sign;
+                flex_LH_EPS_03_EPS_Lenkmoment = eps.data().steering_torque;
+                flex_LH_EPS_03_EPS_VZ_Lenkmoment = eps.data().steering_torque_sign;
             }
 
             if (off.klima_sensor_02 >= 0) {
                 KlimaSensor02 k;
                 k.decode(pdus + off.klima_sensor_02);
-                external_temp = k.data().external_temperature;
+                flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = k.data().external_temperature;
             }
 
             if (off.motor20 >= 0) {
                 Motor20 m20;
                 m20.decode(pdus + off.motor20);
-                gas_pedal_pos = m20.data().gas_percent;
-                gas = gas_pedal_pos;
+                flex_Motor_20_MO_Fahrpedalrohwert_01 = m20.data().gas_percent;
             }
 
             if (off.bremse_ev01 >= 0) {
                 BrakeEV01 br;
                 br.decode(pdus + off.bremse_ev01);
-                brake_driver = br.driver_brakes;
-                brake_pedal_pos = br.pedal_position;
-                brake = brake_pedal_pos;
+                flex_Bremse_EV_01_EBKV_Fahrer_bremst = br.driver_brakes;
+                flex_Bremse_EV_01_EBKV_Bremspedalweg = br.pedal_position;
             }
 
             if (off.motor14 >= 0) {
                 Motor14 m14;
                 m14.decode(pdus + off.motor14);
-                motor14_mo_bls = m14.data().mo_bls;
+                flex_Motor_14_MO_BLS = m14.data().mo_bls;
             }
         }
 
-        switch (cluster) {
-
-        case 1: {
-            BrakeEV01 br; br.decode(pdus + 364); brake = br.brake_percent;
-            SARA_10 s10; s10.decode(pdus + 412);
-            SARA_08 s08; s08.decode(pdus + 437);
-            ESP21 e; e.decode(pdus + 542); v = e.data().vehicle_speed;
-            Motor20 m; m.decode(pdus + 629); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 677); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 2: {
-            SARA_10 s10; s10.decode(pdus + 274);
-            SARA_08 s08; s08.decode(pdus + 348);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 3: {
-            LWI01 l; l.decode(pdus + 56); steer = l.angle; steer_spd = l.speed;
-            BrakeEV01 br; br.decode(pdus + 261); brake = br.brake_percent;
-            SARA_10 s10; s10.decode(pdus + 326);
-            SARA_08 s08; s08.decode(pdus + 425);
-            Motor20 m; m.decode(pdus + 434); gas = m.data().gas_percent;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 4: {
-            SARA_10 s10; s10.decode(pdus + 128);
-            SARA_08 s08; s08.decode(pdus + 385);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 5: {
-            BrakeEV01 br; br.decode(pdus + 48); brake = br.brake_percent;
-            SARA_10 s10; s10.decode(pdus + 213);
-            SARA_08 s08; s08.decode(pdus + 230);
-            ESP21 e; e.decode(pdus + 375); v = e.data().vehicle_speed;
-            LWI01 l; l.decode(pdus + 470); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 6: {
-            SARA_10 s10; s10.decode(pdus + 48);
-            SARA_08 s08; s08.decode(pdus + 73);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 7: {
-            LWI01 l; l.decode(pdus + 96); steer = l.angle; steer_spd = l.speed;
-            BrakeEV01 br; br.decode(pdus + 196); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 233); gas = m.data().gas_percent;
-            SARA_08 s08; s08.decode(pdus + 241);
-            SARA_10 s10; s10.decode(pdus + 366);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 8: {
-            SARA_08 s08; s08.decode(pdus + 349);
-            SARA_10 s10; s10.decode(pdus + 1202);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 9: {
-            ESP21 e; e.decode(pdus + 0); v = e.data().vehicle_speed;
-            Motor20 m; m.decode(pdus + 204); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 172); steer = l.angle; steer_spd = l.speed;
-            BrakeEV01 br; br.decode(pdus + 536); brake = br.brake_percent;
-            SARA_08 s08; s08.decode(pdus + 560);
-            SARA_10 s10; s10.decode(pdus + 620);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 10: {
-            SARA_10 s10; s10.decode(pdus + 420);
-            SARA_08 s08; s08.decode(pdus + 849);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 11: {
-            SARA_10 s10; s10.decode(pdus + 27);
-            BrakeEV01 br; br.decode(pdus + 537); brake = br.brake_percent;
-            SARA_08 s08; s08.decode(pdus + 561);
-            LWI01 l; l.decode(pdus + 1142); steer = l.angle; steer_spd = l.speed;
-            Motor20 m; m.decode(pdus + 1158); gas = m.data().gas_percent;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 12: {
-            SARA_08 s08; s08.decode(pdus + 403);
-            SARA_10 s10; s10.decode(pdus + 436);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 13: {
-            Motor20 m; m.decode(pdus + 79); gas = m.data().gas_percent;
-            ESP21 e; e.decode(pdus + 150); v = e.data().vehicle_speed;
-            LWI01 l; l.decode(pdus + 348); steer = l.angle; steer_spd = l.speed;
-            SARA_10 s10; s10.decode(pdus + 671);
-            SARA_08 s08; s08.decode(pdus + 820);
-            BrakeEV01 br; br.decode(pdus + 958); brake = br.brake_percent;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 14: {
-            SARA_08 s08; s08.decode(pdus + 121);
-            az = s08.data().accel_z;
-            ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 15: {
-            SARA_10 s10; s10.decode(pdus + 130);
-            SARA_08 s08; s08.decode(pdus + 192);
-            BrakeEV01 br; br.decode(pdus + 254); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 612); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 715); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 16: {
-            SARA_08 s08; s08.decode(pdus + 866);
-            SARA_10 s10; s10.decode(pdus + 1187);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 17: {
-            SARA_08 s08; s08.decode(pdus + 125);
-            SARA_10 s10; s10.decode(pdus + 340);
-            Motor20 m; m.decode(pdus + 349); gas = m.data().gas_percent;
-            BrakeEV01 br; br.decode(pdus + 593); brake = br.brake_percent;
-            LWI01 l; l.decode(pdus + 637); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 18: {
-            SARA_10 s10; s10.decode(pdus + 749);
-            SARA_08 s08; s08.decode(pdus + 1114);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 19: {
-            BrakeEV01 br; br.decode(pdus + 177); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 359); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 416); steer = l.angle; steer_spd = l.speed;
-            SARA_10 s10; s10.decode(pdus + 522);
-            SARA_08 s08; s08.decode(pdus + 813);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 20: {
-            SARA_10 s10; s10.decode(pdus + 214);
-            SARA_08 s08; s08.decode(pdus + 260);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 21: {
-            SARA_08 s08; s08.decode(pdus + 45);
-            SARA_10 s10; s10.decode(pdus + 792);
-            Motor20 m; m.decode(pdus + 689); gas = m.data().gas_percent;
-            BrakeEV01 br; br.decode(pdus + 1235); brake = br.brake_percent;
-            LWI01 l; l.decode(pdus + 242); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 22: {
-            SARA_10 s10; s10.decode(pdus + 207);
-            SARA_08 s08; s08.decode(pdus + 374);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 23: {
-            SARA_08 s08; s08.decode(pdus + 206);
-            BrakeEV01 br; br.decode(pdus + 284); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 598); gas = m.data().gas_percent;
-            SARA_10 s10; s10.decode(pdus + 552);
-            LWI01 l; l.decode(pdus + 802); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 24: {
-            SARA_08 s08; s08.decode(pdus + 77);
-            SARA_10 s10; s10.decode(pdus + 856);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 25: {
-            SARA_10 s10; s10.decode(pdus + 48);
-            SARA_08 s08; s08.decode(pdus + 86);
-            Motor20 m; m.decode(pdus + 78); gas = m.data().gas_percent;
-            BrakeEV01 br; br.decode(pdus + 661); brake = br.brake_percent;
-            LWI01 l; l.decode(pdus + 162); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 26: {
-            SARA_08 s08; s08.decode(pdus + 273);
-            SARA_10 s10; s10.decode(pdus + 894);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 27: {
-            BrakeEV01 br; br.decode(pdus + 392); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 617); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 625); steer = l.angle; steer_spd = l.speed;
-            SARA_10 s10; s10.decode(pdus + 682);
-            SARA_08 s08; s08.decode(pdus + 1130);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 28: {
-            SARA_10 s10; s10.decode(pdus + 8);
-            SARA_08 s08; s08.decode(pdus + 70);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 29: {
-            SARA_08 s08; s08.decode(pdus + 206);
-            BrakeEV01 br; br.decode(pdus + 422); brake = br.brake_percent;
-            SARA_10 s10; s10.decode(pdus + 596);
-            Motor20 m; m.decode(pdus + 1003); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 1027); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 30: {
-            SARA_08 s08; s08.decode(pdus + 288);
-            SARA_10 s10; s10.decode(pdus + 457);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 31: {
-            BrakeEV01 br; br.decode(pdus + 16); brake = br.brake_percent;
-            LWI01 l; l.decode(pdus + 32); steer = l.angle; steer_spd = l.speed;
-            Motor20 m; m.decode(pdus + 179); gas = m.data().gas_percent;
-            SARA_10 s10; s10.decode(pdus + 367);
-            SARA_08 s08; s08.decode(pdus + 125);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 32: {
-            SARA_08 s08; s08.decode(pdus + 654);
-            SARA_10 s10; s10.decode(pdus + 684);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 33: {
-            BrakeEV01 br; br.decode(pdus + 172); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 559); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 575); steer = l.angle; steer_spd = l.speed;
-            SARA_08 s08; s08.decode(pdus + 518);
-            SARA_10 s10; s10.decode(pdus + 631);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 34: {
-            SARA_10 s10; s10.decode(pdus + 348);
-            SARA_08 s08; s08.decode(pdus + 661);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 35: {
-            BrakeEV01 br; br.decode(pdus + 116); brake = br.brake_percent;
-            Motor20 m; m.decode(pdus + 65); gas = m.data().gas_percent;
-            SARA_10 s10; s10.decode(pdus + 457);
-            SARA_08 s08; s08.decode(pdus + 614);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 36: {
-            SARA_08 s08; s08.decode(pdus + 32);
-            SARA_10 s10; s10.decode(pdus + 306);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 37: {
-            SARA_10 s10; s10.decode(pdus + 222);
-            SARA_08 s08; s08.decode(pdus + 252);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 38: {
-            SARA_10 s10; s10.decode(pdus + 111);
-            SARA_08 s08; s08.decode(pdus + 759);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 39: {
-            SARA_10 s10; s10.decode(pdus + 398);
-            SARA_08 s08; s08.decode(pdus + 389);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 40: {
-            SARA_10 s10; s10.decode(pdus + 747);
-            SARA_08 s08; s08.decode(pdus + 1062);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 41: {
-            SARA_10 s10; s10.decode(pdus + 0);
-            SARA_08 s08; s08.decode(pdus + 25);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 42: {
-            SARA_10 s10; s10.decode(pdus + 1108);
-            SARA_08 s08; s08.decode(pdus + 108);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 43: {
-            SARA_10 s10; s10.decode(pdus + 402);
-            SARA_08 s08; s08.decode(pdus + 261);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 44: {
-            SARA_10 s10; s10.decode(pdus + 242);
-            SARA_08 s08; s08.decode(pdus + 378);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 45: {
-            SARA_10 s10; s10.decode(pdus + 324);
-            SARA_08 s08; s08.decode(pdus + 855);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 46: {
-            SARA_10 s10; s10.decode(pdus + 156);
-            SARA_08 s08; s08.decode(pdus + 418);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 47: {
-            SARA_10 s10; s10.decode(pdus + 424);
-            SARA_08 s08; s08.decode(pdus + 0);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 48: {
-            SARA_10 s10; s10.decode(pdus + 880);
-            SARA_08 s08; s08.decode(pdus + 158);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 49: {
-            SARA_10 s10; s10.decode(pdus + 96);
-            SARA_08 s08; s08.decode(pdus + 553);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 50: {
-            SARA_10 s10; s10.decode(pdus + 84);
-            SARA_08 s08; s08.decode(pdus + 153);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 51: {
-            SARA_10 s10; s10.decode(pdus + 1057);
-            SARA_08 s08; s08.decode(pdus + 464);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 52: {
-            SARA_10 s10; s10.decode(pdus + 88);
-            SARA_08 s08; s08.decode(pdus + 150);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 53: {
-            SARA_10 s10; s10.decode(pdus + 683);
-            SARA_08 s08; s08.decode(pdus + 230);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 54: {
-            SARA_10 s10; s10.decode(pdus + 261);
-            SARA_08 s08; s08.decode(pdus + 656);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 55: {
-            SARA_10 s10; s10.decode(pdus + 112);
-            SARA_08 s08; s08.decode(pdus + 0);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 56: {
-            SARA_10 s10; s10.decode(pdus + 497);
-            SARA_08 s08; s08.decode(pdus + 680);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 57: {
-            SARA_10 s10; s10.decode(pdus + 660);
-            SARA_08 s08; s08.decode(pdus + 603);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 58: {
-            SARA_10 s10; s10.decode(pdus + 1075);
-            SARA_08 s08; s08.decode(pdus + 838);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 59: {
-            SARA_10 s10; s10.decode(pdus + 943);
-            SARA_08 s08; s08.decode(pdus + 369);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 60: {
-            SARA_10 s10; s10.decode(pdus + 189);
-            SARA_08 s08; s08.decode(pdus + 307);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 61: {
-            SARA_10 s10; s10.decode(pdus + 16);
-            SARA_08 s08; s08.decode(pdus + 110);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 62: {
-            SARA_10 s10; s10.decode(pdus + 568);
-            SARA_08 s08; s08.decode(pdus + 698);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 63: {
-            SARA_10 s10; s10.decode(pdus + 16);
-            BrakeEV01 br; br.decode(pdus + 57); brake = br.brake_percent;
-            SARA_08 s08; s08.decode(pdus + 161);
-            Motor20 m; m.decode(pdus + 170); gas = m.data().gas_percent;
-            LWI01 l; l.decode(pdus + 250); steer = l.angle; steer_spd = l.speed;
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        case 64: {
-            SARA_10 s10; s10.decode(pdus + 341);
-            SARA_08 s08; s08.decode(pdus + 468);
-
-            ax = s10.data().accel_x; ay = s10.data().accel_y; oz = s10.data().omega_z;
-            az = s08.data().accel_z; ox = s08.data().omega_x; oy = s08.data().omega_y;
-            has = true;
-            break;
-        }
-
-        default:
-            break;
-        }
-
-        if (!has) continue;
+        if (cluster < 1 || cluster > 64) continue;
 
         try {
             const auto adma_payload = adma_receiver.receive();
             const auto decoded = adma_decoder.decode(adma_payload);
 
-            adma_acc_x = decoded.kinematics.accx_g;
-            adma_acc_y = decoded.kinematics.accy_g;
-            adma_acc_z = decoded.kinematics.accz_g;
-            adma_kmh = decoded.kinematics.speed_kmh;
-
             if (decoded.v334.has_value()) {
                 const auto& adma_packet = decoded.v334.value();
-                adma_roll = static_cast<double>(adma_packet.insroll) * 0.01;
-                adma_pitch = static_cast<double>(adma_packet.inspitch) * 0.01;
-                adma_yaw = static_cast<double>(adma_packet.insyaw) * 0.01;
+                adma_ins_roll = static_cast<double>(adma_packet.insroll) * 0.01;
+                adma_ins_pitch = static_cast<double>(adma_packet.inspitch) * 0.01;
+                adma_ins_yaw = static_cast<double>(adma_packet.insyaw) * 0.01;
+
+                adma_ins_vel_hor_x = static_cast<double>(adma_packet.insVelHor.x) * 0.005;
+                adma_ins_vel_hor_y = static_cast<double>(adma_packet.insVelHor.y) * 0.005;
+                adma_ins_vel_hor_z = static_cast<double>(adma_packet.insVelHor.z) * 0.005;
+
+                adma_ins_vel_frame_x = static_cast<double>(adma_packet.insVelFrame.x) * 0.005;
+                adma_ins_vel_frame_y = static_cast<double>(adma_packet.insVelFrame.y) * 0.005;
+                adma_ins_vel_frame_z = static_cast<double>(adma_packet.insVelFrame.z) * 0.005;
+
+                adma_ins_vel_hor_poi1_x = static_cast<double>(adma_packet.insVelHorPOI[0].x) * 0.005;
+                adma_ins_vel_hor_poi1_y = static_cast<double>(adma_packet.insVelHorPOI[0].y) * 0.005;
+                adma_ins_vel_hor_poi1_z = static_cast<double>(adma_packet.insVelHorPOI[0].z) * 0.005;
+
+                adma_gnss_vel_frame_x = static_cast<double>(adma_packet.gnssvelframex) * 0.005;
+                adma_gnss_vel_frame_y = static_cast<double>(adma_packet.gnssvelframey) * 0.005;
+                adma_gnss_vel_frame_z = static_cast<double>(adma_packet.gnssvelframez) * 0.005;
+
+                adma_acc_body_x = static_cast<double>(adma_packet.accBody.x) * 0.0004;
+                adma_acc_body_y = static_cast<double>(adma_packet.accBody.y) * 0.0004;
+                adma_acc_body_z = static_cast<double>(adma_packet.accBody.z) * 0.0004;
+
+                adma_acc_horizontal_x = static_cast<double>(adma_packet.accHorizontal.x) * 0.0004;
+                adma_acc_horizontal_y = static_cast<double>(adma_packet.accHorizontal.y) * 0.0004;
+                adma_acc_horizontal_z = static_cast<double>(adma_packet.accHorizontal.z) * 0.0004;
+
+                adma_acc_body_poi1_x = static_cast<double>(adma_packet.accBodyPOI[0].x) * 0.0004;
+                adma_acc_body_poi1_y = static_cast<double>(adma_packet.accBodyPOI[0].y) * 0.0004;
+                adma_acc_body_poi1_z = static_cast<double>(adma_packet.accBodyPOI[0].z) * 0.0004;
+
+                adma_acc_horizontal_poi1_x = static_cast<double>(adma_packet.accHorizontalPOI[0].x) * 0.0004;
+                adma_acc_horizontal_poi1_y = static_cast<double>(adma_packet.accHorizontalPOI[0].y) * 0.0004;
+                adma_acc_horizontal_poi1_z = static_cast<double>(adma_packet.accHorizontalPOI[0].z) * 0.0004;
+
+                adma_rates_body_x = static_cast<double>(adma_packet.ratesBody.x);
+                adma_rates_body_y = static_cast<double>(adma_packet.ratesBody.y);
+                adma_rates_body_z = static_cast<double>(adma_packet.ratesBody.z);
+
+                adma_rates_horizontal_x = static_cast<double>(adma_packet.ratesHorizontal.x);
+                adma_rates_horizontal_y = static_cast<double>(adma_packet.ratesHorizontal.y);
+                adma_rates_horizontal_z = static_cast<double>(adma_packet.ratesHorizontal.z);
+
+                adma_misc_side_slip_angle = static_cast<double>(adma_packet.misc.sideSlipAngle);
+                adma_misc_distance_traveled = static_cast<double>(adma_packet.misc.distanceTraveled);
+                adma_misc_poi1_side_slip_angle = static_cast<double>(adma_packet.miscPOI[0].sideSlipAngle);
+                adma_misc_poi1_distance_traveled = static_cast<double>(adma_packet.miscPOI[0].distanceTraveled);
+
+                adma_ins_pos_lat = static_cast<double>(adma_packet.insPos.pos_abs.latitude);
+                adma_ins_pos_lon = static_cast<double>(adma_packet.insPos.pos_abs.longitude);
+                adma_ins_height = static_cast<double>(adma_packet.insHeight);
+
+                adma_ins_pos_poi1_lat = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.latitude);
+                adma_ins_pos_poi1_lon = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.longitude);
+                adma_ins_height_poi1 = static_cast<double>(adma_packet.insHeightPOI[0]);
+
+                adma_gnss_sats_used = static_cast<int>(adma_packet.gnsssatsused);
+                adma_gnss_sats_visible = static_cast<int>(adma_packet.gnsssatsvisible);
+
+                adma_kf_status = static_cast<int>(adma_packet.kfStatus);
+                adma_kf_lat_stimulated = static_cast<int>(adma_packet.kflatstimulated);
+                adma_kf_long_stimulated = static_cast<int>(adma_packet.kflongstimulated);
+                adma_kf_steady_state = static_cast<int>(adma_packet.kfsteadystate);
             }
         } catch (const std::exception& ex) {
             std::cerr << "WARN: ADMA receive/decode failed: " << ex.what() << "\n";
-            adma_acc_x = NAN;
-            adma_acc_y = NAN;
-            adma_acc_z = NAN;
-            adma_yaw = NAN;
-            adma_pitch = NAN;
-            adma_roll = NAN;
-            adma_kmh = NAN;
+            adma_ins_roll = NAN;
+            adma_ins_pitch = NAN;
+            adma_ins_yaw = NAN;
+
+            adma_ins_vel_hor_x = NAN; adma_ins_vel_hor_y = NAN; adma_ins_vel_hor_z = NAN;
+            adma_ins_vel_frame_x = NAN; adma_ins_vel_frame_y = NAN; adma_ins_vel_frame_z = NAN;
+            adma_ins_vel_hor_poi1_x = NAN; adma_ins_vel_hor_poi1_y = NAN; adma_ins_vel_hor_poi1_z = NAN;
+            adma_gnss_vel_frame_x = NAN; adma_gnss_vel_frame_y = NAN; adma_gnss_vel_frame_z = NAN;
+
+            adma_acc_body_x = NAN; adma_acc_body_y = NAN; adma_acc_body_z = NAN;
+            adma_acc_horizontal_x = NAN; adma_acc_horizontal_y = NAN; adma_acc_horizontal_z = NAN;
+            adma_acc_body_poi1_x = NAN; adma_acc_body_poi1_y = NAN; adma_acc_body_poi1_z = NAN;
+            adma_acc_horizontal_poi1_x = NAN; adma_acc_horizontal_poi1_y = NAN; adma_acc_horizontal_poi1_z = NAN;
+
+            adma_rates_body_x = NAN; adma_rates_body_y = NAN; adma_rates_body_z = NAN;
+            adma_rates_horizontal_x = NAN; adma_rates_horizontal_y = NAN; adma_rates_horizontal_z = NAN;
+
+            adma_misc_side_slip_angle = NAN;
+            adma_misc_distance_traveled = NAN;
+            adma_misc_poi1_side_slip_angle = NAN;
+            adma_misc_poi1_distance_traveled = NAN;
+
+            adma_ins_pos_lat = NAN; adma_ins_pos_lon = NAN; adma_ins_height = NAN;
+            adma_ins_pos_poi1_lat = NAN; adma_ins_pos_poi1_lon = NAN; adma_ins_height_poi1 = NAN;
+
+            adma_gnss_sats_used = -1;
+            adma_gnss_sats_visible = -1;
+            adma_kf_status = -1;
+            adma_kf_lat_stimulated = -1;
+            adma_kf_long_stimulated = -1;
+            adma_kf_steady_state = -1;
         }
 
         ++idx;
@@ -1320,34 +733,53 @@ int main(int argc, char** argv)
         }
 
         print_line(cluster,
-                   ax, ay, az,
-                   ox, oy, oz,
-                   steer, steer_spd,
-                   gas, brake, v,
+                   flex_SARA_10_SARA_Accel_X_b,
+                   flex_SARA_10_SARA_Accel_Y_b,
+                   NAN,
+                   NAN,
+                   NAN,
+                   flex_SARA_10_SARA_Omega_Z_b,
+                   flex_LWI_01_LWI_Lenkradwinkel,
+                   flex_LWI_01_LWI_Lenkradw_Geschw,
+                   flex_Motor_20_MO_Fahrpedalrohwert_01,
+                   flex_Bremse_EV_01_EBKV_Bremspedalweg,
+                   flex_ESP_21_ESP_v_Signal,
                    ts);
 
         csv << idx << ","
             << ts.tv_sec << "," << ts.tv_nsec << ","
             << cluster << ","
-            << ax << "," << ay << "," << az << ","
-            << ox << "," << oy << "," << oz << ","
-            << steer << "," << steer_spd << ","
-            << gas << "," << brake << "," << v << ","
-            << esp_v_signal << ","
-            << sara06_ax << "," << sara10_ax << ","
-            << sara06_ay << "," << sara10_ay << ","
-            << sara06_oz << "," << sara10_oz << ","
-            << lwi_angle << "," << static_cast<unsigned>(lwi_angle_sign) << ","
-            << lwi_speed << "," << static_cast<unsigned>(lwi_speed_sign) << ","
-            << eps_torque << "," << static_cast<unsigned>(eps_torque_sign) << ","
-            << external_temp << ","
-            << gas_pedal_pos << "," << static_cast<unsigned>(brake_driver) << ","
-            << brake_pedal_pos << "," << esp_brake_pressure << ","
-            << static_cast<unsigned>(motor14_mo_bls) << ","
-            << wheel_fl << "," << wheel_fr << "," << wheel_rl << "," << wheel_rr << ","
-            << static_cast<unsigned>(esp_eingriff) << ","
-            << adma_acc_x << "," << adma_acc_y << "," << adma_acc_z << ","
-            << adma_yaw << "," << adma_pitch << "," << adma_roll << "," << adma_kmh << ","
+            << flex_ESP_21_ESP_v_Signal << ","
+            << flex_SARA_06_SARA_Accel_X_010 << "," << flex_SARA_10_SARA_Accel_X_b << ","
+            << flex_SARA_06_SARA_Accel_Y_010 << "," << flex_SARA_10_SARA_Accel_Y_b << ","
+            << flex_SARA_06_SARA_Omega_Z_010 << "," << flex_SARA_10_SARA_Omega_Z_b << ","
+            << flex_LWI_01_LWI_Lenkradwinkel << "," << static_cast<unsigned>(flex_LWI_01_LWI_VZ_Lenkradwinkel) << ","
+            << flex_LWI_01_LWI_Lenkradw_Geschw << "," << static_cast<unsigned>(flex_LWI_01_LWI_VZ_Lenkradw_Geschw) << ","
+            << flex_LH_EPS_03_EPS_Lenkmoment << "," << static_cast<unsigned>(flex_LH_EPS_03_EPS_VZ_Lenkmoment) << ","
+            << flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef << ","
+            << flex_Motor_20_MO_Fahrpedalrohwert_01 << "," << static_cast<unsigned>(flex_Bremse_EV_01_EBKV_Fahrer_bremst) << ","
+            << flex_Bremse_EV_01_EBKV_Bremspedalweg << "," << flex_ESP_05_ESP_Bremsdruck << ","
+            << static_cast<unsigned>(flex_Motor_14_MO_BLS) << ","
+            << flex_ESP_03_ESP_VL_Radgeschw << "," << flex_ESP_03_ESP_VR_Radgeschw << ","
+            << flex_ESP_03_ESP_HL_Radgeschw << "," << flex_ESP_03_ESP_HR_Radgeschw << ","
+            << static_cast<unsigned>(flex_ESP_21_ESP_Eingriff) << ","
+            << adma_ins_vel_hor_x << "," << adma_ins_vel_hor_y << "," << adma_ins_vel_hor_z << ","
+            << adma_ins_vel_frame_x << "," << adma_ins_vel_frame_y << "," << adma_ins_vel_frame_z << ","
+            << adma_ins_vel_hor_poi1_x << "," << adma_ins_vel_hor_poi1_y << "," << adma_ins_vel_hor_poi1_z << ","
+            << adma_gnss_vel_frame_x << "," << adma_gnss_vel_frame_y << "," << adma_gnss_vel_frame_z << ","
+            << adma_acc_body_x << "," << adma_acc_body_y << "," << adma_acc_body_z << ","
+            << adma_acc_horizontal_x << "," << adma_acc_horizontal_y << "," << adma_acc_horizontal_z << ","
+            << adma_acc_body_poi1_x << "," << adma_acc_body_poi1_y << "," << adma_acc_body_poi1_z << ","
+            << adma_acc_horizontal_poi1_x << "," << adma_acc_horizontal_poi1_y << "," << adma_acc_horizontal_poi1_z << ","
+            << adma_ins_roll << "," << adma_ins_pitch << "," << adma_ins_yaw << ","
+            << adma_rates_body_x << "," << adma_rates_body_y << "," << adma_rates_body_z << ","
+            << adma_rates_horizontal_x << "," << adma_rates_horizontal_y << "," << adma_rates_horizontal_z << ","
+            << adma_misc_side_slip_angle << "," << adma_misc_distance_traveled << ","
+            << adma_misc_poi1_side_slip_angle << "," << adma_misc_poi1_distance_traveled << ","
+            << adma_ins_pos_lat << "," << adma_ins_pos_lon << "," << adma_ins_height << ","
+            << adma_ins_pos_poi1_lat << "," << adma_ins_pos_poi1_lon << "," << adma_ins_height_poi1 << ","
+            << adma_gnss_sats_used << "," << adma_gnss_sats_visible << ","
+            << adma_kf_status << "," << adma_kf_lat_stimulated << "," << adma_kf_long_stimulated << "," << adma_kf_steady_state << ","
             << img_path << "\n";
         csv.flush();
     }
