@@ -24,6 +24,14 @@ UdpReceiver::UdpReceiver(uint16_t port)
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     // -------------------------------
+    // Increase UDP receive buffer
+    // -------------------------------
+    int rcvbuf = 4 * 1024 * 1024; // 4MB (prova 8MB se serve)
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        perror("setsockopt(SO_RCVBUF) failed");
+    }
+
+    // -------------------------------
     // Bind to explicit Xavier IP first
     // (replace with your actual IP!)
     // -------------------------------

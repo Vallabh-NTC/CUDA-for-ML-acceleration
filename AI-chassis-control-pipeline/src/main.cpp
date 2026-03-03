@@ -64,10 +64,15 @@ static inline void print_line(
               << "\n";
 }
 
-static bool save_one_jpeg_from_appsink(GstAppSink* appsink, const char* filepath)
+static bool save_one_jpeg_from_appsink(GstAppSink* appsink,
+                                       const char* filepath,
+                                       int timeout_ms)
 {
-    GstSample* sample = gst_app_sink_pull_sample(appsink);
-    if (!sample) return false;
+    GstSample* sample = gst_app_sink_try_pull_sample(appsink, timeout_ms * GST_MSECOND);
+    if (!sample) {
+        // Nessun frame disponibile entro timeout -> non bloccare il loop UDP
+        return false;
+    }
 
     GstBuffer* buffer = gst_sample_get_buffer(sample);
     if (!buffer) {
@@ -325,6 +330,7 @@ int main(int argc, char** argv)
     float gas=NAN, brake=NAN, v=NAN;
 
     uint64_t idx = 0;
+    const uint64_t flush_every = 100; 
 
     while (true) {
         if (!check_bus_nonblocking(pipeline)) {
@@ -1053,18 +1059,19 @@ int main(int argc, char** argv)
         char img_path[256];
         std::snprintf(img_path, sizeof(img_path), "log/images/%06llu.jpg",
                       (unsigned long long)idx);
-
-        if (!save_one_jpeg_from_appsink(appsink, img_path)) {
-            std::cerr << "WARN: failed to grab/save jpeg at idx=" << idx << "\n";
-            continue;
+        if (!save_one_jpeg_from_appsink(appsink, img_path, 5)) { // 5 ms
+            std::cerr << "WARN: no frame ready (non-blocking) at idx=" << idx << "\n";
+            continue; 
         }
 
-        print_line(cluster,
-                   ax, ay, az,
-                   ox, oy, oz,
-                   steer, steer_spd,
-                   gas, brake, v,
-                   ts);
+        if (idx % 10 == 0) {
+            print_line(cluster,
+                    ax, ay, az,
+                    ox, oy, oz,
+                    steer, steer_spd,
+                    gas, brake, v,
+                    ts);
+        }
 
         csv << idx << ","
             << ts.tv_sec << "," << ts.tv_nsec << ","
@@ -1074,7 +1081,9 @@ int main(int argc, char** argv)
             << steer << "," << steer_spd << ","
             << gas << "," << brake << "," << v << ","
             << img_path << "\n";
-        csv.flush();
+        if (idx % flush_every == 0) {
+            csv.flush();
+            }   
     }
 
     gst_element_set_state(pipeline, GST_STATE_NULL);
