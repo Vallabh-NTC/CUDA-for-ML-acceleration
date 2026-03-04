@@ -45,6 +45,7 @@
 #include "ESP03.hpp"
 #include "ESP05.hpp"
 #include "Motor14.hpp"
+#include "Getriebe11.hpp"
 #include "LHEPS03.hpp"
 #include "KlimaSensor02.hpp"
 #include "SARA_06.hpp"
@@ -384,6 +385,14 @@ static const ClusterSignalOffsets kClusterSignalOffsets[65] = {
     {152, 341, -1, -1, -1, -1, -1, -1, -1, -1, 208}
 };
 
+static const int kGetriebe11Offsets[65] = {
+    -1,
+    -1, 1179, -1, 24, -1, 513, -1, 504, -1, 573, -1, 276, -1, 307, -1, 91,
+    -1, 512, -1, 331, -1, 415, -1, 213, -1, 1203, -1, 424, -1, 604, -1, 455,
+    -1, 1043, -1, 431, -1, 342, -1, 0, -1, 1040, -1, 310, -1, 181, -1, 548,
+    -1, 807, -1, 365, -1, 640, -1, 399, -1, 401, -1, 76, -1, 92, -1, 0
+};
+
 static inline timespec now_realtime()
 {
     timespec ts{};
@@ -472,6 +481,7 @@ struct FlexSnapshot {
     float flex_Bremse_EV_01_EBKV_Bremspedalweg = qnanf();
     float flex_ESP_05_ESP_Bremsdruck = qnanf();
     uint8_t flex_Motor_14_MO_BLS = 0;
+    uint8_t flex_Getriebe_11_GE_Zielgang = 0;
 
     float flex_ESP_03_ESP_VL_Radgeschw = qnanf(), flex_ESP_03_ESP_VR_Radgeschw = qnanf(),
         flex_ESP_03_ESP_HL_Radgeschw = qnanf(), flex_ESP_03_ESP_HR_Radgeschw = qnanf();
@@ -626,6 +636,13 @@ static bool decode_flex_packet(const unsigned char* buf, int n, const FlexSnapsh
         out.flex_Motor_14_MO_BLS = m14.data().mo_bls;
     }
 
+    const int getriebe11_offset = kGetriebe11Offsets[out.cluster];
+    if (getriebe11_offset >= 0) {
+        Getriebe11 getriebe11;
+        getriebe11.decode(pdus + getriebe11_offset);
+        out.flex_Getriebe_11_GE_Zielgang = getriebe11.data().ge_zielgang;
+    }
+
     return true;
 }
 
@@ -650,7 +667,7 @@ int main(int argc, char** argv)
             "flex_LWI_01_LWI_Lenkradw_Geschw,flex_LWI_01_LWI_VZ_Lenkradw_Geschw,"
             "flex_LH_EPS_03_EPS_Lenkmoment,flex_LH_EPS_03_EPS_VZ_Lenkmoment,flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef,"
             "flex_Motor_20_MO_Fahrpedalrohwert_01,flex_Bremse_EV_01_EBKV_Fahrer_bremst,flex_Bremse_EV_01_EBKV_Bremspedalweg,"
-            "flex_ESP_05_ESP_Bremsdruck,flex_Motor_14_MO_BLS,"
+            "flex_ESP_05_ESP_Bremsdruck,flex_Motor_14_MO_BLS,flex_Getriebe_11_GE_Zielgang,"
             "flex_ESP_03_ESP_VL_Radgeschw,flex_ESP_03_ESP_VR_Radgeschw,flex_ESP_03_ESP_HL_Radgeschw,flex_ESP_03_ESP_HR_Radgeschw,"
             "flex_ESP_21_ESP_Eingriff,"
             "adma_ins_vel_hor_x,adma_ins_vel_hor_y,adma_ins_vel_hor_z,"
@@ -930,6 +947,7 @@ int main(int argc, char** argv)
             << flex.flex_Motor_20_MO_Fahrpedalrohwert_01 << "," << static_cast<unsigned>(flex.flex_Bremse_EV_01_EBKV_Fahrer_bremst) << ","
             << flex.flex_Bremse_EV_01_EBKV_Bremspedalweg << "," << flex.flex_ESP_05_ESP_Bremsdruck << ","
             << static_cast<unsigned>(flex.flex_Motor_14_MO_BLS) << ","
+            << static_cast<unsigned>(flex.flex_Getriebe_11_GE_Zielgang) << ","
             << flex.flex_ESP_03_ESP_VL_Radgeschw << "," << flex.flex_ESP_03_ESP_VR_Radgeschw << ","
             << flex.flex_ESP_03_ESP_HL_Radgeschw << "," << flex.flex_ESP_03_ESP_HR_Radgeschw << ","
             << static_cast<unsigned>(flex.flex_ESP_21_ESP_Eingriff) << ","

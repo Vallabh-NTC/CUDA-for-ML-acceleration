@@ -38,6 +38,7 @@ add_executable(udp_decoder
     src/Motor14.cpp
     src/LHEPS03.cpp
     src/KlimaSensor02.cpp
+    src/Getriebe11.cpp
 )
 
 set_source_files_properties(src/KernelExec.cu PROPERTIES LANGUAGE CUDA)
