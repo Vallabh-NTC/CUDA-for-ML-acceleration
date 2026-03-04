@@ -26,6 +26,9 @@
 #include <string>
 #include <sstream>
 #include <optional>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -103,6 +106,30 @@ static bool save_one_jpeg_from_appsink(GstAppSink* appsink, const char* filepath
 
     gst_buffer_unmap(buffer, &map);
     gst_sample_unref(sample);
+    return true;
+}
+
+static bool save_jpeg_from_sample(GstSample* sample, const char* filepath)
+{
+    if (!sample) return false;
+
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    if (!buffer) return false;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return false;
+
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out) {
+        gst_buffer_unmap(buffer, &map);
+        return false;
+    }
+
+    out.write(reinterpret_cast<const char*>(map.data),
+              static_cast<std::streamsize>(map.size));
+    out.close();
+
+    gst_buffer_unmap(buffer, &map);
     return true;
 }
 
@@ -351,6 +378,197 @@ static const ClusterSignalOffsets kClusterSignalOffsets[65] = {
     {152, 341, -1, -1, -1, -1, -1, -1, -1, -1, 208}
 };
 
+static inline timespec now_realtime()
+{
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts;
+}
+
+static inline float qnanf()
+{
+    return 0.0f;
+}
+
+static inline double qnand()
+{
+    return 0.0;
+}
+
+struct FlexSnapshot {
+    timespec ts{};
+    int cluster = 0;
+
+    float flex_SARA_06_SARA_Accel_X_010 = qnanf(), flex_SARA_06_SARA_Accel_Y_010 = qnanf(), flex_SARA_06_SARA_Omega_Z_010 = qnanf();
+    float flex_SARA_10_SARA_Accel_X_b = qnanf(), flex_SARA_10_SARA_Accel_Y_b = qnanf(), flex_SARA_10_SARA_Omega_Z_b = qnanf();
+    float flex_ESP_21_ESP_v_Signal = qnanf();
+    uint8_t flex_ESP_21_ESP_Eingriff = 0;
+
+    float flex_LWI_01_LWI_Lenkradwinkel = qnanf();
+    uint8_t flex_LWI_01_LWI_VZ_Lenkradwinkel = 0;
+    float flex_LWI_01_LWI_Lenkradw_Geschw = qnanf();
+    uint8_t flex_LWI_01_LWI_VZ_Lenkradw_Geschw = 0;
+
+    float flex_LH_EPS_03_EPS_Lenkmoment = qnanf();
+    uint8_t flex_LH_EPS_03_EPS_VZ_Lenkmoment = 0;
+    float flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = qnanf();
+
+    float flex_Motor_20_MO_Fahrpedalrohwert_01 = qnanf();
+    uint8_t flex_Bremse_EV_01_EBKV_Fahrer_bremst = 0;
+    float flex_Bremse_EV_01_EBKV_Bremspedalweg = qnanf();
+    float flex_ESP_05_ESP_Bremsdruck = qnanf();
+    uint8_t flex_Motor_14_MO_BLS = 0;
+
+    float flex_ESP_03_ESP_VL_Radgeschw = qnanf(), flex_ESP_03_ESP_VR_Radgeschw = qnanf(),
+        flex_ESP_03_ESP_HL_Radgeschw = qnanf(), flex_ESP_03_ESP_HR_Radgeschw = qnanf();
+};
+
+struct AdmaSnapshot {
+    timespec ts{};
+
+    double adma_ins_roll = qnand();
+    double adma_ins_pitch = qnand();
+    double adma_ins_yaw = qnand();
+
+    double adma_ins_vel_hor_x = qnand(), adma_ins_vel_hor_y = qnand(), adma_ins_vel_hor_z = qnand();
+    double adma_ins_vel_frame_x = qnand(), adma_ins_vel_frame_y = qnand(), adma_ins_vel_frame_z = qnand();
+    double adma_ins_vel_hor_poi1_x = qnand(), adma_ins_vel_hor_poi1_y = qnand(), adma_ins_vel_hor_poi1_z = qnand();
+    double adma_gnss_vel_frame_x = qnand(), adma_gnss_vel_frame_y = qnand(), adma_gnss_vel_frame_z = qnand();
+
+    double adma_acc_body_x = qnand(), adma_acc_body_y = qnand(), adma_acc_body_z = qnand();
+    double adma_acc_horizontal_x = qnand(), adma_acc_horizontal_y = qnand(), adma_acc_horizontal_z = qnand();
+    double adma_acc_body_poi1_x = qnand(), adma_acc_body_poi1_y = qnand(), adma_acc_body_poi1_z = qnand();
+    double adma_acc_horizontal_poi1_x = qnand(), adma_acc_horizontal_poi1_y = qnand(), adma_acc_horizontal_poi1_z = qnand();
+
+    double adma_rates_body_x = qnand(), adma_rates_body_y = qnand(), adma_rates_body_z = qnand();
+    double adma_rates_horizontal_x = qnand(), adma_rates_horizontal_y = qnand(), adma_rates_horizontal_z = qnand();
+
+    double adma_misc_side_slip_angle = qnand();
+    double adma_misc_distance_traveled = qnand();
+    double adma_misc_poi1_side_slip_angle = qnand();
+    double adma_misc_poi1_distance_traveled = qnand();
+
+    double adma_ins_pos_lat = qnand(), adma_ins_pos_lon = qnand(), adma_ins_height = qnand();
+    double adma_ins_pos_poi1_lat = qnand(), adma_ins_pos_poi1_lon = qnand(), adma_ins_height_poi1 = qnand();
+
+    int adma_gnss_sats_used = -1;
+    int adma_gnss_sats_visible = -1;
+    int adma_kf_status = -1;
+    int adma_kf_lat_stimulated = -1;
+    int adma_kf_long_stimulated = -1;
+    int adma_kf_steady_state = -1;
+};
+
+struct CameraSnapshot {
+    timespec ts{};
+    std::string image_path;
+    uint64_t frame_idx = 0;
+};
+
+struct SharedState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    FlexSnapshot flex;
+    AdmaSnapshot adma;
+    CameraSnapshot camera;
+    uint64_t flex_seq = 0;
+};
+
+static bool decode_flex_packet(const unsigned char* buf, int n, const FlexSnapshot& prev, FlexSnapshot& out)
+{
+    if (n < 3) return false;
+
+    out = prev;
+    out.ts = now_realtime();
+    out.cluster = buf[0];
+
+    if (out.cluster < 1 || out.cluster > 64) return false;
+
+    const unsigned char* pdus = buf + 3;
+    const ClusterSignalOffsets& off = kClusterSignalOffsets[out.cluster];
+
+    if (off.sara06 >= 0) {
+        SARA_06 s06;
+        s06.decode(pdus + off.sara06);
+        out.flex_SARA_06_SARA_Accel_X_010 = s06.data().accel_x;
+        out.flex_SARA_06_SARA_Accel_Y_010 = s06.data().accel_y;
+        out.flex_SARA_06_SARA_Omega_Z_010 = s06.data().omega_z;
+    }
+
+    if (off.sara10 >= 0) {
+        SARA_10 s10;
+        s10.decode(pdus + off.sara10);
+        out.flex_SARA_10_SARA_Accel_X_b = s10.data().accel_x;
+        out.flex_SARA_10_SARA_Accel_Y_b = s10.data().accel_y;
+        out.flex_SARA_10_SARA_Omega_Z_b = s10.data().omega_z;
+    }
+
+    if (off.esp21 >= 0) {
+        ESP21 e;
+        e.decode(pdus + off.esp21);
+        out.flex_ESP_21_ESP_v_Signal = e.data().vehicle_speed;
+        out.flex_ESP_21_ESP_Eingriff = e.data().esp_intervention;
+    }
+
+    if (off.esp03 >= 0) {
+        ESP03 e3;
+        e3.decode(pdus + off.esp03);
+        out.flex_ESP_03_ESP_VL_Radgeschw = e3.data().wheel_speed_fl;
+        out.flex_ESP_03_ESP_VR_Radgeschw = e3.data().wheel_speed_fr;
+        out.flex_ESP_03_ESP_HL_Radgeschw = e3.data().wheel_speed_rl;
+        out.flex_ESP_03_ESP_HR_Radgeschw = e3.data().wheel_speed_rr;
+    }
+
+    if (off.esp05 >= 0) {
+        ESP05 e5;
+        e5.decode(pdus + off.esp05);
+        out.flex_ESP_05_ESP_Bremsdruck = e5.data().brake_pressure;
+    }
+
+    if (off.lwi01 >= 0) {
+        LWI01 lwi;
+        lwi.decode(pdus + off.lwi01);
+        out.flex_LWI_01_LWI_Lenkradwinkel = lwi.angle;
+        out.flex_LWI_01_LWI_VZ_Lenkradwinkel = lwi.angle_sign;
+        out.flex_LWI_01_LWI_Lenkradw_Geschw = lwi.speed;
+        out.flex_LWI_01_LWI_VZ_Lenkradw_Geschw = lwi.speed_sign;
+    }
+
+    if (off.lheps03 >= 0) {
+        LHEPS03 eps;
+        eps.decode(pdus + off.lheps03);
+        out.flex_LH_EPS_03_EPS_Lenkmoment = eps.data().steering_torque;
+        out.flex_LH_EPS_03_EPS_VZ_Lenkmoment = eps.data().steering_torque_sign;
+    }
+
+    if (off.klima_sensor_02 >= 0) {
+        KlimaSensor02 k;
+        k.decode(pdus + off.klima_sensor_02);
+        out.flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = k.data().external_temperature;
+    }
+
+    if (off.motor20 >= 0) {
+        Motor20 m20;
+        m20.decode(pdus + off.motor20);
+        out.flex_Motor_20_MO_Fahrpedalrohwert_01 = m20.data().gas_percent;
+    }
+
+    if (off.bremse_ev01 >= 0) {
+        BrakeEV01 br;
+        br.decode(pdus + off.bremse_ev01);
+        out.flex_Bremse_EV_01_EBKV_Fahrer_bremst = br.driver_brakes;
+        out.flex_Bremse_EV_01_EBKV_Bremspedalweg = br.pedal_position;
+    }
+
+    if (off.motor14 >= 0) {
+        Motor14 m14;
+        m14.decode(pdus + off.motor14);
+        out.flex_Motor_14_MO_BLS = m14.data().mo_bls;
+    }
+
+    return true;
+}
+
 int main(int argc, char** argv)
 {
     // -------- Output folders --------
@@ -399,393 +617,267 @@ int main(int argc, char** argv)
     // -------- GStreamer init --------
     gst_init(&argc, &argv);
 
-    // -------- Pipeline --------
-    const std::string pipeline_desc = build_pipeline(opts);
-    std::cerr << "pipeline:\n  " << pipeline_desc << "\n";
+    SharedState shared{};
 
-    GError* err = nullptr;
-    GstElement* pipeline = gst_parse_launch(pipeline_desc.c_str(), &err);
-    if (!pipeline) {
-        std::cerr << "ERROR: gst_parse_launch failed\n";
-        if (err) { std::cerr << "  " << err->message << "\n"; g_error_free(err); }
-        return 1;
-    }
-    if (err) {
-        std::cerr << "GStreamer parse warning/error: " << err->message << "\n";
-        g_error_free(err);
-        err = nullptr;
-    }
+    std::thread flex_thread([&shared]() {
+        UdpReceiver receiver(1500);
+        unsigned char buf[65536];
+        FlexSnapshot last_flex{};
+        last_flex.ts = now_realtime();
+        last_flex.cluster = 0;
 
-    GstElement* sink_elem = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
-    if (!sink_elem) {
-        std::cerr << "ERROR: cannot find appsink element 'sink'\n";
-        gst_object_unref(pipeline);
-        return 1;
-    }
-    GstAppSink* appsink = GST_APP_SINK(sink_elem);
+        while (true) {
+            const int n = receiver.receive(buf, sizeof(buf));
+            if (n < 3) continue;
 
-    // Start pipeline
-    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        std::cerr << "ERROR: failed to set GStreamer pipeline to PLAYING\n";
+            FlexSnapshot snap;
+            if (!decode_flex_packet(buf, n, last_flex, snap)) continue;
+            last_flex = snap;
+
+            {
+                std::lock_guard<std::mutex> lk(shared.mtx);
+                shared.flex = snap;
+                ++shared.flex_seq;
+            }
+            shared.cv.notify_one();
+        }
+    });
+
+    std::thread adma_thread([&shared]() {
+        adma::AdmaPacketDecoder adma_decoder(adma::ProtocolVersion::V334);
+        adma::AdmaUdpReceiver adma_receiver(
+            "192.168.1.20",
+            static_cast<uint16_t>(1021),
+            std::optional<std::string>{"192.168.1.55"});
+
+        while (true) {
+            try {
+                const auto adma_payload = adma_receiver.receive();
+                const auto decoded = adma_decoder.decode(adma_payload);
+                if (!decoded.v334.has_value()) continue;
+
+                const auto& adma_packet = decoded.v334.value();
+                AdmaSnapshot snap;
+                snap.ts = now_realtime();
+
+                snap.adma_ins_roll = static_cast<double>(adma_packet.insroll) * 0.01;
+                snap.adma_ins_pitch = static_cast<double>(adma_packet.inspitch) * 0.01;
+                snap.adma_ins_yaw = static_cast<double>(adma_packet.insyaw) * 0.01;
+
+                snap.adma_ins_vel_hor_x = static_cast<double>(adma_packet.insVelHor.x) * 0.005;
+                snap.adma_ins_vel_hor_y = static_cast<double>(adma_packet.insVelHor.y) * 0.005;
+                snap.adma_ins_vel_hor_z = static_cast<double>(adma_packet.insVelHor.z) * 0.005;
+
+                snap.adma_ins_vel_frame_x = static_cast<double>(adma_packet.insVelFrame.x) * 0.005;
+                snap.adma_ins_vel_frame_y = static_cast<double>(adma_packet.insVelFrame.y) * 0.005;
+                snap.adma_ins_vel_frame_z = static_cast<double>(adma_packet.insVelFrame.z) * 0.005;
+
+                snap.adma_ins_vel_hor_poi1_x = static_cast<double>(adma_packet.insVelHorPOI[0].x) * 0.005;
+                snap.adma_ins_vel_hor_poi1_y = static_cast<double>(adma_packet.insVelHorPOI[0].y) * 0.005;
+                snap.adma_ins_vel_hor_poi1_z = static_cast<double>(adma_packet.insVelHorPOI[0].z) * 0.005;
+
+                snap.adma_gnss_vel_frame_x = static_cast<double>(adma_packet.gnssvelframex) * 0.005;
+                snap.adma_gnss_vel_frame_y = static_cast<double>(adma_packet.gnssvelframey) * 0.005;
+                snap.adma_gnss_vel_frame_z = static_cast<double>(adma_packet.gnssvelframez) * 0.005;
+
+                snap.adma_acc_body_x = static_cast<double>(adma_packet.accBody.x) * 0.0004;
+                snap.adma_acc_body_y = static_cast<double>(adma_packet.accBody.y) * 0.0004;
+                snap.adma_acc_body_z = static_cast<double>(adma_packet.accBody.z) * 0.0004;
+
+                snap.adma_acc_horizontal_x = static_cast<double>(adma_packet.accHorizontal.x) * 0.0004;
+                snap.adma_acc_horizontal_y = static_cast<double>(adma_packet.accHorizontal.y) * 0.0004;
+                snap.adma_acc_horizontal_z = static_cast<double>(adma_packet.accHorizontal.z) * 0.0004;
+
+                snap.adma_acc_body_poi1_x = static_cast<double>(adma_packet.accBodyPOI[0].x) * 0.0004;
+                snap.adma_acc_body_poi1_y = static_cast<double>(adma_packet.accBodyPOI[0].y) * 0.0004;
+                snap.adma_acc_body_poi1_z = static_cast<double>(adma_packet.accBodyPOI[0].z) * 0.0004;
+
+                snap.adma_acc_horizontal_poi1_x = static_cast<double>(adma_packet.accHorizontalPOI[0].x) * 0.0004;
+                snap.adma_acc_horizontal_poi1_y = static_cast<double>(adma_packet.accHorizontalPOI[0].y) * 0.0004;
+                snap.adma_acc_horizontal_poi1_z = static_cast<double>(adma_packet.accHorizontalPOI[0].z) * 0.0004;
+
+                snap.adma_rates_body_x = static_cast<double>(adma_packet.ratesBody.x);
+                snap.adma_rates_body_y = static_cast<double>(adma_packet.ratesBody.y);
+                snap.adma_rates_body_z = static_cast<double>(adma_packet.ratesBody.z);
+
+                snap.adma_rates_horizontal_x = static_cast<double>(adma_packet.ratesHorizontal.x);
+                snap.adma_rates_horizontal_y = static_cast<double>(adma_packet.ratesHorizontal.y);
+                snap.adma_rates_horizontal_z = static_cast<double>(adma_packet.ratesHorizontal.z);
+
+                snap.adma_misc_side_slip_angle = static_cast<double>(adma_packet.misc.sideSlipAngle);
+                snap.adma_misc_distance_traveled = static_cast<double>(adma_packet.misc.distanceTraveled);
+                snap.adma_misc_poi1_side_slip_angle = static_cast<double>(adma_packet.miscPOI[0].sideSlipAngle);
+                snap.adma_misc_poi1_distance_traveled = static_cast<double>(adma_packet.miscPOI[0].distanceTraveled);
+
+                snap.adma_ins_pos_lat = static_cast<double>(adma_packet.insPos.pos_abs.latitude);
+                snap.adma_ins_pos_lon = static_cast<double>(adma_packet.insPos.pos_abs.longitude);
+                snap.adma_ins_height = static_cast<double>(adma_packet.insHeight);
+
+                snap.adma_ins_pos_poi1_lat = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.latitude);
+                snap.adma_ins_pos_poi1_lon = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.longitude);
+                snap.adma_ins_height_poi1 = static_cast<double>(adma_packet.insHeightPOI[0]);
+
+                snap.adma_gnss_sats_used = static_cast<int>(adma_packet.gnsssatsused);
+                snap.adma_gnss_sats_visible = static_cast<int>(adma_packet.gnsssatsvisible);
+                snap.adma_kf_status = static_cast<int>(adma_packet.kfStatus);
+                snap.adma_kf_lat_stimulated = static_cast<int>(adma_packet.kflatstimulated);
+                snap.adma_kf_long_stimulated = static_cast<int>(adma_packet.kflongstimulated);
+                snap.adma_kf_steady_state = static_cast<int>(adma_packet.kfsteadystate);
+
+                {
+                    std::lock_guard<std::mutex> lk(shared.mtx);
+                    shared.adma = snap;
+                }
+            } catch (const std::exception& ex) {
+                std::cerr << "WARN: ADMA receive/decode failed: " << ex.what() << "\n";
+            }
+        }
+    });
+
+    std::thread camera_thread([&shared, &opts]() {
+        const std::string pipeline_desc = build_pipeline(opts);
+        std::cerr << "pipeline:\n  " << pipeline_desc << "\n";
+
+        GError* err = nullptr;
+        GstElement* pipeline = gst_parse_launch(pipeline_desc.c_str(), &err);
+        if (!pipeline) {
+            std::cerr << "ERROR: gst_parse_launch failed\n";
+            if (err) { std::cerr << "  " << err->message << "\n"; g_error_free(err); }
+            return;
+        }
+        if (err) {
+            std::cerr << "GStreamer parse warning/error: " << err->message << "\n";
+            g_error_free(err);
+            err = nullptr;
+        }
+
+        GstElement* sink_elem = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+        if (!sink_elem) {
+            std::cerr << "ERROR: cannot find appsink element 'sink'\n";
+            gst_object_unref(pipeline);
+            return;
+        }
+        GstAppSink* appsink = GST_APP_SINK(sink_elem);
+
+        if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "ERROR: failed to set GStreamer pipeline to PLAYING\n";
+            gst_object_unref(sink_elem);
+            gst_object_unref(pipeline);
+            return;
+        }
+
+        uint64_t cam_idx = 0;
+        while (true) {
+            if (!check_bus_nonblocking(pipeline)) {
+                std::cerr << "Stopping camera thread due to GStreamer error/EOS.\n";
+                break;
+            }
+
+            GstSample* sample = gst_app_sink_try_pull_sample(appsink, 100000000ULL);
+            if (!sample) continue;
+
+            ++cam_idx;
+            char img_path[256];
+            std::snprintf(img_path, sizeof(img_path), "log/images/%06llu.jpg",
+                          static_cast<unsigned long long>(cam_idx));
+
+            if (!save_jpeg_from_sample(sample, img_path)) {
+                std::cerr << "WARN: failed to save camera frame idx=" << cam_idx << "\n";
+                gst_sample_unref(sample);
+                continue;
+            }
+
+            CameraSnapshot cam;
+            cam.ts = now_realtime();
+            cam.image_path = img_path;
+            cam.frame_idx = cam_idx;
+
+            {
+                std::lock_guard<std::mutex> lk(shared.mtx);
+                shared.camera = std::move(cam);
+            }
+
+            gst_sample_unref(sample);
+        }
+
+        gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(sink_elem);
         gst_object_unref(pipeline);
-        return 1;
-    }
-
-    // -------- UDP receiver --------
-    UdpReceiver receiver(1500);
-    unsigned char buf[65536];
-
-    // -------- ADMA receiver (v3.3.4) --------
-    adma::AdmaPacketDecoder adma_decoder(adma::ProtocolVersion::V334);
-    adma::AdmaUdpReceiver adma_receiver(
-        "192.168.1.20",
-        static_cast<uint16_t>(1021),
-        std::optional<std::string>{"192.168.1.55"});
-
-    float flex_SARA_06_SARA_Accel_X_010 = NAN, flex_SARA_06_SARA_Accel_Y_010 = NAN, flex_SARA_06_SARA_Omega_Z_010 = NAN;
-    float flex_SARA_10_SARA_Accel_X_b = NAN, flex_SARA_10_SARA_Accel_Y_b = NAN, flex_SARA_10_SARA_Omega_Z_b = NAN;
-    float flex_ESP_21_ESP_v_Signal = NAN;
-    uint8_t flex_ESP_21_ESP_Eingriff = 0;
-
-    float flex_LWI_01_LWI_Lenkradwinkel = NAN;
-    uint8_t flex_LWI_01_LWI_VZ_Lenkradwinkel = 0;
-    float flex_LWI_01_LWI_Lenkradw_Geschw = NAN;
-    uint8_t flex_LWI_01_LWI_VZ_Lenkradw_Geschw = 0;
-
-    float flex_LH_EPS_03_EPS_Lenkmoment = NAN;
-    uint8_t flex_LH_EPS_03_EPS_VZ_Lenkmoment = 0;
-    float flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = NAN;
-
-    float flex_Motor_20_MO_Fahrpedalrohwert_01 = NAN;
-    uint8_t flex_Bremse_EV_01_EBKV_Fahrer_bremst = 0;
-    float flex_Bremse_EV_01_EBKV_Bremspedalweg = NAN;
-    float flex_ESP_05_ESP_Bremsdruck = NAN;
-    uint8_t flex_Motor_14_MO_BLS = 0;
-
-    float flex_ESP_03_ESP_VL_Radgeschw = NAN, flex_ESP_03_ESP_VR_Radgeschw = NAN,
-        flex_ESP_03_ESP_HL_Radgeschw = NAN, flex_ESP_03_ESP_HR_Radgeschw = NAN;
-
-    double adma_ins_roll = NAN;
-    double adma_ins_pitch = NAN;
-    double adma_ins_yaw = NAN;
-
-    double adma_ins_vel_hor_x = NAN, adma_ins_vel_hor_y = NAN, adma_ins_vel_hor_z = NAN;
-    double adma_ins_vel_frame_x = NAN, adma_ins_vel_frame_y = NAN, adma_ins_vel_frame_z = NAN;
-    double adma_ins_vel_hor_poi1_x = NAN, adma_ins_vel_hor_poi1_y = NAN, adma_ins_vel_hor_poi1_z = NAN;
-    double adma_gnss_vel_frame_x = NAN, adma_gnss_vel_frame_y = NAN, adma_gnss_vel_frame_z = NAN;
-
-    double adma_acc_body_x = NAN, adma_acc_body_y = NAN, adma_acc_body_z = NAN;
-    double adma_acc_horizontal_x = NAN, adma_acc_horizontal_y = NAN, adma_acc_horizontal_z = NAN;
-    double adma_acc_body_poi1_x = NAN, adma_acc_body_poi1_y = NAN, adma_acc_body_poi1_z = NAN;
-    double adma_acc_horizontal_poi1_x = NAN, adma_acc_horizontal_poi1_y = NAN, adma_acc_horizontal_poi1_z = NAN;
-
-    double adma_rates_body_x = NAN, adma_rates_body_y = NAN, adma_rates_body_z = NAN;
-    double adma_rates_horizontal_x = NAN, adma_rates_horizontal_y = NAN, adma_rates_horizontal_z = NAN;
-
-    double adma_misc_side_slip_angle = NAN;
-    double adma_misc_distance_traveled = NAN;
-    double adma_misc_poi1_side_slip_angle = NAN;
-    double adma_misc_poi1_distance_traveled = NAN;
-
-    double adma_ins_pos_lat = NAN, adma_ins_pos_lon = NAN, adma_ins_height = NAN;
-    double adma_ins_pos_poi1_lat = NAN, adma_ins_pos_poi1_lon = NAN, adma_ins_height_poi1 = NAN;
-
-    int adma_gnss_sats_used = -1;
-    int adma_gnss_sats_visible = -1;
-    int adma_kf_status = -1;
-    int adma_kf_lat_stimulated = -1;
-    int adma_kf_long_stimulated = -1;
-    int adma_kf_steady_state = -1;
+    });
 
     uint64_t idx = 0;
+    uint64_t consumed_flex_seq = 0;
 
     while (true) {
-        if (!check_bus_nonblocking(pipeline)) {
-            std::cerr << "Stopping due to GStreamer error/EOS.\n";
-            break;
-        }
+        FlexSnapshot flex;
+        AdmaSnapshot adma;
+        CameraSnapshot cam;
 
-        int n = receiver.receive(buf, sizeof(buf));
-        if (n < 3) continue;
-
-        int cluster = buf[0];
-        const unsigned char* pdus = buf + 3;
-
-        timespec ts{};
-        clock_gettime(CLOCK_REALTIME, &ts);
-
-        flex_SARA_06_SARA_Accel_X_010 = NAN; flex_SARA_06_SARA_Accel_Y_010 = NAN; flex_SARA_06_SARA_Omega_Z_010 = NAN;
-        flex_SARA_10_SARA_Accel_X_b = NAN; flex_SARA_10_SARA_Accel_Y_b = NAN; flex_SARA_10_SARA_Omega_Z_b = NAN;
-        flex_ESP_21_ESP_v_Signal = NAN; flex_ESP_21_ESP_Eingriff = 0;
-        flex_LWI_01_LWI_Lenkradwinkel = NAN; flex_LWI_01_LWI_VZ_Lenkradwinkel = 0;
-        flex_LWI_01_LWI_Lenkradw_Geschw = NAN; flex_LWI_01_LWI_VZ_Lenkradw_Geschw = 0;
-        flex_LH_EPS_03_EPS_Lenkmoment = NAN; flex_LH_EPS_03_EPS_VZ_Lenkmoment = 0;
-        flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = NAN;
-        flex_Motor_20_MO_Fahrpedalrohwert_01 = NAN;
-        flex_Bremse_EV_01_EBKV_Fahrer_bremst = 0;
-        flex_Bremse_EV_01_EBKV_Bremspedalweg = NAN;
-        flex_ESP_05_ESP_Bremsdruck = NAN;
-        flex_Motor_14_MO_BLS = 0;
-        flex_ESP_03_ESP_VL_Radgeschw = NAN; flex_ESP_03_ESP_VR_Radgeschw = NAN;
-        flex_ESP_03_ESP_HL_Radgeschw = NAN; flex_ESP_03_ESP_HR_Radgeschw = NAN;
-
-        if (cluster >= 1 && cluster <= 64) {
-            const ClusterSignalOffsets& off = kClusterSignalOffsets[cluster];
-
-            if (off.sara06 >= 0) {
-                SARA_06 s06;
-                s06.decode(pdus + off.sara06);
-                flex_SARA_06_SARA_Accel_X_010 = s06.data().accel_x;
-                flex_SARA_06_SARA_Accel_Y_010 = s06.data().accel_y;
-                flex_SARA_06_SARA_Omega_Z_010 = s06.data().omega_z;
-            }
-
-            if (off.sara10 >= 0) {
-                SARA_10 s10;
-                s10.decode(pdus + off.sara10);
-                flex_SARA_10_SARA_Accel_X_b = s10.data().accel_x;
-                flex_SARA_10_SARA_Accel_Y_b = s10.data().accel_y;
-                flex_SARA_10_SARA_Omega_Z_b = s10.data().omega_z;
-            }
-
-            if (off.esp21 >= 0) {
-                ESP21 e;
-                e.decode(pdus + off.esp21);
-                flex_ESP_21_ESP_v_Signal = e.data().vehicle_speed;
-                flex_ESP_21_ESP_Eingriff = e.data().esp_intervention;
-            }
-
-            if (off.esp03 >= 0) {
-                ESP03 e3;
-                e3.decode(pdus + off.esp03);
-                flex_ESP_03_ESP_VL_Radgeschw = e3.data().wheel_speed_fl;
-                flex_ESP_03_ESP_VR_Radgeschw = e3.data().wheel_speed_fr;
-                flex_ESP_03_ESP_HL_Radgeschw = e3.data().wheel_speed_rl;
-                flex_ESP_03_ESP_HR_Radgeschw = e3.data().wheel_speed_rr;
-            }
-
-            if (off.esp05 >= 0) {
-                ESP05 e5;
-                e5.decode(pdus + off.esp05);
-                flex_ESP_05_ESP_Bremsdruck = e5.data().brake_pressure;
-            }
-
-            if (off.lwi01 >= 0) {
-                LWI01 lwi;
-                lwi.decode(pdus + off.lwi01);
-                flex_LWI_01_LWI_Lenkradwinkel = lwi.angle;
-                flex_LWI_01_LWI_VZ_Lenkradwinkel = lwi.angle_sign;
-                flex_LWI_01_LWI_Lenkradw_Geschw = lwi.speed;
-                flex_LWI_01_LWI_VZ_Lenkradw_Geschw = lwi.speed_sign;
-            }
-
-            if (off.lheps03 >= 0) {
-                LHEPS03 eps;
-                eps.decode(pdus + off.lheps03);
-                flex_LH_EPS_03_EPS_Lenkmoment = eps.data().steering_torque;
-                flex_LH_EPS_03_EPS_VZ_Lenkmoment = eps.data().steering_torque_sign;
-            }
-
-            if (off.klima_sensor_02 >= 0) {
-                KlimaSensor02 k;
-                k.decode(pdus + off.klima_sensor_02);
-                flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef = k.data().external_temperature;
-            }
-
-            if (off.motor20 >= 0) {
-                Motor20 m20;
-                m20.decode(pdus + off.motor20);
-                flex_Motor_20_MO_Fahrpedalrohwert_01 = m20.data().gas_percent;
-            }
-
-            if (off.bremse_ev01 >= 0) {
-                BrakeEV01 br;
-                br.decode(pdus + off.bremse_ev01);
-                flex_Bremse_EV_01_EBKV_Fahrer_bremst = br.driver_brakes;
-                flex_Bremse_EV_01_EBKV_Bremspedalweg = br.pedal_position;
-            }
-
-            if (off.motor14 >= 0) {
-                Motor14 m14;
-                m14.decode(pdus + off.motor14);
-                flex_Motor_14_MO_BLS = m14.data().mo_bls;
-            }
-        }
-
-        if (cluster < 1 || cluster > 64) continue;
-
-        try {
-            const auto adma_payload = adma_receiver.receive();
-            const auto decoded = adma_decoder.decode(adma_payload);
-
-            if (decoded.v334.has_value()) {
-                const auto& adma_packet = decoded.v334.value();
-                adma_ins_roll = static_cast<double>(adma_packet.insroll) * 0.01;
-                adma_ins_pitch = static_cast<double>(adma_packet.inspitch) * 0.01;
-                adma_ins_yaw = static_cast<double>(adma_packet.insyaw) * 0.01;
-
-                adma_ins_vel_hor_x = static_cast<double>(adma_packet.insVelHor.x) * 0.005;
-                adma_ins_vel_hor_y = static_cast<double>(adma_packet.insVelHor.y) * 0.005;
-                adma_ins_vel_hor_z = static_cast<double>(adma_packet.insVelHor.z) * 0.005;
-
-                adma_ins_vel_frame_x = static_cast<double>(adma_packet.insVelFrame.x) * 0.005;
-                adma_ins_vel_frame_y = static_cast<double>(adma_packet.insVelFrame.y) * 0.005;
-                adma_ins_vel_frame_z = static_cast<double>(adma_packet.insVelFrame.z) * 0.005;
-
-                adma_ins_vel_hor_poi1_x = static_cast<double>(adma_packet.insVelHorPOI[0].x) * 0.005;
-                adma_ins_vel_hor_poi1_y = static_cast<double>(adma_packet.insVelHorPOI[0].y) * 0.005;
-                adma_ins_vel_hor_poi1_z = static_cast<double>(adma_packet.insVelHorPOI[0].z) * 0.005;
-
-                adma_gnss_vel_frame_x = static_cast<double>(adma_packet.gnssvelframex) * 0.005;
-                adma_gnss_vel_frame_y = static_cast<double>(adma_packet.gnssvelframey) * 0.005;
-                adma_gnss_vel_frame_z = static_cast<double>(adma_packet.gnssvelframez) * 0.005;
-
-                adma_acc_body_x = static_cast<double>(adma_packet.accBody.x) * 0.0004;
-                adma_acc_body_y = static_cast<double>(adma_packet.accBody.y) * 0.0004;
-                adma_acc_body_z = static_cast<double>(adma_packet.accBody.z) * 0.0004;
-
-                adma_acc_horizontal_x = static_cast<double>(adma_packet.accHorizontal.x) * 0.0004;
-                adma_acc_horizontal_y = static_cast<double>(adma_packet.accHorizontal.y) * 0.0004;
-                adma_acc_horizontal_z = static_cast<double>(adma_packet.accHorizontal.z) * 0.0004;
-
-                adma_acc_body_poi1_x = static_cast<double>(adma_packet.accBodyPOI[0].x) * 0.0004;
-                adma_acc_body_poi1_y = static_cast<double>(adma_packet.accBodyPOI[0].y) * 0.0004;
-                adma_acc_body_poi1_z = static_cast<double>(adma_packet.accBodyPOI[0].z) * 0.0004;
-
-                adma_acc_horizontal_poi1_x = static_cast<double>(adma_packet.accHorizontalPOI[0].x) * 0.0004;
-                adma_acc_horizontal_poi1_y = static_cast<double>(adma_packet.accHorizontalPOI[0].y) * 0.0004;
-                adma_acc_horizontal_poi1_z = static_cast<double>(adma_packet.accHorizontalPOI[0].z) * 0.0004;
-
-                adma_rates_body_x = static_cast<double>(adma_packet.ratesBody.x);
-                adma_rates_body_y = static_cast<double>(adma_packet.ratesBody.y);
-                adma_rates_body_z = static_cast<double>(adma_packet.ratesBody.z);
-
-                adma_rates_horizontal_x = static_cast<double>(adma_packet.ratesHorizontal.x);
-                adma_rates_horizontal_y = static_cast<double>(adma_packet.ratesHorizontal.y);
-                adma_rates_horizontal_z = static_cast<double>(adma_packet.ratesHorizontal.z);
-
-                adma_misc_side_slip_angle = static_cast<double>(adma_packet.misc.sideSlipAngle);
-                adma_misc_distance_traveled = static_cast<double>(adma_packet.misc.distanceTraveled);
-                adma_misc_poi1_side_slip_angle = static_cast<double>(adma_packet.miscPOI[0].sideSlipAngle);
-                adma_misc_poi1_distance_traveled = static_cast<double>(adma_packet.miscPOI[0].distanceTraveled);
-
-                adma_ins_pos_lat = static_cast<double>(adma_packet.insPos.pos_abs.latitude);
-                adma_ins_pos_lon = static_cast<double>(adma_packet.insPos.pos_abs.longitude);
-                adma_ins_height = static_cast<double>(adma_packet.insHeight);
-
-                adma_ins_pos_poi1_lat = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.latitude);
-                adma_ins_pos_poi1_lon = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.longitude);
-                adma_ins_height_poi1 = static_cast<double>(adma_packet.insHeightPOI[0]);
-
-                adma_gnss_sats_used = static_cast<int>(adma_packet.gnsssatsused);
-                adma_gnss_sats_visible = static_cast<int>(adma_packet.gnsssatsvisible);
-
-                adma_kf_status = static_cast<int>(adma_packet.kfStatus);
-                adma_kf_lat_stimulated = static_cast<int>(adma_packet.kflatstimulated);
-                adma_kf_long_stimulated = static_cast<int>(adma_packet.kflongstimulated);
-                adma_kf_steady_state = static_cast<int>(adma_packet.kfsteadystate);
-            }
-        } catch (const std::exception& ex) {
-            std::cerr << "WARN: ADMA receive/decode failed: " << ex.what() << "\n";
-            adma_ins_roll = NAN;
-            adma_ins_pitch = NAN;
-            adma_ins_yaw = NAN;
-
-            adma_ins_vel_hor_x = NAN; adma_ins_vel_hor_y = NAN; adma_ins_vel_hor_z = NAN;
-            adma_ins_vel_frame_x = NAN; adma_ins_vel_frame_y = NAN; adma_ins_vel_frame_z = NAN;
-            adma_ins_vel_hor_poi1_x = NAN; adma_ins_vel_hor_poi1_y = NAN; adma_ins_vel_hor_poi1_z = NAN;
-            adma_gnss_vel_frame_x = NAN; adma_gnss_vel_frame_y = NAN; adma_gnss_vel_frame_z = NAN;
-
-            adma_acc_body_x = NAN; adma_acc_body_y = NAN; adma_acc_body_z = NAN;
-            adma_acc_horizontal_x = NAN; adma_acc_horizontal_y = NAN; adma_acc_horizontal_z = NAN;
-            adma_acc_body_poi1_x = NAN; adma_acc_body_poi1_y = NAN; adma_acc_body_poi1_z = NAN;
-            adma_acc_horizontal_poi1_x = NAN; adma_acc_horizontal_poi1_y = NAN; adma_acc_horizontal_poi1_z = NAN;
-
-            adma_rates_body_x = NAN; adma_rates_body_y = NAN; adma_rates_body_z = NAN;
-            adma_rates_horizontal_x = NAN; adma_rates_horizontal_y = NAN; adma_rates_horizontal_z = NAN;
-
-            adma_misc_side_slip_angle = NAN;
-            adma_misc_distance_traveled = NAN;
-            adma_misc_poi1_side_slip_angle = NAN;
-            adma_misc_poi1_distance_traveled = NAN;
-
-            adma_ins_pos_lat = NAN; adma_ins_pos_lon = NAN; adma_ins_height = NAN;
-            adma_ins_pos_poi1_lat = NAN; adma_ins_pos_poi1_lon = NAN; adma_ins_height_poi1 = NAN;
-
-            adma_gnss_sats_used = -1;
-            adma_gnss_sats_visible = -1;
-            adma_kf_status = -1;
-            adma_kf_lat_stimulated = -1;
-            adma_kf_long_stimulated = -1;
-            adma_kf_steady_state = -1;
+        {
+            std::unique_lock<std::mutex> lk(shared.mtx);
+            shared.cv.wait(lk, [&]() { return shared.flex_seq != consumed_flex_seq; });
+            consumed_flex_seq = shared.flex_seq;
+            flex = shared.flex;
+            adma = shared.adma;
+            cam = shared.camera;
         }
 
         ++idx;
 
-        char img_path[256];
-        std::snprintf(img_path, sizeof(img_path), "log/images/%06llu.jpg",
-                      (unsigned long long)idx);
-
-        if (!save_one_jpeg_from_appsink(appsink, img_path)) {
-            std::cerr << "WARN: failed to grab/save jpeg at idx=" << idx << "\n";
-            continue;
-        }
-
-        print_line(cluster,
-                   flex_SARA_10_SARA_Accel_X_b,
-                   flex_SARA_10_SARA_Accel_Y_b,
-                   NAN,
-                   NAN,
-                   NAN,
-                   flex_SARA_10_SARA_Omega_Z_b,
-                   flex_LWI_01_LWI_Lenkradwinkel,
-                   flex_LWI_01_LWI_Lenkradw_Geschw,
-                   flex_Motor_20_MO_Fahrpedalrohwert_01,
-                   flex_Bremse_EV_01_EBKV_Bremspedalweg,
-                   flex_ESP_21_ESP_v_Signal,
-                   ts);
+        print_line(flex.cluster,
+                   flex.flex_SARA_10_SARA_Accel_X_b,
+                   flex.flex_SARA_10_SARA_Accel_Y_b,
+                   qnanf(),
+                   qnanf(),
+                   qnanf(),
+                   flex.flex_SARA_10_SARA_Omega_Z_b,
+                   flex.flex_LWI_01_LWI_Lenkradwinkel,
+                   flex.flex_LWI_01_LWI_Lenkradw_Geschw,
+                   flex.flex_Motor_20_MO_Fahrpedalrohwert_01,
+                   flex.flex_Bremse_EV_01_EBKV_Bremspedalweg,
+                   flex.flex_ESP_21_ESP_v_Signal,
+                   flex.ts);
 
         csv << idx << ","
-            << ts.tv_sec << "," << ts.tv_nsec << ","
-            << cluster << ","
-            << flex_ESP_21_ESP_v_Signal << ","
-            << flex_SARA_06_SARA_Accel_X_010 << "," << flex_SARA_10_SARA_Accel_X_b << ","
-            << flex_SARA_06_SARA_Accel_Y_010 << "," << flex_SARA_10_SARA_Accel_Y_b << ","
-            << flex_SARA_06_SARA_Omega_Z_010 << "," << flex_SARA_10_SARA_Omega_Z_b << ","
-            << flex_LWI_01_LWI_Lenkradwinkel << "," << static_cast<unsigned>(flex_LWI_01_LWI_VZ_Lenkradwinkel) << ","
-            << flex_LWI_01_LWI_Lenkradw_Geschw << "," << static_cast<unsigned>(flex_LWI_01_LWI_VZ_Lenkradw_Geschw) << ","
-            << flex_LH_EPS_03_EPS_Lenkmoment << "," << static_cast<unsigned>(flex_LH_EPS_03_EPS_VZ_Lenkmoment) << ","
-            << flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef << ","
-            << flex_Motor_20_MO_Fahrpedalrohwert_01 << "," << static_cast<unsigned>(flex_Bremse_EV_01_EBKV_Fahrer_bremst) << ","
-            << flex_Bremse_EV_01_EBKV_Bremspedalweg << "," << flex_ESP_05_ESP_Bremsdruck << ","
-            << static_cast<unsigned>(flex_Motor_14_MO_BLS) << ","
-            << flex_ESP_03_ESP_VL_Radgeschw << "," << flex_ESP_03_ESP_VR_Radgeschw << ","
-            << flex_ESP_03_ESP_HL_Radgeschw << "," << flex_ESP_03_ESP_HR_Radgeschw << ","
-            << static_cast<unsigned>(flex_ESP_21_ESP_Eingriff) << ","
-            << adma_ins_vel_hor_x << "," << adma_ins_vel_hor_y << "," << adma_ins_vel_hor_z << ","
-            << adma_ins_vel_frame_x << "," << adma_ins_vel_frame_y << "," << adma_ins_vel_frame_z << ","
-            << adma_ins_vel_hor_poi1_x << "," << adma_ins_vel_hor_poi1_y << "," << adma_ins_vel_hor_poi1_z << ","
-            << adma_gnss_vel_frame_x << "," << adma_gnss_vel_frame_y << "," << adma_gnss_vel_frame_z << ","
-            << adma_acc_body_x << "," << adma_acc_body_y << "," << adma_acc_body_z << ","
-            << adma_acc_horizontal_x << "," << adma_acc_horizontal_y << "," << adma_acc_horizontal_z << ","
-            << adma_acc_body_poi1_x << "," << adma_acc_body_poi1_y << "," << adma_acc_body_poi1_z << ","
-            << adma_acc_horizontal_poi1_x << "," << adma_acc_horizontal_poi1_y << "," << adma_acc_horizontal_poi1_z << ","
-            << adma_ins_roll << "," << adma_ins_pitch << "," << adma_ins_yaw << ","
-            << adma_rates_body_x << "," << adma_rates_body_y << "," << adma_rates_body_z << ","
-            << adma_rates_horizontal_x << "," << adma_rates_horizontal_y << "," << adma_rates_horizontal_z << ","
-            << adma_misc_side_slip_angle << "," << adma_misc_distance_traveled << ","
-            << adma_misc_poi1_side_slip_angle << "," << adma_misc_poi1_distance_traveled << ","
-            << adma_ins_pos_lat << "," << adma_ins_pos_lon << "," << adma_ins_height << ","
-            << adma_ins_pos_poi1_lat << "," << adma_ins_pos_poi1_lon << "," << adma_ins_height_poi1 << ","
-            << adma_gnss_sats_used << "," << adma_gnss_sats_visible << ","
-            << adma_kf_status << "," << adma_kf_lat_stimulated << "," << adma_kf_long_stimulated << "," << adma_kf_steady_state << ","
-            << img_path << "\n";
+            << flex.ts.tv_sec << "," << flex.ts.tv_nsec << ","
+            << flex.cluster << ","
+            << flex.flex_ESP_21_ESP_v_Signal << ","
+            << flex.flex_SARA_06_SARA_Accel_X_010 << "," << flex.flex_SARA_10_SARA_Accel_X_b << ","
+            << flex.flex_SARA_06_SARA_Accel_Y_010 << "," << flex.flex_SARA_10_SARA_Accel_Y_b << ","
+            << flex.flex_SARA_06_SARA_Omega_Z_010 << "," << flex.flex_SARA_10_SARA_Omega_Z_b << ","
+            << flex.flex_LWI_01_LWI_Lenkradwinkel << "," << static_cast<unsigned>(flex.flex_LWI_01_LWI_VZ_Lenkradwinkel) << ","
+            << flex.flex_LWI_01_LWI_Lenkradw_Geschw << "," << static_cast<unsigned>(flex.flex_LWI_01_LWI_VZ_Lenkradw_Geschw) << ","
+            << flex.flex_LH_EPS_03_EPS_Lenkmoment << "," << static_cast<unsigned>(flex.flex_LH_EPS_03_EPS_VZ_Lenkmoment) << ","
+            << flex.flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef << ","
+            << flex.flex_Motor_20_MO_Fahrpedalrohwert_01 << "," << static_cast<unsigned>(flex.flex_Bremse_EV_01_EBKV_Fahrer_bremst) << ","
+            << flex.flex_Bremse_EV_01_EBKV_Bremspedalweg << "," << flex.flex_ESP_05_ESP_Bremsdruck << ","
+            << static_cast<unsigned>(flex.flex_Motor_14_MO_BLS) << ","
+            << flex.flex_ESP_03_ESP_VL_Radgeschw << "," << flex.flex_ESP_03_ESP_VR_Radgeschw << ","
+            << flex.flex_ESP_03_ESP_HL_Radgeschw << "," << flex.flex_ESP_03_ESP_HR_Radgeschw << ","
+            << static_cast<unsigned>(flex.flex_ESP_21_ESP_Eingriff) << ","
+            << adma.adma_ins_vel_hor_x << "," << adma.adma_ins_vel_hor_y << "," << adma.adma_ins_vel_hor_z << ","
+            << adma.adma_ins_vel_frame_x << "," << adma.adma_ins_vel_frame_y << "," << adma.adma_ins_vel_frame_z << ","
+            << adma.adma_ins_vel_hor_poi1_x << "," << adma.adma_ins_vel_hor_poi1_y << "," << adma.adma_ins_vel_hor_poi1_z << ","
+            << adma.adma_gnss_vel_frame_x << "," << adma.adma_gnss_vel_frame_y << "," << adma.adma_gnss_vel_frame_z << ","
+            << adma.adma_acc_body_x << "," << adma.adma_acc_body_y << "," << adma.adma_acc_body_z << ","
+            << adma.adma_acc_horizontal_x << "," << adma.adma_acc_horizontal_y << "," << adma.adma_acc_horizontal_z << ","
+            << adma.adma_acc_body_poi1_x << "," << adma.adma_acc_body_poi1_y << "," << adma.adma_acc_body_poi1_z << ","
+            << adma.adma_acc_horizontal_poi1_x << "," << adma.adma_acc_horizontal_poi1_y << "," << adma.adma_acc_horizontal_poi1_z << ","
+            << adma.adma_ins_roll << "," << adma.adma_ins_pitch << "," << adma.adma_ins_yaw << ","
+            << adma.adma_rates_body_x << "," << adma.adma_rates_body_y << "," << adma.adma_rates_body_z << ","
+            << adma.adma_rates_horizontal_x << "," << adma.adma_rates_horizontal_y << "," << adma.adma_rates_horizontal_z << ","
+            << adma.adma_misc_side_slip_angle << "," << adma.adma_misc_distance_traveled << ","
+            << adma.adma_misc_poi1_side_slip_angle << "," << adma.adma_misc_poi1_distance_traveled << ","
+            << adma.adma_ins_pos_lat << "," << adma.adma_ins_pos_lon << "," << adma.adma_ins_height << ","
+            << adma.adma_ins_pos_poi1_lat << "," << adma.adma_ins_pos_poi1_lon << "," << adma.adma_ins_height_poi1 << ","
+            << adma.adma_gnss_sats_used << "," << adma.adma_gnss_sats_visible << ","
+            << adma.adma_kf_status << "," << adma.adma_kf_lat_stimulated << "," << adma.adma_kf_long_stimulated << "," << adma.adma_kf_steady_state << ","
+            << cam.image_path << "\n";
         csv.flush();
     }
 
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(sink_elem);
-    gst_object_unref(pipeline);
+    flex_thread.join();
+    adma_thread.join();
+    camera_thread.join();
     return 0;
 }
