@@ -50,11 +50,13 @@
 #include "SARA_06.hpp"
 
 static inline void print_line(
-    int cluster,
-    float ax, float ay, float az,
-    float ox, float oy, float oz,
-    float steer, float steer_spd,
-    float gas, float brake, float v,
+    int adma_kf_status,
+    int adma_kf_lat_stimulated,
+    int adma_kf_long_stimulated,
+    int adma_kf_steady_state,
+    double adma_ins_vel_hor_x,
+    double adma_ins_vel_hor_y,
+    double adma_acc_body_y,
     const timespec& ts)
 {
     std::tm tm_local{};
@@ -64,15 +66,19 @@ static inline void print_line(
     std::strftime(tb, sizeof(tb), "%H:%M:%S", &tm_local);
     long ms = ts.tv_nsec / 1000000;
 
+    const double vel_res = std::sqrt(
+        adma_ins_vel_hor_x * adma_ins_vel_hor_x +
+        adma_ins_vel_hor_y * adma_ins_vel_hor_y);
+
     std::cout << std::fixed << std::setprecision(3)
               << "[" << tb << "." << std::setw(3) << std::setfill('0') << ms
               << std::setfill(' ') << "] "
-              << "C" << cluster
-              << " | ax=" << ax << " ay=" << ay << " az=" << az
-              << " | ox=" << ox << " oy=" << oy << " oz=" << oz
-              << " | steer=" << steer << " spd=" << steer_spd
-              << " | gas=" << gas << " brake=" << brake
-              << " v=" << v
+              << "\n | kf_status=" << adma_kf_status
+              << "\n | kf_lat_stim=" << adma_kf_lat_stimulated
+              << "\n | kf_long_stim=" << adma_kf_long_stimulated
+              << "\n | kf_steady=" << adma_kf_steady_state
+              << "\n | vel_xy_res=" << vel_res
+              << "\n | acc_body_y=" << adma_acc_body_y
               << "\n";
 }
 
@@ -849,18 +855,13 @@ int main(int argc, char** argv)
 
         ++idx;
 
-        print_line(flex.cluster,
-                   flex.flex_SARA_10_SARA_Accel_X_b,
-                   flex.flex_SARA_10_SARA_Accel_Y_b,
-                   qnanf(),
-                   qnanf(),
-                   qnanf(),
-                   flex.flex_SARA_10_SARA_Omega_Z_b,
-                   flex.flex_LWI_01_LWI_Lenkradwinkel,
-                   flex.flex_LWI_01_LWI_Lenkradw_Geschw,
-                   flex.flex_Motor_20_MO_Fahrpedalrohwert_01,
-                   flex.flex_Bremse_EV_01_EBKV_Bremspedalweg,
-                   flex.flex_ESP_21_ESP_v_Signal,
+        print_line(adma.adma_kf_status,
+               adma.adma_kf_lat_stimulated,
+               adma.adma_kf_long_stimulated,
+               adma.adma_kf_steady_state,
+               adma.adma_ins_vel_hor_x,
+               adma.adma_ins_vel_hor_y,
+               adma.adma_acc_body_y,
                    flex.ts);
 
         csv << idx << ","
