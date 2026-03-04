@@ -391,6 +391,54 @@ static inline timespec now_realtime()
     return ts;
 }
 
+static std::filesystem::path create_run_log_dir()
+{
+    namespace fs = std::filesystem;
+
+    const fs::path base_log_dir("log");
+    fs::create_directories(base_log_dir);
+
+    int next_log_index = 1;
+    for (const auto& entry : fs::directory_iterator(base_log_dir)) {
+        if (!entry.is_directory()) continue;
+
+        const std::string name = entry.path().filename().string();
+        const std::size_t marker_pos = name.rfind("_log_");
+        if (marker_pos == std::string::npos) continue;
+
+        const std::string index_str = name.substr(marker_pos + 5);
+        if (index_str.empty()) continue;
+
+        bool all_digits = true;
+        for (const char c : index_str) {
+            if (c < '0' || c > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (!all_digits) continue;
+
+        const int existing_index = std::stoi(index_str);
+        if (existing_index >= next_log_index) {
+            next_log_index = existing_index + 1;
+        }
+    }
+
+    const timespec ts = now_realtime();
+    std::tm tm_local{};
+    localtime_r(&ts.tv_sec, &tm_local);
+
+    char time_buf[32];
+    std::strftime(time_buf, sizeof(time_buf), "%Y%m%d_%H%M", &tm_local);
+
+    std::ostringstream run_name;
+    run_name << time_buf << "_log_" << next_log_index;
+
+    const fs::path run_dir = base_log_dir / run_name.str();
+    fs::create_directories(run_dir / "images");
+    return run_dir;
+}
+
 static inline float qnanf()
 {
     return 0.0f;
@@ -584,12 +632,15 @@ static bool decode_flex_packet(const unsigned char* buf, int n, const FlexSnapsh
 int main(int argc, char** argv)
 {
     // -------- Output folders --------
-    std::filesystem::create_directories("log/images");
+    const std::filesystem::path run_log_dir = create_run_log_dir();
+    const std::filesystem::path images_dir = run_log_dir / "images";
+    const std::filesystem::path telemetry_csv_path = run_log_dir / "telemetry.csv";
+    std::cerr << "Run log directory: " << run_log_dir.string() << "\n";
 
     // -------- CSV log --------
-    std::ofstream csv("log/telemetry.csv");
+    std::ofstream csv(telemetry_csv_path.string());
     if (!csv) {
-        std::cerr << "ERROR: cannot open log/telemetry.csv\n";
+        std::cerr << "ERROR: cannot open " << telemetry_csv_path.string() << "\n";
         return 1;
     }
     csv << "idx,unix_sec,unix_nsec,cluster,"
@@ -765,7 +816,7 @@ int main(int argc, char** argv)
         }
     });
 
-    std::thread camera_thread([&shared, &opts]() {
+    std::thread camera_thread([&shared, &opts, &images_dir]() {
         const std::string pipeline_desc = build_pipeline(opts);
         std::cerr << "pipeline:\n  " << pipeline_desc << "\n";
 
@@ -808,11 +859,12 @@ int main(int argc, char** argv)
             if (!sample) continue;
 
             ++cam_idx;
-            char img_path[256];
-            std::snprintf(img_path, sizeof(img_path), "log/images/%06llu.jpg",
+            char img_name[32];
+            std::snprintf(img_name, sizeof(img_name), "%06llu.jpg",
                           static_cast<unsigned long long>(cam_idx));
+            const std::filesystem::path img_path = images_dir / img_name;
 
-            if (!save_jpeg_from_sample(sample, img_path)) {
+            if (!save_jpeg_from_sample(sample, img_path.string().c_str())) {
                 std::cerr << "WARN: failed to save camera frame idx=" << cam_idx << "\n";
                 gst_sample_unref(sample);
                 continue;
@@ -820,7 +872,7 @@ int main(int argc, char** argv)
 
             CameraSnapshot cam;
             cam.ts = now_realtime();
-            cam.image_path = img_path;
+            cam.image_path = img_path.string();
             cam.frame_idx = cam_idx;
 
             {
