@@ -433,12 +433,15 @@ struct AdmaSnapshot {
     double adma_ins_vel_hor_x = qnand(), adma_ins_vel_hor_y = qnand(), adma_ins_vel_hor_z = qnand();
     double adma_ins_vel_frame_x = qnand(), adma_ins_vel_frame_y = qnand(), adma_ins_vel_frame_z = qnand();
     double adma_ins_vel_hor_poi1_x = qnand(), adma_ins_vel_hor_poi1_y = qnand(), adma_ins_vel_hor_poi1_z = qnand();
+    double adma_ins_vel_hor_poi2_x = qnand(), adma_ins_vel_hor_poi2_y = qnand(), adma_ins_vel_hor_poi2_z = qnand();
     double adma_gnss_vel_frame_x = qnand(), adma_gnss_vel_frame_y = qnand(), adma_gnss_vel_frame_z = qnand();
 
     double adma_acc_body_x = qnand(), adma_acc_body_y = qnand(), adma_acc_body_z = qnand();
     double adma_acc_horizontal_x = qnand(), adma_acc_horizontal_y = qnand(), adma_acc_horizontal_z = qnand();
     double adma_acc_body_poi1_x = qnand(), adma_acc_body_poi1_y = qnand(), adma_acc_body_poi1_z = qnand();
+    double adma_acc_body_poi2_x = qnand(), adma_acc_body_poi2_y = qnand(), adma_acc_body_poi2_z = qnand();
     double adma_acc_horizontal_poi1_x = qnand(), adma_acc_horizontal_poi1_y = qnand(), adma_acc_horizontal_poi1_z = qnand();
+    double adma_acc_horizontal_poi2_x = qnand(), adma_acc_horizontal_poi2_y = qnand(), adma_acc_horizontal_poi2_z = qnand();
 
     double adma_rates_body_x = qnand(), adma_rates_body_y = qnand(), adma_rates_body_z = qnand();
     double adma_rates_horizontal_x = qnand(), adma_rates_horizontal_y = qnand(), adma_rates_horizontal_z = qnand();
@@ -447,9 +450,12 @@ struct AdmaSnapshot {
     double adma_misc_distance_traveled = qnand();
     double adma_misc_poi1_side_slip_angle = qnand();
     double adma_misc_poi1_distance_traveled = qnand();
+    double adma_misc_poi2_side_slip_angle = qnand();
+    double adma_misc_poi2_distance_traveled = qnand();
 
     double adma_ins_pos_lat = qnand(), adma_ins_pos_lon = qnand(), adma_ins_height = qnand();
     double adma_ins_pos_poi1_lat = qnand(), adma_ins_pos_poi1_lon = qnand(), adma_ins_height_poi1 = qnand();
+    double adma_ins_pos_poi2_lat = qnand(), adma_ins_pos_poi2_lon = qnand(), adma_ins_height_poi2 = qnand();
 
     int adma_gnss_sats_used = -1;
     int adma_gnss_sats_visible = -1;
@@ -593,18 +599,23 @@ int main(int argc, char** argv)
             "adma_ins_vel_hor_x,adma_ins_vel_hor_y,adma_ins_vel_hor_z,"
             "adma_ins_vel_frame_x,adma_ins_vel_frame_y,adma_ins_vel_frame_z,"
             "adma_ins_vel_hor_poi1_x,adma_ins_vel_hor_poi1_y,adma_ins_vel_hor_poi1_z,"
+            "adma_ins_vel_hor_poi2_x,adma_ins_vel_hor_poi2_y,adma_ins_vel_hor_poi2_z,"
             "adma_gnss_vel_frame_x,adma_gnss_vel_frame_y,adma_gnss_vel_frame_z,"
             "adma_acc_body_x,adma_acc_body_y,adma_acc_body_z,"
             "adma_acc_horizontal_x,adma_acc_horizontal_y,adma_acc_horizontal_z,"
             "adma_acc_body_poi1_x,adma_acc_body_poi1_y,adma_acc_body_poi1_z,"
+            "adma_acc_body_poi2_x,adma_acc_body_poi2_y,adma_acc_body_poi2_z,"
             "adma_acc_horizontal_poi1_x,adma_acc_horizontal_poi1_y,adma_acc_horizontal_poi1_z,"
+            "adma_acc_horizontal_poi2_x,adma_acc_horizontal_poi2_y,adma_acc_horizontal_poi2_z,"
             "adma_ins_roll,adma_ins_pitch,adma_ins_yaw,"
             "adma_rates_body_x,adma_rates_body_y,adma_rates_body_z,"
             "adma_rates_horizontal_x,adma_rates_horizontal_y,adma_rates_horizontal_z,"
             "adma_misc_side_slip_angle,adma_misc_distance_traveled,"
             "adma_misc_poi1_side_slip_angle,adma_misc_poi1_distance_traveled,"
+            "adma_misc_poi2_side_slip_angle,adma_misc_poi2_distance_traveled,"
             "adma_ins_pos_lat,adma_ins_pos_lon,adma_ins_height,"
             "adma_ins_pos_poi1_lat,adma_ins_pos_poi1_lon,adma_ins_height_poi1,"
+            "adma_ins_pos_poi2_lat,adma_ins_pos_poi2_lon,adma_ins_height_poi2,"
             "adma_gnss_sats_used,adma_gnss_sats_visible,"
             "adma_kf_status,adma_kf_lat_stimulated,adma_kf_long_stimulated,adma_kf_steady_state,"
             "image\n";
@@ -675,6 +686,9 @@ int main(int argc, char** argv)
                 snap.adma_ins_vel_hor_poi1_x = static_cast<double>(adma_packet.insVelHorPOI[0].x) * 0.005;
                 snap.adma_ins_vel_hor_poi1_y = static_cast<double>(adma_packet.insVelHorPOI[0].y) * 0.005;
                 snap.adma_ins_vel_hor_poi1_z = static_cast<double>(adma_packet.insVelHorPOI[0].z) * 0.005;
+                snap.adma_ins_vel_hor_poi2_x = static_cast<double>(adma_packet.insVelHorPOI[1].x) * 0.005;
+                snap.adma_ins_vel_hor_poi2_y = static_cast<double>(adma_packet.insVelHorPOI[1].y) * 0.005;
+                snap.adma_ins_vel_hor_poi2_z = static_cast<double>(adma_packet.insVelHorPOI[1].z) * 0.005;
 
                 snap.adma_gnss_vel_frame_x = static_cast<double>(adma_packet.gnssvelframex) * 0.005;
                 snap.adma_gnss_vel_frame_y = static_cast<double>(adma_packet.gnssvelframey) * 0.005;
@@ -691,10 +705,16 @@ int main(int argc, char** argv)
                 snap.adma_acc_body_poi1_x = static_cast<double>(adma_packet.accBodyPOI[0].x) * 0.0004;
                 snap.adma_acc_body_poi1_y = static_cast<double>(adma_packet.accBodyPOI[0].y) * 0.0004;
                 snap.adma_acc_body_poi1_z = static_cast<double>(adma_packet.accBodyPOI[0].z) * 0.0004;
+                snap.adma_acc_body_poi2_x = static_cast<double>(adma_packet.accBodyPOI[1].x) * 0.0004;
+                snap.adma_acc_body_poi2_y = static_cast<double>(adma_packet.accBodyPOI[1].y) * 0.0004;
+                snap.adma_acc_body_poi2_z = static_cast<double>(adma_packet.accBodyPOI[1].z) * 0.0004;
 
                 snap.adma_acc_horizontal_poi1_x = static_cast<double>(adma_packet.accHorizontalPOI[0].x) * 0.0004;
                 snap.adma_acc_horizontal_poi1_y = static_cast<double>(adma_packet.accHorizontalPOI[0].y) * 0.0004;
                 snap.adma_acc_horizontal_poi1_z = static_cast<double>(adma_packet.accHorizontalPOI[0].z) * 0.0004;
+                snap.adma_acc_horizontal_poi2_x = static_cast<double>(adma_packet.accHorizontalPOI[1].x) * 0.0004;
+                snap.adma_acc_horizontal_poi2_y = static_cast<double>(adma_packet.accHorizontalPOI[1].y) * 0.0004;
+                snap.adma_acc_horizontal_poi2_z = static_cast<double>(adma_packet.accHorizontalPOI[1].z) * 0.0004;
 
                 snap.adma_rates_body_x = static_cast<double>(adma_packet.ratesBody.x);
                 snap.adma_rates_body_y = static_cast<double>(adma_packet.ratesBody.y);
@@ -708,6 +728,8 @@ int main(int argc, char** argv)
                 snap.adma_misc_distance_traveled = static_cast<double>(adma_packet.misc.distanceTraveled);
                 snap.adma_misc_poi1_side_slip_angle = static_cast<double>(adma_packet.miscPOI[0].sideSlipAngle);
                 snap.adma_misc_poi1_distance_traveled = static_cast<double>(adma_packet.miscPOI[0].distanceTraveled);
+                snap.adma_misc_poi2_side_slip_angle = static_cast<double>(adma_packet.miscPOI[1].sideSlipAngle);
+                snap.adma_misc_poi2_distance_traveled = static_cast<double>(adma_packet.miscPOI[1].distanceTraveled);
 
                 snap.adma_ins_pos_lat = static_cast<double>(adma_packet.insPos.pos_abs.latitude);
                 snap.adma_ins_pos_lon = static_cast<double>(adma_packet.insPos.pos_abs.longitude);
@@ -716,6 +738,9 @@ int main(int argc, char** argv)
                 snap.adma_ins_pos_poi1_lat = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.latitude);
                 snap.adma_ins_pos_poi1_lon = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.longitude);
                 snap.adma_ins_height_poi1 = static_cast<double>(adma_packet.insHeightPOI[0]);
+                snap.adma_ins_pos_poi2_lat = static_cast<double>(adma_packet.insPosPOI[1].pos_abs.latitude);
+                snap.adma_ins_pos_poi2_lon = static_cast<double>(adma_packet.insPosPOI[1].pos_abs.longitude);
+                snap.adma_ins_height_poi2 = static_cast<double>(adma_packet.insHeightPOI[1]);
 
                 snap.adma_gnss_sats_used = static_cast<int>(adma_packet.gnsssatsused);
                 snap.adma_gnss_sats_visible = static_cast<int>(adma_packet.gnsssatsvisible);
@@ -858,18 +883,23 @@ int main(int argc, char** argv)
             << adma.adma_ins_vel_hor_x << "," << adma.adma_ins_vel_hor_y << "," << adma.adma_ins_vel_hor_z << ","
             << adma.adma_ins_vel_frame_x << "," << adma.adma_ins_vel_frame_y << "," << adma.adma_ins_vel_frame_z << ","
             << adma.adma_ins_vel_hor_poi1_x << "," << adma.adma_ins_vel_hor_poi1_y << "," << adma.adma_ins_vel_hor_poi1_z << ","
+            << adma.adma_ins_vel_hor_poi2_x << "," << adma.adma_ins_vel_hor_poi2_y << "," << adma.adma_ins_vel_hor_poi2_z << ","
             << adma.adma_gnss_vel_frame_x << "," << adma.adma_gnss_vel_frame_y << "," << adma.adma_gnss_vel_frame_z << ","
             << adma.adma_acc_body_x << "," << adma.adma_acc_body_y << "," << adma.adma_acc_body_z << ","
             << adma.adma_acc_horizontal_x << "," << adma.adma_acc_horizontal_y << "," << adma.adma_acc_horizontal_z << ","
             << adma.adma_acc_body_poi1_x << "," << adma.adma_acc_body_poi1_y << "," << adma.adma_acc_body_poi1_z << ","
+            << adma.adma_acc_body_poi2_x << "," << adma.adma_acc_body_poi2_y << "," << adma.adma_acc_body_poi2_z << ","
             << adma.adma_acc_horizontal_poi1_x << "," << adma.adma_acc_horizontal_poi1_y << "," << adma.adma_acc_horizontal_poi1_z << ","
+            << adma.adma_acc_horizontal_poi2_x << "," << adma.adma_acc_horizontal_poi2_y << "," << adma.adma_acc_horizontal_poi2_z << ","
             << adma.adma_ins_roll << "," << adma.adma_ins_pitch << "," << adma.adma_ins_yaw << ","
             << adma.adma_rates_body_x << "," << adma.adma_rates_body_y << "," << adma.adma_rates_body_z << ","
             << adma.adma_rates_horizontal_x << "," << adma.adma_rates_horizontal_y << "," << adma.adma_rates_horizontal_z << ","
             << adma.adma_misc_side_slip_angle << "," << adma.adma_misc_distance_traveled << ","
             << adma.adma_misc_poi1_side_slip_angle << "," << adma.adma_misc_poi1_distance_traveled << ","
+            << adma.adma_misc_poi2_side_slip_angle << "," << adma.adma_misc_poi2_distance_traveled << ","
             << adma.adma_ins_pos_lat << "," << adma.adma_ins_pos_lon << "," << adma.adma_ins_height << ","
             << adma.adma_ins_pos_poi1_lat << "," << adma.adma_ins_pos_poi1_lon << "," << adma.adma_ins_height_poi1 << ","
+            << adma.adma_ins_pos_poi2_lat << "," << adma.adma_ins_pos_poi2_lon << "," << adma.adma_ins_height_poi2 << ","
             << adma.adma_gnss_sats_used << "," << adma.adma_gnss_sats_visible << ","
             << adma.adma_kf_status << "," << adma.adma_kf_lat_stimulated << "," << adma.adma_kf_long_stimulated << "," << adma.adma_kf_steady_state << ","
             << cam.image_path << "\n";
