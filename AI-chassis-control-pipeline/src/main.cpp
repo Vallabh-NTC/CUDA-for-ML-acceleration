@@ -58,6 +58,7 @@ static inline void print_line(
     double adma_ins_vel_hor_x,
     double adma_ins_vel_hor_y,
     double adma_acc_body_y,
+    float flex_lwi_01_lwi_lenkradwinkel,
     const timespec& ts)
 {
     std::tm tm_local{};
@@ -80,6 +81,7 @@ static inline void print_line(
               << "\n | kf_steady=" << adma_kf_steady_state
               << "\n | vel_xy_res=" << vel_res
               << "\n | acc_body_y=" << adma_acc_body_y
+              << "\n | lenkradwinkel=" << flex_lwi_01_lwi_lenkradwinkel
               << "\n";
 }
 
@@ -931,6 +933,7 @@ int main(int argc, char** argv)
                adma.adma_ins_vel_hor_x,
                adma.adma_ins_vel_hor_y,
                adma.adma_acc_body_y,
+             flex.flex_LWI_01_LWI_Lenkradwinkel,
                    flex.ts);
 
         csv << idx << ","
