@@ -33,6 +33,8 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 
+#include <csignal>
+
 #include "UdpReceiver.hpp"
 #include "AdmaDecoder.hpp"
 #include "AdmaUdpReceiver.hpp"
@@ -651,10 +653,16 @@ static bool decode_flex_packet(const unsigned char* buf, int n, const FlexSnapsh
 int main(int argc, char** argv)
 {
     // -------- Output folders --------
-    const std::filesystem::path run_log_dir = create_run_log_dir();
+    static std::filesystem::path run_log_dir = create_run_log_dir();
     const std::filesystem::path images_dir = run_log_dir / "images";
     const std::filesystem::path telemetry_csv_path = run_log_dir / "telemetry.csv";
     std::cerr << "Run log directory: " << run_log_dir.string() << "\n";
+
+    // SIGINT handler to print log folder name
+    std::signal(SIGINT, [](int){
+        std::cout << "\nLog folder: " << run_log_dir.string() << std::endl;
+        std::exit(0);
+    });
 
     // -------- CSV log --------
     std::ofstream csv(telemetry_csv_path.string());
