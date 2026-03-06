@@ -1,41 +1,26 @@
-// overlay.hpp
 #pragma once
+// overlay.hpp — flow field + resultant vector on NV12 EGLImage
+
+#include <cuda_runtime.h>
 #include <cstdint>
 
-// Forward typedef to avoid pulling EGL headers into CUDA TU headers.
-typedef void* EGLImageKHR;
+// Draw flow field arrows (green) over the ROI
+void overlay_draw_flow(
+    uint8_t      *d_y, uint8_t *d_uv,
+    int           pitchY, int pitchUV, int W, int H,
+    const float  *d_flow,
+    float roi_x0, float roi_x1, float roi_y0, float roi_y1,
+    int step, float arrow_scale, float min_mag,
+    cudaStream_t stream = 0);
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Draw MV field arrows and one OF resultant arrow + optional IMU resultant arrow.
-// mvPtr points to device memory: 2S16 interleaved (dx,dy) in S10.5.
-// mvPitchBytes is pitch in bytes of mvPtr.
-//
-// NOTE:
-// - OF resultant vector is in px/frame.
-// - IMU/Telemetry vector is expected in px/frame (already scaled from m/s using pxPerM*dt).
-//
-void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
-                           int W, int H,
-                           const int16_t *mvPtr, int mvPitchBytes,
-                           int mvW, int mvH, int grid,
-                           int x0, int x1, int y0, int y1,
-                           int step, float scale,
-                           float minMagDraw,
-                           uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
-                           float resDxPx, float resDyPx,
-                           uint8_t resY, uint8_t resU, uint8_t resV,
-                           // IMU/Telemetry resultant (optional): pass 0,0 to disable
-                           float imuDx, float imuDy,
-                           float imuScale,
-                           uint8_t imuY, uint8_t imuU, uint8_t imuV,
-                           // Visual-only direction forcing options
-                           float forceDeg,
-                           float forceMinResMag,
-                           uint32_t frameTag);
-
-#ifdef __cplusplus
-}
-#endif
+// Draw resultant vector (blue, thick) at center of ROI
+// mean_u, mean_v   : mean displacement in px/frame from flow_reduce
+// result_scale     : visual amplification (e.g. 8.0)
+void overlay_draw_resultant(
+    uint8_t    *d_y, uint8_t *d_uv,
+    int         pitchY, int pitchUV, int W, int H,
+    float       mean_u, float mean_v,
+    float       roi_x0, float roi_x1,
+    float       roi_y0, float roi_y1,
+    float       result_scale,
+    cudaStream_t stream = 0);

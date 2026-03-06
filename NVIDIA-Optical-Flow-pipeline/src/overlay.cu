@@ -1,357 +1,147 @@
-// overlay.cu
-// (UNCHANGED LOGIC; shown here for completeness)
-
-#include <cstdint>
-#include <cstring>
-#include <cmath>
-
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cudaEGL.h>
+// overlay.cu — flow field arrows + resultant vector on NV12 EGLImage
 
 #include "overlay.hpp"
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <cmath>
 
-#ifndef OVERLAY_HEAD_LEN
-#define OVERLAY_HEAD_LEN 10
-#endif
-
-#ifndef OVERLAY_HEAD_W
-#define OVERLAY_HEAD_W   7
-#endif
-
-#ifndef OVERLAY_RES_THICKNESS
-#define OVERLAY_RES_THICKNESS 5
-#endif
-
-#ifndef OVERLAY_IMU_THICKNESS
-#define OVERLAY_IMU_THICKNESS 3
-#endif
-
-#ifndef OVERLAY_RES_SCALE_MUL
-#define OVERLAY_RES_SCALE_MUL 1.35f
-#endif
-
-__device__ __forceinline__ float s10_5_to_px(int16_t v) { return (float)v * (1.0f / 32.0f); }
-
-__device__ __forceinline__ float fast_rsqrtf_safe(float x)
-{
-    return rsqrtf(fmaxf(x, 1e-12f));
-}
-
-__device__ __forceinline__ float hash01_u32(uint32_t x)
-{
-    x ^= x >> 16; x *= 0x7feb352dU;
-    x ^= x >> 15; x *= 0x846ca68bU;
-    x ^= x >> 16;
-    return (x & 0x00FFFFFFu) * (1.0f / 16777216.0f);
-}
-
-__device__ __forceinline__ void rotate2(float x, float y, float c, float s, float &ox, float &oy)
-{
-    ox = c * x - s * y;
-    oy = s * x + c * y;
-}
-
-__device__ inline void putY_ptr(uint8_t *Y, int pitch, int W, int H, int x, int y, uint8_t v)
+// ── Pixel helpers ─────────────────────────────────────────────────────────────
+__device__ inline void put_y(
+    uint8_t *d_y, int pitch, int W, int H, int x, int y, uint8_t v)
 {
     if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H)
-        Y[y * pitch + x] = v;
+        d_y[y * pitch + x] = v;
 }
 
-__device__ inline void putUV_ptr(uint8_t *UV, int pitchUV, int W, int H, int x, int y, uint8_t U, uint8_t V)
+__device__ inline void put_uv(
+    uint8_t *d_uv, int pitch, int W, int H, int x, int y, uint8_t U, uint8_t V)
 {
-    int uvx = x >> 1;
-    int uvy = y >> 1;
-    int uvW = W >> 1;
-    int uvH = H >> 1;
-    if ((unsigned)uvx < (unsigned)uvW && (unsigned)uvy < (unsigned)uvH) {
-        uint8_t *p = &UV[uvy * pitchUV + uvx * 2];
-        p[0] = U; p[1] = V;
+    int ux=x>>1, uy=y>>1;
+    if ((unsigned)ux<(unsigned)(W>>1) && (unsigned)uy<(unsigned)(H>>1)) {
+        d_uv[uy*pitch + ux*2+0] = U;
+        d_uv[uy*pitch + ux*2+1] = V;
     }
 }
 
-__device__ inline void drawLine_ptr(uint8_t *Y, uint8_t *UV,
-                                    int pitchY, int pitchUV,
-                                    int W, int H,
-                                    int x0, int y0, int x1, int y1,
-                                    uint8_t Yc, uint8_t Uc, uint8_t Vc)
+__device__ void draw_line(
+    uint8_t *d_y, uint8_t *d_uv,
+    int pitchY, int pitchUV, int W, int H,
+    int x0, int y0, int x1, int y1,
+    uint8_t Yc, uint8_t Uc, uint8_t Vc)
 {
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-
-    while (true) {
-        putY_ptr(Y, pitchY, W, H, x0, y0, Yc);
-        putUV_ptr(UV, pitchUV, W, H, x0, y0, Uc, Vc);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+    int dx=abs(x1-x0), sx=x0<x1?1:-1;
+    int dy=-abs(y1-y0), sy=y0<y1?1:-1;
+    int err=dx+dy;
+    for (int i=0;i<1024;++i) {
+        put_y (d_y,  pitchY,  W,H,x0,y0,Yc);
+        put_uv(d_uv, pitchUV, W,H,x0,y0,Uc,Vc);
+        if (x0==x1&&y0==y1) break;
+        int e2=2*err;
+        if (e2>=dy){err+=dy;x0+=sx;}
+        if (e2<=dx){err+=dx;y0+=sy;}
     }
 }
 
-__device__ inline void drawArrow_ptr(uint8_t *Y, uint8_t *UV,
-                                     int pitchY, int pitchUV,
-                                     int W, int H,
-                                     int x0, int y0, int x1, int y1,
-                                     uint8_t Yc, uint8_t Uc, uint8_t Vc)
+__device__ void draw_arrow(
+    uint8_t *d_y, uint8_t *d_uv,
+    int pitchY, int pitchUV, int W, int H,
+    int x0, int y0, int x1, int y1,
+    uint8_t Yc, uint8_t Uc, uint8_t Vc,
+    int thickness=1)
 {
-    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x0, y0, x1, y1, Yc, Uc, Vc);
-
-    int hx = x1 - x0;
-    int hy = y1 - y0;
-    if (hx == 0 && hy == 0) return;
-
-    int px = -hy, py = hx;
-    int len = max(1, abs(hx) + abs(hy));
-
-    const int HEAD_LEN = OVERLAY_HEAD_LEN;
-    const int HEAD_W   = OVERLAY_HEAD_W;
-
-    int ahx = (hx * HEAD_LEN) / len;
-    int ahy = (hy * HEAD_LEN) / len;
-    int apx = (px * HEAD_W)   / len;
-    int apy = (py * HEAD_W)   / len;
-
-    if (ahx == 0 && hx != 0) ahx = (hx > 0 ? 1 : -1);
-    if (ahy == 0 && hy != 0) ahy = (hy > 0 ? 1 : -1);
-
-    int xh1 = x1 - ahx + apx;
-    int yh1 = y1 - ahy + apy;
-    int xh2 = x1 - ahx - apx;
-    int yh2 = y1 - ahy - apy;
-
-    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh1, yh1, Yc, Uc, Vc);
-    drawLine_ptr(Y, UV, pitchY, pitchUV, W, H, x1, y1, xh2, yh2, Yc, Uc, Vc);
+    for (int oy=-thickness/2; oy<=thickness/2; ++oy)
+    for (int ox=-thickness/2; ox<=thickness/2; ++ox) {
+        draw_line(d_y,d_uv,pitchY,pitchUV,W,H,
+                  x0+ox,y0+oy,x1+ox,y1+oy,Yc,Uc,Vc);
+    }
+    // Arrow head
+    int hx=x1-x0, hy=y1-y0;
+    int len=max(1,abs(hx)+abs(hy));
+    const int HL=10, HW=6;
+    int ahx=(hx*HL)/len, ahy=(hy*HL)/len;
+    int apx=(-hy*HW)/len, apy=(hx*HW)/len;
+    draw_line(d_y,d_uv,pitchY,pitchUV,W,H, x1,y1, x1-ahx+apx,y1-ahy+apy, Yc,Uc,Vc);
+    draw_line(d_y,d_uv,pitchY,pitchUV,W,H, x1,y1, x1-ahx-apx,y1-ahy-apy, Yc,Uc,Vc);
 }
 
-__device__ inline void drawArrowThick_ptr(uint8_t *Y, uint8_t *UV,
-                                          int pitchY, int pitchUV,
-                                          int W, int H,
-                                          int x0, int y0, int x1, int y1,
-                                          uint8_t Yc, uint8_t Uc, uint8_t Vc,
-                                          int thickness)
+// ── Flow field kernel ─────────────────────────────────────────────────────────
+__global__ void overlay_field_kernel(
+    uint8_t     *d_y, uint8_t *d_uv,
+    int          pitchY, int pitchUV, int W, int H,
+    const float *d_flow,
+    int roi_x0, int roi_x1, int roi_y0, int roi_y1,
+    int step, float arrow_scale, float min_mag)
 {
-    thickness = max(1, thickness);
-    int r = thickness / 2;
+    const int sx=blockIdx.x*blockDim.x+threadIdx.x;
+    const int sy=blockIdx.y*blockDim.y+threadIdx.y;
+    const int px=roi_x0+sx*step;
+    const int py=roi_y0+sy*step;
+    if (px>=roi_x1||py>=roi_y1||px<0||py<0||px>=W||py>=H) return;
 
-    for (int oy = -r; oy <= r; ++oy) {
-        for (int ox = -r; ox <= r; ++ox) {
-            drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H,
-                          x0 + ox, y0 + oy, x1 + ox, y1 + oy,
-                          Yc, Uc, Vc);
-        }
-    }
+    const int plane=H*W, idx=py*W+px;
+    const float u=d_flow[0*plane+idx];
+    const float v=d_flow[1*plane+idx];
+    if (sqrtf(u*u+v*v)<min_mag) return;
+
+    int x1=max(0,min(W-1,px+(int)lrintf(u*arrow_scale)));
+    int y1=max(0,min(H-1,py+(int)lrintf(v*arrow_scale)));
+
+    // Green arrows for field (Y=150, U=44, V=21 → greenish)
+    draw_arrow(d_y,d_uv,pitchY,pitchUV,W,H, px,py,x1,y1, 150,44,21, 1);
 }
 
-__global__ void drawFieldPitchKernel(uint8_t *Y, uint8_t *UV,
-                                     int pitchY, int pitchUV,
-                                     int W, int H,
-                                     const int16_t *mvPtr, int mvPitchBytes,
-                                     int mvW, int mvH, int grid,
-                                     int x0, int x1, int y0, int y1,
-                                     int step, float scale,
-                                     float minMagDraw,
-                                     float resDxPx, float resDyPx,
-                                     float forceDeg,
-                                     float forceMinResMag,
-                                     uint32_t frameTag,
-                                     uint8_t Yc, uint8_t Uc, uint8_t Vc)
+// ── Resultant vector kernel (single thread) ───────────────────────────────────
+// Blue arrow in NV12: Y=29, U=255, V=107
+__global__ void overlay_resultant_kernel(
+    uint8_t    *d_y, uint8_t *d_uv,
+    int         pitchY, int pitchUV, int W, int H,
+    float       mean_u, float mean_v,
+    int         cx, int cy,          // center of ROI in pixels
+    float       result_scale)        // visual scale for resultant
 {
-    int sx = blockIdx.x * blockDim.x + threadIdx.x;
-    int sy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (threadIdx.x!=0||blockIdx.x!=0) return;
 
-    int mx = x0 + sx * step;
-    int my = y0 + sy * step;
-    if (mx >= x1 || my >= y1) return;
-    if (mx < 0 || my < 0 || mx >= mvW || my >= mvH) return;
+    int x1=max(0,min(W-1, cx+(int)lrintf(mean_u*result_scale)));
+    int y1=max(0,min(H-1, cy+(int)lrintf(mean_v*result_scale)));
 
-    const uint8_t *rowB = (const uint8_t*)mvPtr + (size_t)my * (size_t)mvPitchBytes;
-    const int16_t *row  = (const int16_t*)rowB;
-
-    int16_t fx = row[mx * 2 + 0];
-    int16_t fy = row[mx * 2 + 1];
-
-    float dx = s10_5_to_px(fx);
-    float dy = s10_5_to_px(fy);
-
-    float magL1 = fabsf(dx) + fabsf(dy);
-    if (magL1 < minMagDraw) return;
-
-    float resMagL1 = fabsf(resDxPx) + fabsf(resDyPx);
-    if (forceDeg > 0.0f && resMagL1 >= forceMinResMag)
-    {
-        float rx = resDxPx;
-        float ry = resDyPx;
-        float rinv = fast_rsqrtf_safe(rx*rx + ry*ry);
-        rx *= rinv;
-        ry *= rinv;
-
-        float v2 = dx*dx + dy*dy;
-        float vinv = fast_rsqrtf_safe(v2);
-        float vx = dx * vinv;
-        float vy = dy * vinv;
-
-        float maxRad = forceDeg * 0.01745329252f;
-        float cosTh  = cosf(maxRad);
-        float dot    = vx*rx + vy*ry;
-
-        if (dot < cosTh)
-        {
-            uint32_t h = (uint32_t)(mx * 73856093u) ^
-                         (uint32_t)(my * 19349663u) ^
-                         (uint32_t)(frameTag * 83492791u);
-            float u = hash01_u32(h);
-            float a = (u * 2.0f - 1.0f) * maxRad;
-            float c = cosf(a), s = sinf(a);
-
-            float fx2, fy2;
-            rotate2(rx, ry, c, s, fx2, fy2);
-
-            float vmag = sqrtf(v2);
-            dx = fx2 * vmag;
-            dy = fy2 * vmag;
-        }
-    }
-
-    int px0 = mx * grid;
-    int py0 = my * grid;
-
-    int px1 = px0 + (int)lrintf(dx * scale);
-    int py1 = py0 + (int)lrintf(dy * scale);
-
-    px1 = max(0, min(W - 1, px1));
-    py1 = max(0, min(H - 1, py1));
-
-    drawArrow_ptr(Y, UV, pitchY, pitchUV, W, H, px0, py0, px1, py1, Yc, Uc, Vc);
+    // Draw thick blue arrow (thickness=4)
+    draw_arrow(d_y,d_uv,pitchY,pitchUV,W,H, cx,cy,x1,y1,
+               29,255,107, 4);
 }
 
-__global__ void drawResultantPitchKernel(uint8_t *Y, uint8_t *UV,
-                                         int pitchY, int pitchUV,
-                                         int W, int H,
-                                         float resDxPx, float resDyPx,
-                                         float scale,
-                                         uint8_t Yc, uint8_t Uc, uint8_t Vc)
+// ── Host wrappers ─────────────────────────────────────────────────────────────
+void overlay_draw_flow(
+    uint8_t     *d_y, uint8_t *d_uv,
+    int          pitchY, int pitchUV, int W, int H,
+    const float *d_flow,
+    float roi_x0, float roi_x1, float roi_y0, float roi_y1,
+    int step, float arrow_scale, float min_mag,
+    cudaStream_t stream)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-
-    int cx = W / 2;
-    int cy = H / 2;
-
-    float s = scale * OVERLAY_RES_SCALE_MUL;
-
-    int x1 = cx + (int)lrintf(resDxPx * s);
-    int y1 = cy + (int)lrintf(resDyPx * s);
-
-    x1 = max(0, min(W - 1, x1));
-    y1 = max(0, min(H - 1, y1));
-
-    drawArrowThick_ptr(Y, UV, pitchY, pitchUV, W, H,
-                       cx, cy, x1, y1,
-                       Yc, Uc, Vc,
-                       OVERLAY_RES_THICKNESS);
+    const int rx0=(int)(roi_x0*W), rx1=(int)(roi_x1*W);
+    const int ry0=(int)(roi_y0*H), ry1=(int)(roi_y1*H);
+    const int nx=(rx1-rx0+step-1)/step, ny=(ry1-ry0+step-1)/step;
+    dim3 block(8,8);
+    dim3 grid((nx+7)/8,(ny+7)/8);
+    overlay_field_kernel<<<grid,block,0,stream>>>(
+        d_y,d_uv,pitchY,pitchUV,W,H,d_flow,
+        rx0,rx1,ry0,ry1,step,arrow_scale,min_mag);
 }
 
-__global__ void drawImuPitchKernel(uint8_t *Y, uint8_t *UV,
-                                   int pitchY, int pitchUV,
-                                   int W, int H,
-                                   float imuDx, float imuDy,
-                                   float imuScale,
-                                   uint8_t Yc, uint8_t Uc, uint8_t Vc)
+void overlay_draw_resultant(
+    uint8_t    *d_y, uint8_t *d_uv,
+    int         pitchY, int pitchUV, int W, int H,
+    float       mean_u, float mean_v,
+    float       roi_x0, float roi_x1,
+    float       roi_y0, float roi_y1,
+    float       result_scale,
+    cudaStream_t stream)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // Center of ROI
+    const int cx = (int)((roi_x0 + roi_x1) * 0.5f * W);
+    const int cy = (int)((roi_y0 + roi_y1) * 0.5f * H);
 
-    if ((fabsf(imuDx) + fabsf(imuDy)) < 1e-6f) return;
-
-    int cx = W / 2 + 14;
-    int cy = H / 2 + 14;
-
-    int x1 = cx + (int)lrintf(imuDx * imuScale);
-    int y1 = cy + (int)lrintf(imuDy * imuScale);
-
-    x1 = max(0, min(W - 1, x1));
-    y1 = max(0, min(H - 1, y1));
-
-    drawArrowThick_ptr(Y, UV, pitchY, pitchUV, W, H,
-                       cx, cy, x1, y1,
-                       Yc, Uc, Vc,
-                       OVERLAY_IMU_THICKNESS);
-}
-
-extern "C" void overlay_draw_mvs_nv12(EGLImageKHR eglImage,
-                                      int W, int H,
-                                      const int16_t *mvPtr, int mvPitchBytes,
-                                      int mvW, int mvH, int grid,
-                                      int x0, int x1, int y0, int y1,
-                                      int step, float scale,
-                                      float minMagDraw,
-                                      uint8_t fieldY, uint8_t fieldU, uint8_t fieldV,
-                                      float resDxPx, float resDyPx,
-                                      uint8_t resY, uint8_t resU, uint8_t resV,
-                                      float imuDx, float imuDy,
-                                      float imuScale,
-                                      uint8_t imuY, uint8_t imuU, uint8_t imuV,
-                                      float forceDeg,
-                                      float forceMinResMag,
-                                      uint32_t frameTag)
-{
-    if (!eglImage || !mvPtr) return;
-
-    static bool cuInitDone = false;
-    if (!cuInitDone) { if (cuInit(0) != CUDA_SUCCESS) return; cuInitDone = true; }
-
-    static cudaStream_t stream = nullptr;
-    if (!stream) {
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return;
-    }
-
-    CUgraphicsResource cuRes = nullptr;
-    CUeglFrame eglFrame;
-
-    if (cuGraphicsEGLRegisterImage(&cuRes, (EGLImageKHR)eglImage,
-                                   CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE) != CUDA_SUCCESS)
-        return;
-
-    if (cuGraphicsResourceGetMappedEglFrame(&eglFrame, cuRes, 0, 0) != CUDA_SUCCESS) {
-        cuGraphicsUnregisterResource(cuRes);
-        return;
-    }
-
-    if (eglFrame.frameType == CU_EGL_FRAME_TYPE_PITCH) {
-        uint8_t *Y  = (uint8_t*)eglFrame.frame.pPitch[0];
-        uint8_t *UV = (uint8_t*)eglFrame.frame.pPitch[1];
-        int pitchY  = (int)eglFrame.pitch;
-        int pitchUV = (int)eglFrame.pitch;
-
-        int sxN = (x1 - x0 + step - 1) / step;
-        int syN = (y1 - y0 + step - 1) / step;
-
-        dim3 block(8, 8);
-        dim3 gridD((sxN + block.x - 1) / block.x,
-                   (syN + block.y - 1) / block.y);
-
-        drawFieldPitchKernel<<<gridD, block, 0, stream>>>(
-            Y, UV, pitchY, pitchUV, W, H,
-            mvPtr, mvPitchBytes, mvW, mvH, grid,
-            x0, x1, y0, y1,
-            step, scale, minMagDraw,
-            resDxPx, resDyPx,
-            forceDeg, forceMinResMag, frameTag,
-            fieldY, fieldU, fieldV);
-
-        drawResultantPitchKernel<<<1, 1, 0, stream>>>(
-            Y, UV, pitchY, pitchUV, W, H,
-            resDxPx, resDyPx, scale,
-            resY, resU, resV);
-
-        drawImuPitchKernel<<<1, 1, 0, stream>>>(
-            Y, UV, pitchY, pitchUV, W, H,
-            imuDx, imuDy, imuScale,
-            imuY, imuU, imuV);
-
-        cudaGetLastError();
-        cudaStreamSynchronize(stream);
-    }
-
-    cuGraphicsUnregisterResource(cuRes);
+    overlay_resultant_kernel<<<1,1,0,stream>>>(
+        d_y,d_uv,pitchY,pitchUV,W,H,
+        mean_u, mean_v, cx, cy, result_scale);
 }
