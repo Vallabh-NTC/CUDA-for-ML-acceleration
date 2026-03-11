@@ -1,5 +1,31 @@
-// nvivafilter_raft.cpp — RAFT zero-copy pipeline
-// Output: mean displacement in x (u) and y (v) in px/frame
+// nvivafilter_raft.cpp — RAFT zero-copy optical flow pipeline
+// Estimates longitudinal (vx) and lateral (vy) vehicle speed in km/h
+// from raw camera frames decoded by NVDEC on Jetson Orin AGX.
+//
+// Processing chain:
+//   EGLImage (NVMM) → NV12→float32 → Sharpen → RAFT TRT → flow_reduce
+//   → FOE correction → startup filter → CSV + stdout
+//
+// Startup filter (active until first stable lock):
+//
+//   Gate 1 — absolute bounds
+//     Rejects frames where vx < RAFT_MIN_VX_KMH or |vy| > RAFT_MAX_VY_KMH.
+//     Catches AEC transients and corrupted RAFT inputs.
+//
+//   Gate 2 — gap-aware derivative bound
+//     Rejects frames where |vx - last_valid_vx| > RAFT_MAX_DVX_KMH.
+//     Disabled when the last valid reference is older than RAFT_MAX_VALID_GAP
+//     frames, so a burst of rejections cannot permanently lock out valid data.
+//
+//   Gate 3 — consecutive valid frames
+//     Suppresses output until RAFT_MIN_CONSECUTIVE valid frames are seen in a
+//     row. Prevents isolated transients that pass gates 1+2 from being emitted.
+//     The derivative reference is updated throughout to stay fresh.
+//
+// Once RAFT_MIN_CONSECUTIVE consecutive valid frames have been seen, the
+// pipeline is considered "locked". From that point all three gates are
+// permanently disabled and every frame is emitted unconditionally — including
+// during maneuvers where vx may briefly dip below the startup threshold.
 
 #include "egl_map.hpp"
 #include "nv12_to_rgb_fp16.hpp"
@@ -13,69 +39,49 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
-static int   env_int  (const char *k, int   d) { const char *v=getenv(k); return v?atoi(v):d; }
-static float env_float(const char *k, float d) { const char *v=getenv(k); return v?atof(v):d; }
-static const char *env_str(const char *k, const char *d) { const char *v=getenv(k); return v?v:d; }
-
-
-// ── Exponential Moving Average ────────────────────────────────────────────────
-// output[t] = α × input[t] + (1-α) × output[t-1]
-// α = 1/(N+1) per equivalenza con SMA di finestra N
-struct MovingAverage {
-    float alpha  = 1.0f;   // α=1 → nessun filtro
-    float value  = 0.0f;
-    bool  inited = false;
-
-    void init(int window) {
-        // Converte finestra SMA in alpha EMA equivalente
-        alpha = window <= 1 ? 1.0f : 2.0f / (window + 1.0f);
-    }
-
-    float update(float val) {
-        if (!inited) { value = val; inited = true; return val; }
-        value = alpha * val + (1.0f - alpha) * value;
-        return value;
-    }
-};
+static int         env_int  (const char *k, int   d) { const char *v=getenv(k); return v?atoi(v):d; }
+static float       env_float(const char *k, float d) { const char *v=getenv(k); return v?atof(v):d; }
+static const char *env_str  (const char *k, const char *d) { const char *v=getenv(k); return v?v:d; }
 
 
-// ── Rate Limiter ──────────────────────────────────────────────────────────────
-// Rejects samples that change more than max_delta per frame
-struct RateLimiter {
-    float max_delta = 1e9f;  // km/h per frame
-    float last      = 0.0f;
-    bool  inited    = false;
-
-    void init(float delta) { max_delta = delta; }
-
-    float update(float val) {
-        if (!inited) { last = val; inited = true; return val; }
-        float delta = val - last;
-        if (delta >  max_delta) val = last + max_delta;
-        if (delta < -max_delta) val = last - max_delta;
-        last = val;
-        return val;
-    }
-};
-
+// ── Pipeline State ────────────────────────────────────────────────────────────
 struct State {
     bool  inited      = false;
     bool  init_failed = false;
     int   W = 0, H = 0;
 
-    // ROI in coordinate normalizzate [0,1]
+    // ROI in normalized coordinates [0,1]
     float roi_x0 = 0.55f;
     float roi_x1 = 0.95f;
     float roi_y0 = 0.45f;
     float roi_y1 = 0.68f;
 
-    // Overlay
-    int   step         = 16;   // distanza tra frecce in pixel
-    float arrow_scale  = 4.0f;
-    float min_mag      = 1.5f;
-    float result_scale = 8.0f;
+    // Overlay parameters
+    int   step           = 16;
+    float arrow_scale    = 4.0f;
+    float min_mag        = 1.5f;
+    float result_scale   = 8.0f;
     float sharp_strength = 1.5f;
+
+    // Startup gate 1 — absolute bounds
+    float min_vx_kmh = 5.0f;   // RAFT_MIN_VX_KMH
+    float max_vy_kmh = 3.0f;   // RAFT_MAX_VY_KMH
+
+    // Startup gate 2 — gap-aware derivative bound
+    float    max_dvx_kmh      = 5.0f;   // RAFT_MAX_DVX_KMH
+    int      max_valid_gap    = 3;      // RAFT_MAX_VALID_GAP
+    float    last_valid_vx    = -1.0f;  // -1 = no valid sample yet
+    uint32_t last_valid_frame = 0;
+
+    // Startup gate 3 — consecutive valid frames before first output
+    int  min_consecutive   = 3;   // RAFT_MIN_CONSECUTIVE
+    int  consecutive_valid = 0;
+
+    // Lock flag — set permanently after first stable lock.
+    // All startup gates are bypassed once locked.
+    bool locked = false;
 
     RaftInfer    raft;
     float       *d_frame_prev = nullptr;
@@ -83,20 +89,15 @@ struct State {
     float       *d_flow       = nullptr;
     FlowResult  *d_result     = nullptr;
 
-    bool         have_prev    = false;
-    cudaStream_t stream       = nullptr;
-    uint32_t     frame_id     = 0;
-    uint32_t     warmup_frames = 0;  // skip first N frames (overexposed)
+    bool         have_prev = false;
+    cudaStream_t stream    = nullptr;
+    uint32_t     frame_id  = 0;
 
-    FILE        *csv_file  = nullptr;
+    FILE        *csv_file = nullptr;
 
-    MovingAverage ma_u;
-    MovingAverage ma_v;
-
-    RateLimiter   rl_u;
-    RateLimiter   rl_v;
-
-    float foe_a = 0.0f;  // v = a*u + b
+    // Focus of Expansion correction coefficients
+    // mean_v_corrected = mean_v - (foe_a * mean_u + foe_b)
+    float foe_a = 0.0f;
     float foe_b = 0.0f;
 };
 
@@ -114,36 +115,27 @@ static bool init_once(State *st, int W, int H)
 
     st->W = W; st->H = H;
 
-    st->roi_x0       = env_float("RAFT_ROI_X0",      st->roi_x0);
-    st->roi_x1       = env_float("RAFT_ROI_X1",      st->roi_x1);
-    st->roi_y0       = env_float("RAFT_ROI_Y0",      st->roi_y0);
-    st->roi_y1       = env_float("RAFT_ROI_Y1",      st->roi_y1);
-    st->step         = env_int  ("RAFT_STEP",         st->step);
-    st->arrow_scale  = env_float("RAFT_ARROW_SCALE",  st->arrow_scale);
-    st->min_mag      = env_float("RAFT_MIN_MAG",      st->min_mag);
-    st->result_scale = env_float("RAFT_RESULT_SCALE", st->result_scale);
-    st->sharp_strength  = env_float("RAFT_SHARP",      st->sharp_strength);
-    st->warmup_frames   = (uint32_t)env_int("RAFT_WARMUP_FRAMES", 20);
-
-    const int ma_win   = env_int("RAFT_MA_WINDOW",   1);
-    const int ma_win_v = env_int("RAFT_MA_WINDOW_V", ma_win);
-    st->ma_u.init(ma_win);
-    st->ma_v.init(ma_win_v);
+    st->roi_x0          = env_float("RAFT_ROI_X0",          st->roi_x0);
+    st->roi_x1          = env_float("RAFT_ROI_X1",          st->roi_x1);
+    st->roi_y0          = env_float("RAFT_ROI_Y0",          st->roi_y0);
+    st->roi_y1          = env_float("RAFT_ROI_Y1",          st->roi_y1);
+    st->step            = env_int  ("RAFT_STEP",             st->step);
+    st->arrow_scale     = env_float("RAFT_ARROW_SCALE",      st->arrow_scale);
+    st->min_mag         = env_float("RAFT_MIN_MAG",          st->min_mag);
+    st->result_scale    = env_float("RAFT_RESULT_SCALE",     st->result_scale);
+    st->sharp_strength  = env_float("RAFT_SHARP",            st->sharp_strength);
+    st->min_vx_kmh      = env_float("RAFT_MIN_VX_KMH",      st->min_vx_kmh);
+    st->max_vy_kmh      = env_float("RAFT_MAX_VY_KMH",      st->max_vy_kmh);
+    st->max_dvx_kmh     = env_float("RAFT_MAX_DVX_KMH",     st->max_dvx_kmh);
+    st->max_valid_gap   = env_int  ("RAFT_MAX_VALID_GAP",   st->max_valid_gap);
+    st->min_consecutive = env_int  ("RAFT_MIN_CONSECUTIVE", st->min_consecutive);
 
     st->foe_a = env_float("RAFT_FOE_A", 0.0f);
     st->foe_b = env_float("RAFT_FOE_B", 0.0f);
 
-    // Rate limiter: max change per frame in px/frame
-    // Default 2 km/h → px/frame: 2 / (1/px_per_m * 100 * 3.6)
-    // At PX_PER_M=428: 2 / 0.849 = 2.356 px/frame
-    const float rl_px = env_float("RAFT_RATE_LIMIT_KMPH", 2.0f) / ((1.0f/428.0f) * 100.0f * 3.6f);
-    st->rl_u.init(rl_px);
-    st->rl_v.init(rl_px);
-
     const char *engine_path = env_str("RAFT_ENGINE_PATH",
         "/home/ntc-orin/raft/raft_large_fp16.engine");
 
-    // Calcola N = numero di punti nella ROI
     const int rx0 = (int)(st->roi_x0 * W), rx1 = (int)(st->roi_x1 * W);
     const int ry0 = (int)(st->roi_y0 * H), ry1 = (int)(st->roi_y1 * H);
     int nx = 0, ny = 0;
@@ -153,10 +145,16 @@ static bool init_once(State *st, int W, int H)
 
     std::fprintf(stderr,
         "[raft_of] Init W=%d H=%d engine=%s\n"
-        "[raft_of] ROI px=[%d,%d]x[%d,%d]  step=%d  N=%d punti\n"
-        "[raft_of] mean_u = sum(u_i) / %d,  mean_v = sum(v_i) / %d\n",
+        "[raft_of] ROI px=[%d,%d]x[%d,%d]  step=%d  N=%d points\n"
+        "[raft_of] mean_u = sum(u_i) / %d,  mean_v = sum(v_i) / %d\n"
+        "[raft_of] startup gate 1 (absolute)   : vx >= %.1f km/h, |vy| <= %.1f km/h\n"
+        "[raft_of] startup gate 2 (derivative) : |dvx| <= %.1f km/h/frame, gap <= %d frames\n"
+        "[raft_of] startup gate 3 (consecutive): %d valid frames in a row to lock\n",
         W, H, engine_path,
-        rx0, rx1, ry0, ry1, st->step, N, N, N);
+        rx0, rx1, ry0, ry1, st->step, N, N, N,
+        st->min_vx_kmh, st->max_vy_kmh,
+        st->max_dvx_kmh, st->max_valid_gap,
+        st->min_consecutive);
 
     if (cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking) != cudaSuccess) {
         std::fprintf(stderr, "[raft_of] cudaStreamCreate failed\n");
@@ -184,7 +182,6 @@ static bool init_once(State *st, int W, int H)
     cudaMemset(st->d_flow,       0, flow_bytes);
     cudaMemset(st->d_result,     0, sizeof(FlowResult));
 
-    // Apri CSV
     const char *csv_path = env_str("RAFT_CSV_PATH", "/home/ntc-orin/raft/output.csv");
     st->csv_file = std::fopen(csv_path, "w");
     if (!st->csv_file) {
@@ -208,7 +205,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
 
     if (!init_once(st, W, H)) return;
 
-    // Step 1: mappa EGLImage → CUDA pointer (zero-copy)
+    // Step 1: map EGLImage → CUDA pointer (zero-copy)
     EGLMapResult egl;
     if (!egl_map(image, W, H, egl)) {
         std::fprintf(stderr, "[raft_of] egl_map failed frame %u\n", st->frame_id);
@@ -220,66 +217,107 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                      egl.pitchY, egl.pitchUV,
                      W, H, st->d_frame_curr, st->stream);
 
-    // Step 3: sharpening (opzionale, RAFT_SHARP=0 per disabilitare)
+    // Step 3: unsharp mask sharpening (set RAFT_SHARP=0 to disable)
     preprocess_sharpen(st->d_frame_curr, W, H,
                        st->sharp_strength, st->stream);
 
-    // Step 4: inferenza RAFT
+    // Step 4: RAFT inference — produces flow field [1,2,H,W]
     if (st->have_prev) {
         if (!st->raft.infer(st->d_frame_prev, st->d_frame_curr,
                             st->d_flow, st->stream)) {
             std::fprintf(stderr, "[raft_of] infer failed frame %u\n", st->frame_id);
         } else {
-            const int rx0=(int)(st->roi_x0*W), rx1=(int)(st->roi_x1*W);
-            const int ry0=(int)(st->roi_y0*H), ry1=(int)(st->roi_y1*H);
+            const int rx0 = (int)(st->roi_x0 * W), rx1 = (int)(st->roi_x1 * W);
+            const int ry0 = (int)(st->roi_y0 * H), ry1 = (int)(st->roi_y1 * H);
 
-            // Step 5: riduzione GPU → mean_u e mean_v sulla ROI
-            // Kernel: accumula sum_u += flow[y,x,0] e sum_v += flow[y,x,1]
-            //         per ogni punto (x,y) con passo step nella ROI
-            //         poi divide per N = numero di punti
+            // Step 5: GPU reduction → mean_u, mean_v over ROI
             flow_reduce(st->d_flow, W, H,
                         rx0, rx1, ry0, ry1,
                         st->step, st->d_result, st->stream);
 
-            // Copia ~8 byte da GPU a CPU
             FlowResult res{};
             cudaMemcpyAsync(&res, st->d_result, sizeof(FlowResult),
                             cudaMemcpyDeviceToHost, st->stream);
             cudaStreamSynchronize(st->stream);
 
-            // Stampa displacement medio in px/frame
-            // Correzione FOE: sottrai componente geometrica da mean_v
-            const float v_foe_corrected = res.mean_v - (st->foe_a * res.mean_u + st->foe_b);
+            // Step 6: FOE correction
+            // Removes spurious vertical flow caused by camera pitch.
+            // mean_v_corrected = mean_v - (foe_a * mean_u + foe_b)
+            const float v_foe = res.mean_v - (st->foe_a * res.mean_u + st->foe_b);
 
-            // Rate limiter: rigetta salti impossibili (default 2 km/h per frame)
-            const float u_rl = st->rl_u.update(res.mean_u);
-            const float v_rl = st->rl_v.update(v_foe_corrected);
-
-            const float u_filt = st->ma_u.update(u_rl);
-            const float v_filt = st->ma_v.update(v_rl);  // MA leggera su v
-
-            // Conversione px/frame → km/h
-            // v_kmh = (px/frame) / (px/m) * FPS * 3.6
+            // Step 7: convert px/frame → km/h
+            // vx = -mean_u * (1/px_per_m) * FPS * 3.6  (forward motion → negative u)
+            // vy =  v_foe  * (1/px_per_m) * FPS * 3.6
             const float px_per_m = env_float("RAFT_PX_PER_M", 424.0f);
-            const float SCALE = (1.0f / px_per_m) * 100.0f * 3.6f;
-            // During warmup (overexposed frames) output zero
-            const bool  in_warmup = (st->frame_id < st->warmup_frames);
-            const float vx_kmh = in_warmup ? 0.0f : -u_filt * SCALE;
-            const float vy_min_vx = env_float("RAFT_VY_MIN_VX", 5.0f);
-            const float vy_kmh = (in_warmup || vx_kmh < vy_min_vx) ? 0.0f : v_filt * SCALE;
+            const float SCALE    = (1.0f / px_per_m) * 100.0f * 3.6f;
+            const float vx_kmh   = -res.mean_u * SCALE;
+            const float vy_kmh   =  v_foe      * SCALE;
 
-            std::fprintf(stdout,
-                "frame=%u  vx=%.3f  vy=%.3f  km/h\n",
-                st->frame_id, vx_kmh, vy_kmh);
-            std::fflush(stdout);
+            // Step 8: startup filter — only active before lock
+            // Once locked, all frames are emitted unconditionally.
+            bool emit = true;
 
-            if (st->csv_file) {
-                std::fprintf(st->csv_file, "%u,%.4f,%.4f,%.4f,%.4f\n",
-                    st->frame_id, u_filt, v_filt, vx_kmh, vy_kmh);
-                std::fflush(st->csv_file);
+            if (!st->locked) {
+                // Gate 1: absolute bounds
+                const bool valid_abs = (vx_kmh        >= st->min_vx_kmh) &&
+                                       (fabsf(vy_kmh)  <= st->max_vy_kmh);
+
+                // Gate 2: gap-aware derivative bound
+                const int  gap       = (int)st->frame_id - (int)st->last_valid_frame;
+                const bool ref_fresh = (st->last_valid_vx >= 0.0f) &&
+                                       (gap <= st->max_valid_gap);
+                const float dvx      = ref_fresh
+                                       ? fabsf(vx_kmh - st->last_valid_vx)
+                                       : 0.0f;
+                const bool valid_rate = (dvx <= st->max_dvx_kmh);
+
+                const bool valid = valid_abs && valid_rate;
+
+                if (!valid) {
+                    st->consecutive_valid = 0;
+                    emit = false;
+                    std::fprintf(stderr,
+                        "[raft_of] skip frame %u — vx=%.2f vy=%.2f dvx=%.2f km/h"
+                        " (gap=%d ref_fresh=%d)\n",
+                        st->frame_id, vx_kmh, vy_kmh, dvx, gap, (int)ref_fresh);
+                } else {
+                    // Update derivative reference throughout startup
+                    st->last_valid_vx    = vx_kmh;
+                    st->last_valid_frame = st->frame_id;
+                    st->consecutive_valid++;
+
+                    if (st->consecutive_valid >= st->min_consecutive) {
+                        // Stable signal confirmed — lock permanently
+                        st->locked = true;
+                        std::fprintf(stderr,
+                            "[raft_of] LOCKED at frame %u after %d consecutive valid frames\n",
+                            st->frame_id, st->min_consecutive);
+                    } else {
+                        // Valid but still in warmup — hold output
+                        emit = false;
+                        std::fprintf(stderr,
+                            "[raft_of] hold frame %u — vx=%.2f vy=%.2f km/h"
+                            " (consecutive=%d/%d)\n",
+                            st->frame_id, vx_kmh, vy_kmh,
+                            st->consecutive_valid, st->min_consecutive);
+                    }
+                }
             }
 
-            // Overlay: frecce verdi + vettore risultante blu
+            if (emit) {
+                std::fprintf(stdout,
+                    "frame=%u  vx=%.3f  vy=%.3f  km/h\n",
+                    st->frame_id, vx_kmh, vy_kmh);
+                std::fflush(stdout);
+
+                if (st->csv_file) {
+                    std::fprintf(st->csv_file, "%u,%.4f,%.4f,%.4f,%.4f\n",
+                        st->frame_id, res.mean_u, v_foe, vx_kmh, vy_kmh);
+                    std::fflush(st->csv_file);
+                }
+            }
+
+            // Overlay is always drawn — useful for visual debug on skipped frames too
             overlay_draw_flow(
                 egl.d_y, egl.d_uv,
                 egl.pitchY, egl.pitchUV,
@@ -303,7 +341,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     cudaStreamSynchronize(st->stream);
     egl_unmap(egl);
 
-    // Swap buffer prev/curr
+    // Swap prev/curr frame buffers
     float *tmp       = st->d_frame_prev;
     st->d_frame_prev = st->d_frame_curr;
     st->d_frame_curr = tmp;
@@ -319,7 +357,8 @@ static void pre_process(
 {
     State *st = get_state(userPtr);
     if (inW && inH && *inW > 0 && *inH > 0) {
-        st->W=(int)*inW; st->H=(int)*inH;
+        st->W = (int)*inW;
+        st->H = (int)*inH;
     }
 }
 
@@ -330,14 +369,14 @@ static void post_process(
 {
     if (!userPtr || !*userPtr) return;
     State *st = reinterpret_cast<State*>(*userPtr);
-    if (st->csv_file)     { std::fclose(st->csv_file);  }
-    if (st->d_frame_prev) { cudaFree(st->d_frame_prev); }
-    if (st->d_frame_curr) { cudaFree(st->d_frame_curr); }
-    if (st->d_flow)       { cudaFree(st->d_flow);       }
-    if (st->d_result)     { cudaFree(st->d_result);     }
+    if (st->csv_file)     { std::fclose(st->csv_file);     }
+    if (st->d_frame_prev) { cudaFree(st->d_frame_prev);    }
+    if (st->d_frame_curr) { cudaFree(st->d_frame_curr);    }
+    if (st->d_flow)       { cudaFree(st->d_flow);          }
+    if (st->d_result)     { cudaFree(st->d_result);        }
     if (st->stream)       { cudaStreamDestroy(st->stream); }
     std::fprintf(stderr, "[raft_of] Shutdown — %u frames\n", st->frame_id);
-    delete st; *userPtr=nullptr;
+    delete st; *userPtr = nullptr;
 }
 
 extern "C" void init(CustomerFunction *f) {
