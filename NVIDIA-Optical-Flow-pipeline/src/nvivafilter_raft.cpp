@@ -4,28 +4,19 @@
 //
 // Processing chain:
 //   EGLImage (NVMM) → NV12→float32 → Sharpen → RAFT TRT → flow_reduce
-//   → FOE correction → startup filter → CSV + stdout
+//   → FOE correction → Startup filter → EMA → CSV + stdout
 //
 // Startup filter (active until first stable lock):
+//   Gate 1 — absolute bounds (vx >= MIN_VX, |vy| <= MAX_VY)
+//   Gate 2 — gap-aware derivative bound (|dvx| <= MAX_DVX)
+//   Gate 3 — consecutive valid frames (MIN_CONSECUTIVE in a row)
+//   Once locked, all frames are emitted unconditionally.
 //
-//   Gate 1 — absolute bounds
-//     Rejects frames where vx < RAFT_MIN_VX_KMH or |vy| > RAFT_MAX_VY_KMH.
-//     Catches AEC transients and corrupted RAFT inputs.
-//
-//   Gate 2 — gap-aware derivative bound
-//     Rejects frames where |vx - last_valid_vx| > RAFT_MAX_DVX_KMH.
-//     Disabled when the last valid reference is older than RAFT_MAX_VALID_GAP
-//     frames, so a burst of rejections cannot permanently lock out valid data.
-//
-//   Gate 3 — consecutive valid frames
-//     Suppresses output until RAFT_MIN_CONSECUTIVE valid frames are seen in a
-//     row. Prevents isolated transients that pass gates 1+2 from being emitted.
-//     The derivative reference is updated throughout to stay fresh.
-//
-// Once RAFT_MIN_CONSECUTIVE consecutive valid frames have been seen, the
-// pipeline is considered "locked". From that point all three gates are
-// permanently disabled and every frame is emitted unconditionally — including
-// during maneuvers where vx may briefly dip below the startup threshold.
+// EMA filter (active after lock, initialized at lock value — no transient):
+//   vx: alpha = RAFT_ALPHA_VX (default 0.4) → ~15ms group delay
+//   vy: alpha = RAFT_ALPHA_VY (default 0.2) → ~40ms group delay
+//   output[t] = alpha * input[t] + (1-alpha) * output[t-1]
+//   Set RAFT_ALPHA_VX=1.0 / RAFT_ALPHA_VY=1.0 to disable filtering.
 
 #include "egl_map.hpp"
 #include "nv12_to_rgb_fp16.hpp"
@@ -44,6 +35,24 @@
 static int         env_int  (const char *k, int   d) { const char *v=getenv(k); return v?atoi(v):d; }
 static float       env_float(const char *k, float d) { const char *v=getenv(k); return v?atof(v):d; }
 static const char *env_str  (const char *k, const char *d) { const char *v=getenv(k); return v?v:d; }
+
+
+// ── EMA filter ────────────────────────────────────────────────────────────────
+// Initialized at first value → zero transient at startup.
+// alpha=1.0 → pass-through (no filtering).
+struct EMA {
+    float alpha  = 1.0f;
+    float value  = 0.0f;
+    bool  inited = false;
+
+    void  init(float a) { alpha = a; }
+
+    float push(float x) {
+        if (!inited) { value = x; inited = true; return x; }
+        value = alpha * x + (1.0f - alpha) * value;
+        return value;
+    }
+};
 
 
 // ── Pipeline State ────────────────────────────────────────────────────────────
@@ -70,18 +79,22 @@ struct State {
     float max_vy_kmh = 3.0f;   // RAFT_MAX_VY_KMH
 
     // Startup gate 2 — gap-aware derivative bound
-    float    max_dvx_kmh      = 5.0f;   // RAFT_MAX_DVX_KMH
-    int      max_valid_gap    = 3;      // RAFT_MAX_VALID_GAP
-    float    last_valid_vx    = -1.0f;  // -1 = no valid sample yet
+    float    max_dvx_kmh      = 5.0f;  // RAFT_MAX_DVX_KMH
+    int      max_valid_gap    = 3;     // RAFT_MAX_VALID_GAP
+    float    last_valid_vx    = -1.0f;
     uint32_t last_valid_frame = 0;
 
-    // Startup gate 3 — consecutive valid frames before first output
-    int  min_consecutive   = 3;   // RAFT_MIN_CONSECUTIVE
+    // Startup gate 3 — consecutive valid frames
+    int  min_consecutive   = 3;        // RAFT_MIN_CONSECUTIVE
     int  consecutive_valid = 0;
 
     // Lock flag — set permanently after first stable lock.
     // All startup gates are bypassed once locked.
     bool locked = false;
+
+    // EMA filters — initialized at lock value, no transient
+    EMA  ema_vx;
+    EMA  ema_vy;
 
     RaftInfer    raft;
     float       *d_frame_prev = nullptr;
@@ -130,6 +143,9 @@ static bool init_once(State *st, int W, int H)
     st->max_valid_gap   = env_int  ("RAFT_MAX_VALID_GAP",   st->max_valid_gap);
     st->min_consecutive = env_int  ("RAFT_MIN_CONSECUTIVE", st->min_consecutive);
 
+    st->ema_vx.init(env_float("RAFT_ALPHA_VX", 0.4f));
+    st->ema_vy.init(env_float("RAFT_ALPHA_VY", 0.2f));
+
     st->foe_a = env_float("RAFT_FOE_A", 0.0f);
     st->foe_b = env_float("RAFT_FOE_B", 0.0f);
 
@@ -149,12 +165,15 @@ static bool init_once(State *st, int W, int H)
         "[raft_of] mean_u = sum(u_i) / %d,  mean_v = sum(v_i) / %d\n"
         "[raft_of] startup gate 1 (absolute)   : vx >= %.1f km/h, |vy| <= %.1f km/h\n"
         "[raft_of] startup gate 2 (derivative) : |dvx| <= %.1f km/h/frame, gap <= %d frames\n"
-        "[raft_of] startup gate 3 (consecutive): %d valid frames in a row to lock\n",
+        "[raft_of] startup gate 3 (consecutive): %d valid frames in a row to lock\n"
+        "[raft_of] EMA filter                  : alpha_vx=%.2f (~%.0fms)  alpha_vy=%.2f (~%.0fms)\n",
         W, H, engine_path,
         rx0, rx1, ry0, ry1, st->step, N, N, N,
         st->min_vx_kmh, st->max_vy_kmh,
         st->max_dvx_kmh, st->max_valid_gap,
-        st->min_consecutive);
+        st->min_consecutive,
+        st->ema_vx.alpha, (1.0f / st->ema_vx.alpha - 1.0f) * 10.0f,
+        st->ema_vy.alpha, (1.0f / st->ema_vy.alpha - 1.0f) * 10.0f);
 
     if (cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking) != cudaSuccess) {
         std::fprintf(stderr, "[raft_of] cudaStreamCreate failed\n");
@@ -246,28 +265,27 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
             const float v_foe = res.mean_v - (st->foe_a * res.mean_u + st->foe_b);
 
             // Step 7: convert px/frame → km/h
-            // vx = -mean_u * (1/px_per_m) * FPS * 3.6  (forward motion → negative u)
+            // vx = -mean_u * (1/px_per_m) * FPS * 3.6  (forward → negative u)
             // vy =  v_foe  * (1/px_per_m) * FPS * 3.6
             const float px_per_m = env_float("RAFT_PX_PER_M", 424.0f);
             const float SCALE    = (1.0f / px_per_m) * 100.0f * 3.6f;
-            const float vx_kmh   = -res.mean_u * SCALE;
-            const float vy_kmh   =  v_foe      * SCALE;
+            const float vx_raw   = -res.mean_u * SCALE;
+            const float vy_raw   =  v_foe      * SCALE;
 
             // Step 8: startup filter — only active before lock
-            // Once locked, all frames are emitted unconditionally.
             bool emit = true;
 
             if (!st->locked) {
                 // Gate 1: absolute bounds
-                const bool valid_abs = (vx_kmh        >= st->min_vx_kmh) &&
-                                       (fabsf(vy_kmh)  <= st->max_vy_kmh);
+                const bool valid_abs = (vx_raw        >= st->min_vx_kmh) &&
+                                       (fabsf(vy_raw)  <= st->max_vy_kmh);
 
                 // Gate 2: gap-aware derivative bound
                 const int  gap       = (int)st->frame_id - (int)st->last_valid_frame;
                 const bool ref_fresh = (st->last_valid_vx >= 0.0f) &&
                                        (gap <= st->max_valid_gap);
                 const float dvx      = ref_fresh
-                                       ? fabsf(vx_kmh - st->last_valid_vx)
+                                       ? fabsf(vx_raw - st->last_valid_vx)
                                        : 0.0f;
                 const bool valid_rate = (dvx <= st->max_dvx_kmh);
 
@@ -279,32 +297,37 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                     std::fprintf(stderr,
                         "[raft_of] skip frame %u — vx=%.2f vy=%.2f dvx=%.2f km/h"
                         " (gap=%d ref_fresh=%d)\n",
-                        st->frame_id, vx_kmh, vy_kmh, dvx, gap, (int)ref_fresh);
+                        st->frame_id, vx_raw, vy_raw, dvx, gap, (int)ref_fresh);
                 } else {
-                    // Update derivative reference throughout startup
-                    st->last_valid_vx    = vx_kmh;
+                    st->last_valid_vx    = vx_raw;
                     st->last_valid_frame = st->frame_id;
                     st->consecutive_valid++;
 
                     if (st->consecutive_valid >= st->min_consecutive) {
-                        // Stable signal confirmed — lock permanently
                         st->locked = true;
                         std::fprintf(stderr,
                             "[raft_of] LOCKED at frame %u after %d consecutive valid frames\n",
                             st->frame_id, st->min_consecutive);
                     } else {
-                        // Valid but still in warmup — hold output
                         emit = false;
                         std::fprintf(stderr,
                             "[raft_of] hold frame %u — vx=%.2f vy=%.2f km/h"
                             " (consecutive=%d/%d)\n",
-                            st->frame_id, vx_kmh, vy_kmh,
+                            st->frame_id, vx_raw, vy_raw,
                             st->consecutive_valid, st->min_consecutive);
                     }
                 }
             }
 
             if (emit) {
+                // Step 9: EMA filter
+                // Initialized at first value after lock → no transient.
+                // alpha_vx=0.4 → ~15ms delay  (light smoothing for vx)
+                // alpha_vy=0.2 → ~40ms delay  (aggressive smoothing for vy HF noise)
+                // Set RAFT_ALPHA_VX/VY=1.0 to bypass.
+                const float vx_kmh = st->ema_vx.push(vx_raw);
+                const float vy_kmh = st->ema_vy.push(vy_raw);
+
                 std::fprintf(stdout,
                     "frame=%u  vx=%.3f  vy=%.3f  km/h\n",
                     st->frame_id, vx_kmh, vy_kmh);
@@ -317,7 +340,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                 }
             }
 
-            // Overlay is always drawn — useful for visual debug on skipped frames too
+            // Overlay always drawn — useful for visual debug on skipped frames too
             overlay_draw_flow(
                 egl.d_y, egl.d_uv,
                 egl.pitchY, egl.pitchUV,
