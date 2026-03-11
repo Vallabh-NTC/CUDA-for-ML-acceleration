@@ -4,7 +4,13 @@
 //
 // Processing chain:
 //   EGLImage (NVMM) → NV12→float32 → Sharpen → RAFT TRT → flow_reduce
-//   → FOE correction → Startup filter → EMA → CSV + stdout
+//   → FOE correction (numerical) → Startup filter → EMA → CSV + stdout
+//   → FOE correction (visual, in-place on d_flow) → overlay
+//
+// The FOE correction is applied twice:
+//   1. Numerically on the reduced mean_v → used for vy_kmh and CSV output
+//   2. Visually via foe_correct_flow() on the full flow field → arrows and
+//      resultant vector on the overlay reflect corrected motion
 //
 // Startup filter (active until first stable lock):
 //   Gate 1 — absolute bounds (vx >= MIN_VX, |vy| <= MAX_VY)
@@ -15,8 +21,7 @@
 // EMA filter (active after lock, initialized at lock value — no transient):
 //   vx: alpha = RAFT_ALPHA_VX (default 0.4) → ~15ms group delay
 //   vy: alpha = RAFT_ALPHA_VY (default 0.2) → ~40ms group delay
-//   output[t] = alpha * input[t] + (1-alpha) * output[t-1]
-//   Set RAFT_ALPHA_VX=1.0 / RAFT_ALPHA_VY=1.0 to disable filtering.
+//   Set RAFT_ALPHA_VX=1.0 / RAFT_ALPHA_VY=1.0 to disable.
 
 #include "egl_map.hpp"
 #include "nv12_to_rgb_fp16.hpp"
@@ -38,8 +43,6 @@ static const char *env_str  (const char *k, const char *d) { const char *v=geten
 
 
 // ── EMA filter ────────────────────────────────────────────────────────────────
-// Initialized at first value → zero transient at startup.
-// alpha=1.0 → pass-through (no filtering).
 struct EMA {
     float alpha  = 1.0f;
     float value  = 0.0f;
@@ -75,24 +78,23 @@ struct State {
     float sharp_strength = 1.5f;
 
     // Startup gate 1 — absolute bounds
-    float min_vx_kmh = 5.0f;   // RAFT_MIN_VX_KMH
-    float max_vy_kmh = 3.0f;   // RAFT_MAX_VY_KMH
+    float min_vx_kmh = 5.0f;
+    float max_vy_kmh = 3.0f;
 
     // Startup gate 2 — gap-aware derivative bound
-    float    max_dvx_kmh      = 5.0f;  // RAFT_MAX_DVX_KMH
-    int      max_valid_gap    = 3;     // RAFT_MAX_VALID_GAP
+    float    max_dvx_kmh      = 5.0f;
+    int      max_valid_gap    = 3;
     float    last_valid_vx    = -1.0f;
     uint32_t last_valid_frame = 0;
 
     // Startup gate 3 — consecutive valid frames
-    int  min_consecutive   = 3;        // RAFT_MIN_CONSECUTIVE
+    int  min_consecutive   = 3;
     int  consecutive_valid = 0;
 
-    // Lock flag — set permanently after first stable lock.
-    // All startup gates are bypassed once locked.
+    // Lock flag
     bool locked = false;
 
-    // EMA filters — initialized at lock value, no transient
+    // EMA filters
     EMA  ema_vx;
     EMA  ema_vy;
 
@@ -108,7 +110,7 @@ struct State {
 
     FILE        *csv_file = nullptr;
 
-    // Focus of Expansion correction coefficients
+    // FOE correction coefficients
     // mean_v_corrected = mean_v - (foe_a * mean_u + foe_b)
     float foe_a = 0.0f;
     float foe_b = 0.0f;
@@ -157,23 +159,22 @@ static bool init_once(State *st, int W, int H)
     int nx = 0, ny = 0;
     for (int x = rx0; x < rx1; x += st->step) nx++;
     for (int y = ry0; y < ry1; y += st->step) ny++;
-    const int N = nx * ny;
 
     std::fprintf(stderr,
         "[raft_of] Init W=%d H=%d engine=%s\n"
         "[raft_of] ROI px=[%d,%d]x[%d,%d]  step=%d  N=%d points\n"
-        "[raft_of] mean_u = sum(u_i) / %d,  mean_v = sum(v_i) / %d\n"
+        "[raft_of] FOE correction               : A=%.4f  B=%.3f (numerical + visual)\n"
         "[raft_of] startup gate 1 (absolute)   : vx >= %.1f km/h, |vy| <= %.1f km/h\n"
         "[raft_of] startup gate 2 (derivative) : |dvx| <= %.1f km/h/frame, gap <= %d frames\n"
         "[raft_of] startup gate 3 (consecutive): %d valid frames in a row to lock\n"
-        "[raft_of] EMA filter                  : alpha_vx=%.2f (~%.0fms)  alpha_vy=%.2f (~%.0fms)\n",
+        "[raft_of] EMA filter                  : alpha_vx=%.2f  alpha_vy=%.2f\n",
         W, H, engine_path,
-        rx0, rx1, ry0, ry1, st->step, N, N, N,
+        rx0, rx1, ry0, ry1, st->step, nx * ny,
+        st->foe_a, st->foe_b,
         st->min_vx_kmh, st->max_vy_kmh,
         st->max_dvx_kmh, st->max_valid_gap,
         st->min_consecutive,
-        st->ema_vx.alpha, (1.0f / st->ema_vx.alpha - 1.0f) * 10.0f,
-        st->ema_vy.alpha, (1.0f / st->ema_vy.alpha - 1.0f) * 10.0f);
+        st->ema_vx.alpha, st->ema_vy.alpha);
 
     if (cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking) != cudaSuccess) {
         std::fprintf(stderr, "[raft_of] cudaStreamCreate failed\n");
@@ -236,11 +237,11 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                      egl.pitchY, egl.pitchUV,
                      W, H, st->d_frame_curr, st->stream);
 
-    // Step 3: unsharp mask sharpening (set RAFT_SHARP=0 to disable)
+    // Step 3: unsharp mask sharpening
     preprocess_sharpen(st->d_frame_curr, W, H,
                        st->sharp_strength, st->stream);
 
-    // Step 4: RAFT inference — produces flow field [1,2,H,W]
+    // Step 4: RAFT inference
     if (st->have_prev) {
         if (!st->raft.infer(st->d_frame_prev, st->d_frame_curr,
                             st->d_flow, st->stream)) {
@@ -249,7 +250,7 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
             const int rx0 = (int)(st->roi_x0 * W), rx1 = (int)(st->roi_x1 * W);
             const int ry0 = (int)(st->roi_y0 * H), ry1 = (int)(st->roi_y1 * H);
 
-            // Step 5: GPU reduction → mean_u, mean_v over ROI
+            // Step 5: GPU reduction on raw flow → mean_u, mean_v
             flow_reduce(st->d_flow, W, H,
                         rx0, rx1, ry0, ry1,
                         st->step, st->d_result, st->stream);
@@ -259,37 +260,28 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                             cudaMemcpyDeviceToHost, st->stream);
             cudaStreamSynchronize(st->stream);
 
-            // Step 6: FOE correction
-            // Removes spurious vertical flow caused by camera pitch.
+            // Step 6: FOE correction (numerical)
             // mean_v_corrected = mean_v - (foe_a * mean_u + foe_b)
             const float v_foe = res.mean_v - (st->foe_a * res.mean_u + st->foe_b);
 
             // Step 7: convert px/frame → km/h
-            // vx = -mean_u * (1/px_per_m) * FPS * 3.6  (forward → negative u)
-            // vy =  v_foe  * (1/px_per_m) * FPS * 3.6
             const float px_per_m = env_float("RAFT_PX_PER_M", 424.0f);
             const float SCALE    = (1.0f / px_per_m) * 100.0f * 3.6f;
             const float vx_raw   = -res.mean_u * SCALE;
             const float vy_raw   =  v_foe      * SCALE;
 
-            // Step 8: startup filter — only active before lock
+            // Step 8: startup filter
             bool emit = true;
 
             if (!st->locked) {
-                // Gate 1: absolute bounds
-                const bool valid_abs = (vx_raw        >= st->min_vx_kmh) &&
-                                       (fabsf(vy_raw)  <= st->max_vy_kmh);
-
-                // Gate 2: gap-aware derivative bound
-                const int  gap       = (int)st->frame_id - (int)st->last_valid_frame;
-                const bool ref_fresh = (st->last_valid_vx >= 0.0f) &&
-                                       (gap <= st->max_valid_gap);
-                const float dvx      = ref_fresh
-                                       ? fabsf(vx_raw - st->last_valid_vx)
-                                       : 0.0f;
+                const bool valid_abs  = (vx_raw >= st->min_vx_kmh) &&
+                                        (fabsf(vy_raw) <= st->max_vy_kmh);
+                const int  gap        = (int)st->frame_id - (int)st->last_valid_frame;
+                const bool ref_fresh  = (st->last_valid_vx >= 0.0f) &&
+                                        (gap <= st->max_valid_gap);
+                const float dvx       = ref_fresh ? fabsf(vx_raw - st->last_valid_vx) : 0.0f;
                 const bool valid_rate = (dvx <= st->max_dvx_kmh);
-
-                const bool valid = valid_abs && valid_rate;
+                const bool valid      = valid_abs && valid_rate;
 
                 if (!valid) {
                     st->consecutive_valid = 0;
@@ -320,11 +312,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
             }
 
             if (emit) {
-                // Step 9: EMA filter
-                // Initialized at first value after lock → no transient.
-                // alpha_vx=0.4 → ~15ms delay  (light smoothing for vx)
-                // alpha_vy=0.2 → ~40ms delay  (aggressive smoothing for vy HF noise)
-                // Set RAFT_ALPHA_VX/VY=1.0 to bypass.
                 const float vx_kmh = st->ema_vx.push(vx_raw);
                 const float vy_kmh = st->ema_vy.push(vy_raw);
 
@@ -340,7 +327,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                 }
             }
 
-            // Overlay always drawn — useful for visual debug on skipped frames too
+            // Step 9: FOE correction (visual) — in-place on d_flow
+            // Applied AFTER flow_reduce so numerical output is unaffected.
+            // Arrow field and resultant will show corrected motion.
+            foe_correct_flow(st->d_flow, H, W,
+                             st->foe_a, st->foe_b, st->stream);
+
+            // Step 10: overlay — arrow field (FOE-corrected)
             overlay_draw_flow(
                 egl.d_y, egl.d_uv,
                 egl.pitchY, egl.pitchUV,
@@ -350,11 +343,12 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                 st->step, st->arrow_scale, st->min_mag,
                 st->stream);
 
+            // Step 11: overlay — resultant vector using v_foe
             overlay_draw_resultant(
                 egl.d_y, egl.d_uv,
                 egl.pitchY, egl.pitchUV,
                 W, H,
-                res.mean_u, res.mean_v,
+                res.mean_u, v_foe,
                 st->roi_x0, st->roi_x1,
                 st->roi_y0, st->roi_y1,
                 st->result_scale, st->stream);
@@ -364,7 +358,6 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
     cudaStreamSynchronize(st->stream);
     egl_unmap(egl);
 
-    // Swap prev/curr frame buffers
     float *tmp       = st->d_frame_prev;
     st->d_frame_prev = st->d_frame_curr;
     st->d_frame_curr = tmp;

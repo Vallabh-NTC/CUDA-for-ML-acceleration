@@ -64,6 +64,36 @@ __device__ void draw_arrow(
     draw_line(d_y,d_uv,pitchY,pitchUV,W,H, x1,y1, x1-ahx-apx,y1-ahy-apy, Yc,Uc,Vc);
 }
 
+
+// ── FOE correction kernel ─────────────────────────────────────────────────────
+// Applies pitch correction to the full flow field in-place, for visualization.
+// For each pixel:  v_corrected = v - (foe_a * u + foe_b)
+// Flow layout: [1, 2, H, W] — ch0 = u at offset 0, ch1 = v at offset H*W
+__global__ void foe_correct_flow_kernel(float *flow, int H, int W,
+                                        float foe_a, float foe_b)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    const int idx_u = y * W + x;
+    const int idx_v = H * W + y * W + x;
+
+    const float u = flow[idx_u];
+    flow[idx_v] -= (foe_a * u + foe_b);
+}
+
+void foe_correct_flow(float *d_flow, int H, int W,
+                      float foe_a, float foe_b,
+                      cudaStream_t stream)
+{
+    if (foe_a == 0.0f && foe_b == 0.0f) return;
+    dim3 block(16, 16);
+    dim3 grid((W + 15) / 16, (H + 15) / 16);
+    foe_correct_flow_kernel<<<grid, block, 0, stream>>>(d_flow, H, W, foe_a, foe_b);
+}
+
+
 // ── Flow field kernel ─────────────────────────────────────────────────────────
 __global__ void overlay_field_kernel(
     uint8_t     *d_y, uint8_t *d_uv,
@@ -86,9 +116,10 @@ __global__ void overlay_field_kernel(
     int x1=max(0,min(W-1,px+(int)lrintf(u*arrow_scale)));
     int y1=max(0,min(H-1,py+(int)lrintf(v*arrow_scale)));
 
-    // Green arrows for field (Y=150, U=44, V=21 → greenish)
+    // Green arrows (Y=150, U=44, V=21)
     draw_arrow(d_y,d_uv,pitchY,pitchUV,W,H, px,py,x1,y1, 150,44,21, 1);
 }
+
 
 // ── Resultant vector kernel (single thread) ───────────────────────────────────
 // Blue arrow in NV12: Y=29, U=255, V=107
@@ -96,18 +127,18 @@ __global__ void overlay_resultant_kernel(
     uint8_t    *d_y, uint8_t *d_uv,
     int         pitchY, int pitchUV, int W, int H,
     float       mean_u, float mean_v,
-    int         cx, int cy,          // center of ROI in pixels
-    float       result_scale)        // visual scale for resultant
+    int         cx, int cy,
+    float       result_scale)
 {
     if (threadIdx.x!=0||blockIdx.x!=0) return;
 
     int x1=max(0,min(W-1, cx+(int)lrintf(mean_u*result_scale)));
     int y1=max(0,min(H-1, cy+(int)lrintf(mean_v*result_scale)));
 
-    // Draw thick blue arrow (thickness=4)
     draw_arrow(d_y,d_uv,pitchY,pitchUV,W,H, cx,cy,x1,y1,
                29,255,107, 4);
 }
+
 
 // ── Host wrappers ─────────────────────────────────────────────────────────────
 void overlay_draw_flow(
@@ -137,7 +168,6 @@ void overlay_draw_resultant(
     float       result_scale,
     cudaStream_t stream)
 {
-    // Center of ROI
     const int cx = (int)((roi_x0 + roi_x1) * 0.5f * W);
     const int cy = (int)((roi_y0 + roi_y1) * 0.5f * H);
 

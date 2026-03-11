@@ -4,6 +4,15 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// Apply FOE pitch correction to the RAFT flow field in-place.
+// Flow layout: [1, 2, H, W] — ch0 = u (horizontal), ch1 = v (vertical)
+// For each pixel:  v_corrected = v - (foe_a * u + foe_b)
+// Call AFTER flow_reduce (numerical output unaffected) and BEFORE
+// overlay_draw_flow / overlay_draw_resultant. No-op if foe_a==0 && foe_b==0.
+void foe_correct_flow(float *d_flow, int H, int W,
+                      float foe_a, float foe_b,
+                      cudaStream_t stream = 0);
+
 // Draw flow field arrows (green) over the ROI
 void overlay_draw_flow(
     uint8_t      *d_y, uint8_t *d_uv,
