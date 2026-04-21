@@ -24,3 +24,5 @@ AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/Recorder*
 # Pyenv (windows server)
 AI-chassis-control-pipeline/windows_udp_server/.venvE3
 AI-chassis-control-pipeline/windows_udp_server/__pycache__
+# E3 arxml
+AI-chassis-control-pipeline/windows_udp_server/config/e3/E3_1_2_Premium_HCP1.arxml
