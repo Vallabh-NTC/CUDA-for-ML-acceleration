@@ -18,3 +18,9 @@ Thumbs.db
 
 # jetpack public sources bsp
 public_sources.tbz2
+
+# Canape Recordings
+AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/Recorder*
+# Pyenv (windows server)
+AI-chassis-control-pipeline/windows_udp_server/.venvE3
+AI-chassis-control-pipeline/windows_udp_server/__pycache__

@@ -1,0 +1,8 @@
+# E3 signals to acquire - one per line (lines starting with # are comments)
+# Add here the exact signal names as they appear in the CANape E3 project
+
+# DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS
+Sig1
+Sig2
+Sig3
+Sig4

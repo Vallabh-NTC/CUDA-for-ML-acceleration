@@ -1,0 +1,2 @@
+# No external Python dependencies required for standalone E3 acquisition.
+# Uses only standard Python libraries + CANape API DLL installed on the PC.
