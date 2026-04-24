@@ -34,6 +34,10 @@ def _read_signal_names_from_file(signals_file: Path) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        # Strip inline comments before splitting
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
         signal_names.extend(token for token in line.split() if token.strip())
 
     if not signal_names:
