@@ -1,8 +1,30 @@
 # E3 signals to acquire - one per line (lines starting with # are comments)
 # Add here the exact signal names as they appear in the CANape E3 project
 
-# DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS
-Sig1
-Sig2
-Sig3
-Sig4
+# DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS # gear N D P R
+
+VDSO_Vx3dKmph                                       # flex_ESP_21_ESP_v_Signal 
+VDSO_ALatOfsCmp                                     # flex_SARA_06_SARA_Accel_X_010
+# flex_SARA_10_SARA_Accel_X_b
+VDSO_ALgtOfsCmp                                     # flex_SARA_06_SARA_Accel_Y_010
+# flex_SARA_10_SARA_Accel_Y_b
+VDSO_AgvYawRateOfsCmp                               # flex_SARA_06_SARA_Omega_Z_010
+# flex_SARA_10_SARA_Omega_Z_b
+LWI_AgStgWhl                                        # flex_LWI_01_LWI_Lenkradwinkel
+# flex_LWI_01_LWI_VZ_Lenkradwinkel
+# flex_LWI_01_LWI_Lenkradw_Geschw
+# flex_LWI_01_LWI_VZ_Lenkradw_Geschw
+EPS_StgTq	                                        # flex_LH_EPS_03_EPS_Lenkmoment
+# flex_LH_EPS_03_EPS_VZ_Lenkmoment
+OTP_Aussen_Temp_ungef                               # flex_Klima_Sensor_02_BCM1_Aussen_Temp_ungef
+API_PrctDrvPed                                      # flex_Motor_20_MO_Fahrpedalrohwert_01
+DBR_FBrkPedDrv                                      # flex_Bremse_EV_01_EBKV_Fahrer_bremst
+DBR_PrctLPosnBrkPedDrv                              # flex_Bremse_EV_01_EBKV_Bremspedalweg
+# flex_ESP_05_ESP_Bremsdruck
+BLC_BrkLghtReq                                      # flex_Motor_14_MO_BLS
+DPM_StDispDrvPosn                                   # flex_Getriebe_11_GE_Zielgang
+VDSO_VWhlSpdFrLe                                    # flex_ESP_03_ESP_VL_Radgeschw
+VDSO_VWhlSpdFrRi                                    # flex_ESP_03_ESP_VR_Radgeschw
+VDSO_VWhlSpdReLe                                    # flex_ESP_03_ESP_HL_Radgeschw
+VDSO_VWhlSpdReLi                                    # flex_ESP_03_ESP_HR_Radgeschw
+# flex_ESP_21_ESP_Eingriff
