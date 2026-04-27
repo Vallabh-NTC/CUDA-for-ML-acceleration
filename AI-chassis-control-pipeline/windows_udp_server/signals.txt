@@ -28,3 +28,4 @@ VDSO_VWhlSpdFrRi                                    # flex_ESP_03_ESP_VR_Radgesc
 VDSO_VWhlSpdReLe                                    # flex_ESP_03_ESP_HL_Radgeschw
 VDSO_VWhlSpdReLi                                    # flex_ESP_03_ESP_HR_Radgeschw
 # flex_ESP_21_ESP_Eingriff
+VDSO_AgVehSideSlip                                  # not in flexray
