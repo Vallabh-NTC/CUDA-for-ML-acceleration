@@ -396,11 +396,16 @@ class CanapeE3SignalAcquisition:
             str(cfg["device_name"]): False for cfg in self.device_signal_configs
         }
         disconnect_timeout_s = max(5.0, self.status_interval * 3.0)
-        signal_order = [
-            signal_name
-            for cfg in self.device_signal_configs
-            for signal_name in list(cfg["signal_names"])
-        ]
+
+        # Build signal order and prefix map for UDP payload
+        signal_order = []
+        signal_prefix_map = {}
+        for cfg in self.device_signal_configs:
+            device_name = str(cfg["device_name"])
+            prefix = "eth_" if device_name.lower().startswith("e3") else ("smotion_" if device_name.lower().startswith("smotion") else f"{device_name.lower()}_")
+            for signal_name in list(cfg["signal_names"]):
+                signal_order.append(signal_name)
+                signal_prefix_map[signal_name] = prefix
         latest_values: dict[str, float] = {signal_name: 0.0 for signal_name in signal_order}
         latest_timestamp_s = 0.0
 
@@ -483,7 +488,7 @@ class CanapeE3SignalAcquisition:
 
             loop_elapsed_s = loop_start - run_start
             joined_values = " | ".join(
-                f"{signal_name}={latest_values[signal_name]}" for signal_name in signal_order
+                f"{signal_prefix_map[signal_name]}{signal_name}={latest_values[signal_name]}" for signal_name in signal_order
             )
             now_for_print = time.time()
             should_print = self.sample_interval <= 0 or (
@@ -494,8 +499,7 @@ class CanapeE3SignalAcquisition:
                     f"loop={loop_elapsed_s:.3f}s | data={latest_timestamp_s:.3f}s | {joined_values}"
                 )
                 if self._udp_sock is not None:
-                    payload: dict[str, float] = {"t": round(latest_timestamp_s, 4)}
-                    payload.update({name: latest_values[name] for name in signal_order})
+                    payload: dict[str, float] = {f"{signal_prefix_map[name]}{name}": latest_values[name] for name in signal_order}
                     try:
                         self._udp_sock.sendto(
                             json.dumps(payload).encode("utf-8"),
