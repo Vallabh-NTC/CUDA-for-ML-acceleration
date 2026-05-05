@@ -20,7 +20,7 @@ Thumbs.db
 public_sources.tbz2
 
 # Canape Recordings
-AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/Recorder*
+AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/vn5650_smotion/Recorder*
 # Pyenv (windows server)
 AI-chassis-control-pipeline/windows_udp_server/.venvE3
 AI-chassis-control-pipeline/windows_udp_server/__pycache__
@@ -28,3 +28,4 @@ AI-chassis-control-pipeline/windows_udp_server/__pycache__
 AI-chassis-control-pipeline/windows_udp_server/config/e3/E3_1_2_Premium_HCP1.arxml
 AI-chassis-control-pipeline/windows_udp_server/config/e3/E3_1_2_Premium_MFK_5_NIP_V12.06.91.F.arxml
 AI-chassis-control-pipeline/windows_udp_server/config/smotion/SMOTION.dbc
+AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/vn5650_smotion/Recorder_2026-05-05_13-03-25.mf4
