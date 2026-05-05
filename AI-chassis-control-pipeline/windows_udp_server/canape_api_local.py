@@ -39,17 +39,42 @@ def _registry_canape_base_path() -> str | None:
         return None
 
 
+def _resolve_dll_from_path(path_value: str) -> Path | None:
+    raw = path_value.strip()
+    if not raw:
+        return None
+
+    p = Path(raw).expanduser().resolve()
+    candidates: list[Path] = []
+
+    if p.is_file():
+        candidates.append(p)
+    elif p.is_dir():
+        candidates.append(p / _dll_name())
+        candidates.append(p / "CANapeAPI" / _dll_name())
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    return None
+
+
 def get_canape_dll_path() -> Path:
     env_path = os.getenv("CANAPE_DLL_PATH", "").strip()
     if env_path:
-        p = Path(env_path).expanduser().resolve()
-        if p.exists():
-            return p
+        resolved_env = _resolve_dll_from_path(env_path)
+        if resolved_env is not None:
+            return resolved_env
 
     base = _registry_canape_base_path()
     if base:
+        resolved_base = _resolve_dll_from_path(base)
+        if resolved_base is not None:
+            return resolved_base
+
         p = Path(base) / "CANapeAPI" / _dll_name()
-        if p.exists():
+        if p.exists() and p.is_file():
             return p
 
     raise FileNotFoundError(
