@@ -1,0 +1,5 @@
+# Segnali Ethernet da acquisire
+# Uno per riga; # per commenti
+
+DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS
+LWI_AgStgWhl

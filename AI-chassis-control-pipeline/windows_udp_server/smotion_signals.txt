@@ -1,0 +1,5 @@
+# Segnali SMOTION da acquisire
+# Uno per riga; # per commenti
+
+AccY_body
+AccZ_body

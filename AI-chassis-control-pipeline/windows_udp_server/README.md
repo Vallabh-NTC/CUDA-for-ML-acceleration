@@ -1,18 +1,12 @@
-# Windows UDP Server — CANape E3 Signal Acquisition
+# Windows UDP Server - CANape E3 Multi-device Acquisition
 
-Reads one or more signals from CANape (E3 interface) in a loop, prints them to the console, and optionally streams each sample as a JSON packet over UDP.
+Acquisisce segnali da CANape su due device (Ethernet e SMOTION), stampa i valori a console e opzionalmente invia i dati in UDP come JSON.
 
----
+## Requisiti
 
-## Requirements
-
-- **Windows only** — uses the CANape ASAP3 API DLL
-- **Python 3.9+**
-- CANape installed on the machine (the DLL is auto-discovered from the installation)
-
-No external Python packages are required — only the standard library is used.
-
----
+- Windows (usa API ASAP3 via DLL CANape)
+- Python 3.9+
+- CANape installato sulla macchina
 
 ## Setup
 
@@ -20,108 +14,78 @@ No external Python packages are required — only the standard library is used.
 .\setup_venv.ps1
 ```
 
-This creates a `.venvE3` virtual environment and installs dependencies from `requirements.txt`.
-
-Activate manually if needed:
+Attivazione manuale (se serve):
 
 ```powershell
 .\.venvE3\Scripts\Activate.ps1
 ```
 
----
+## File segnali
 
-## Signal List
+Per default il programma legge:
 
-Signals to acquire are listed in `signals.txt`, one per line. Lines starting with `#` are comments.
+- eth_signals.txt
+- smotion_signals.txt
 
+Formato: un segnale per riga, # per commenti.
+
+Esempio:
+
+```text
+# commento
+DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS
+LWI_AgStgWhl
 ```
-# Example signals.txt
-Sig1
-Sig2
-Sig3
-Sig4
+
+```text
+# commento
+AccY_body
+AccZ_body
 ```
 
-Signals can also be passed directly on the command line with `--signal` (see below).
+## Configurazione CANape di default
 
----
+Cartella progetto passata ad Asap3Init5:
 
-## Usage
+- config/e3/canape/vn5650_smotion
 
-### Basic — read signals defined in `signals.txt`
+## Avvio rapido
+
+Acquisizione con file segnali di default:
 
 ```powershell
-python main.py
+python .\main.py
 ```
 
-### Specify signals inline
+Acquisizione + invio UDP:
 
 ```powershell
-python main.py --signal VehV_v VehAX_ax
+python .\main.py --udp-host 192.168.1.20 --udp-port 5005
 ```
 
-### Enable UDP output
-
-```powershell
-python main.py --udp-host 192.168.1.20 --udp-port 5005
-```
-
-Each acquired sample is sent as a JSON packet:
+Esempio payload UDP:
 
 ```json
-{"t": 1234.5678, "Sig1": 0.0, "Sig2": -1.5, "Sig3": 0.3, "Sig4": 2.1}
+{"t": 1234.5678, "DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS": 2.0, "LWI_AgStgWhl": 0.12, "AccY_body": -0.05, "AccZ_body": 9.81}
 ```
 
-When no samples are available (FIFO empty), a zero-value packet is sent at `--status-interval` rate:
+## Opzioni principali
 
-```json
-{"t": 0.0, "Sig1": 0, "Sig2": 0, "Sig3": 0, "Sig4": 0}
-```
+- --eth-signal: segnali Ethernet da CLI
+- --eth-signals-file: file segnali Ethernet (default: eth_signals.txt)
+- --eth-device: device Ethernet CANape (default: E3_1_2_Premium_HCP1)
+- --smotion-signal: segnali SMOTION da CLI
+- --smotion-signals-file: file segnali SMOTION (default: smotion_signals.txt)
+- --smotion-device: device SMOTION CANape (default: SMOTION)
+- --canape-folder: cartella progetto CANape (default: config/e3/canape/vn5650_smotion)
+- --cna-file: CNA opzionale
+- --udp-host: IP destinazione UDP (se omesso, UDP disattivo)
+- --udp-port: porta destinazione UDP (default: 5005)
+- --sample-interval: intervallo stampa console (default: 0.01)
+- --status-interval: intervallo messaggi stato (default: 2.0)
+- --list-modules-only: inizializza, stampa moduli, esce
+- --auto-device: fallback al primo modulo disponibile
 
-If `--udp-host` is omitted, UDP output is disabled.
+Compatibilita legacy:
 
-### Discover available CANape modules
-
-```powershell
-python main.py --list-modules-only
-```
-
----
-
-## All Options
-
-| Argument | Default | Description |
-|---|---|---|
-| `--signal` | — | One or more signal names (space-separated) |
-| `--signals-file` | `signals.txt` | Path to signal list file |
-| `--canape-device` | `e3` | CANape device name |
-| `--canape-folder` | `config/e3/canape` | CANape project folder (passed to `Asap3Init5`) |
-| `--cna-file` | — | Optional `.cna` project file to load |
-| `--sample-interval` | `0.1` | Loop interval in seconds |
-| `--status-interval` | `2.0` | Seconds between status messages when FIFO is empty |
-| `--device-discovery-timeout` | `6.0` | Max seconds to wait for device after init |
-| `--auto-device` | off | Auto-select the first available module if the named device is not found |
-| `--diagnostics` | off | Print extra diagnostics on modules/device/task |
-| `--asap-modal` / `--no-asap-modal` | on | Enable/disable modal mode in `Asap3Init5` |
-| `--list-modules-only` | off | Init CANape, print exposed modules, then exit |
-| `--udp-host` | — | UDP destination IP. If omitted, UDP is disabled |
-| `--udp-port` | `5005` | UDP destination port |
-
----
-
-## Console Output Format
-
-Each sample is printed as:
-
-```
-1234.568s | Sig1=0.0 | Sig2=-1.5 | Sig3=0.3 | Sig4=2.1
-```
-
-When the FIFO is empty:
-
-```
-[status] Nessun campione disponibile (FIFO=0) sul task 1
-0.000s | Sig1=0 | Sig2=0 | Sig3=0 | Sig4=0
-```
-
-Press **CTRL+C** to stop acquisition cleanly.
+- --signal e --signals-file sono ancora supportati e confluiscono nel gruppo Ethernet.
