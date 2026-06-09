@@ -1,5 +1,27 @@
 # Segnali Ethernet da acquisire
 # Uno per riga; # per commenti
 
-DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS
+VDSO_Vx3dKmph
+IMU_ALat
+IMU_ALgt
+IMU_YawRate
 LWI_AgStgWhl
+EPS_RackPosnSpd
+EPS_SpdResv
+EPS_StgTq
+OTP_Aussen_Temp_ungef
+API_PrctDrvPed
+API_StDrvPed
+DBR_PrctLPosnBrkPedDrv
+DBR_LPosnBrkPedDrv
+DBR_FBrkPedDrv
+VMM_BrkPed_ItDmdNorm
+BLC_BrkLghtReq_XIX_ESC_03_XIX_VLAN_FAS
+DBR_IdcDrvBrk_XIX_ESC_06_XIX_VLAN_FAS
+DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS
+VDSO_VWhlSpdFrLe
+VDSO_VWhlSpdFrRi
+VDSO_VWhlSpdReLe
+VDSO_VWhlSpdReRi
+VDC_Intv
+VDSO_AgVehSideSlip

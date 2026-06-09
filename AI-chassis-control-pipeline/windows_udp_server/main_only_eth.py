@@ -397,15 +397,13 @@ class CanapeE3SignalAcquisition:
         }
         disconnect_timeout_s = max(5.0, self.status_interval * 3.0)
 
-        # Build signal order and prefix map for UDP payload
+        # Build signal order and fixed Ethernet prefix for UDP payload
         signal_order = []
         signal_prefix_map = {}
         for cfg in self.device_signal_configs:
-            device_name = str(cfg["device_name"])
-            prefix = "eth_" if device_name.lower().startswith("e3") else ("smotion_" if device_name.lower().startswith("smotion") else f"{device_name.lower()}_")
             for signal_name in list(cfg["signal_names"]):
                 signal_order.append(signal_name)
-                signal_prefix_map[signal_name] = prefix
+                signal_prefix_map[signal_name] = "eth_"
         latest_values: dict[str, float] = {signal_name: 0.0 for signal_name in signal_order}
         latest_timestamp_s = 0.0
 
@@ -548,7 +546,7 @@ class CanapeE3SignalAcquisition:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Legge in loop segnali da CANape (E3) su device multipli, stampati a console e inviati via UDP.",
+        description="Legge in loop segnali Ethernet da CANape (E3), stampati a console e inviati via UDP.",
     )
     parser.add_argument(
         "--eth-signal",
@@ -565,22 +563,6 @@ def parse_args() -> argparse.Namespace:
         "--eth-device",
         default="E3_1_2_Premium_HCP1",
         help="Nome device Ethernet in CANape (default: E3_1_2_Premium_HCP1)",
-    )
-    parser.add_argument(
-        "--smotion-signal",
-        default=[],
-        nargs="+",
-        help="Uno o piu' nomi segnale SMOTION (es: AccY_body AccZ_body)",
-    )
-    parser.add_argument(
-        "--smotion-signals-file",
-        default=str(Path(__file__).resolve().parent / "smotion_signals.txt"),
-        help="Path file testo segnali SMOTION (uno per riga o separati da spazio; # per commenti)",
-    )
-    parser.add_argument(
-        "--smotion-device",
-        default="SMOTION",
-        help="Nome device SMOTION in CANape (default: SMOTION)",
     )
     parser.add_argument(
         "--signal",
@@ -685,8 +667,6 @@ def main() -> int:
         return _deduplicate_signal_names(signal_names_input)
 
     eth_signal_names = _build_signal_list(args.eth_signal, args.eth_signals_file)
-    smotion_signal_names = _build_signal_list(args.smotion_signal, args.smotion_signals_file)
-
     legacy_signals = _build_signal_list(args.signal, args.signals_file)
     if legacy_signals:
         eth_signal_names = _deduplicate_signal_names(eth_signal_names + legacy_signals)
@@ -694,8 +674,6 @@ def main() -> int:
     device_signal_configs: list[tuple[str, list[str]]] = []
     if eth_signal_names:
         device_signal_configs.append((args.eth_device, eth_signal_names))
-    if smotion_signal_names:
-        device_signal_configs.append((args.smotion_device, smotion_signal_names))
 
     canape_folder = Path(args.canape_folder).resolve()
     cna_file = Path(args.cna_file).resolve() if args.cna_file else None
@@ -703,8 +681,7 @@ def main() -> int:
     try:
         if not device_signal_configs and not args.list_modules_only:
             raise ValueError(
-                "Nessun segnale specificato: usa --eth-signals-file/--smotion-signals-file "
-                "o --eth-signal/--smotion-signal"
+                "Nessun segnale specificato: usa --eth-signals-file o --eth-signal"
             )
 
         acq = CanapeE3SignalAcquisition(

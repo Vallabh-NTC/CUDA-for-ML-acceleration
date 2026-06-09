@@ -22,7 +22,7 @@ DBR_FBrkPedDrv                                      # flex_Bremse_EV_01_EBKV_Fah
 DBR_PrctLPosnBrkPedDrv                              # flex_Bremse_EV_01_EBKV_Bremspedalweg
 # flex_ESP_05_ESP_Bremsdruck
 BLC_BrkLghtReq                                      # flex_Motor_14_MO_BLS
-DPM_StDispDrvPosn                                   # flex_Getriebe_11_GE_Zielgang
+DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS          # flex_Getriebe_11_GE_Zielgang
 VDSO_VWhlSpdFrLe                                    # flex_ESP_03_ESP_VL_Radgeschw
 VDSO_VWhlSpdFrRi                                    # flex_ESP_03_ESP_VR_Radgeschw
 VDSO_VWhlSpdReLe                                    # flex_ESP_03_ESP_HL_Radgeschw
