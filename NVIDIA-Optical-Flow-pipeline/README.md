@@ -42,7 +42,7 @@ GStreamer pipeline.
 
 ```bash
 # TensorRT engine path
-export RAFT_ENGINE_PATH=/home/ntc-orin/raft/raft_large_fp16.engine
+export RAFT_ENGINE_PATH=/home/jetson-ntc/raft/raft_large_fp16.engine
 
 # CSV output path
 export RAFT_CSV_PATH=/home/ntc-orin/raft/output.csv
@@ -238,7 +238,7 @@ vy_kmh =  mean_v_px × (1 / PX_PER_M) × FPS × 3.6
 
 ```bash
 gst-launch-1.0 -e \
-  filesrc location="/home/ntc-orin/Videos/sweep_log_6.mp4" ! \
+  filesrc location="/home/ntc-orin/Videos/sweep_log_7.mp4" ! \
   qtdemux name=dem dem.video_0 ! queue ! h264parse ! nvv4l2decoder ! \
   nvvidconv ! 'video/x-raw(memory:NVMM),format=NV12,width=672,height=376' ! \
   nvivafilter cuda-process=true \

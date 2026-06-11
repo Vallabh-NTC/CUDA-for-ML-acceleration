@@ -22,6 +22,10 @@
 //   vx: alpha = RAFT_ALPHA_VX (default 0.4) → ~15ms group delay
 //   vy: alpha = RAFT_ALPHA_VY (default 0.2) → ~40ms group delay
 //   Set RAFT_ALPHA_VX=1.0 / RAFT_ALPHA_VY=1.0 to disable.
+//
+// Locale note: setlocale(LC_NUMERIC, "C") is forced at init so that atof()
+// parses env vars with '.' as decimal separator, regardless of the system
+// locale (e.g. it_IT.UTF-8 would otherwise parse "0.62" as 0.0).
 
 #include "egl_map.hpp"
 #include "nv12_to_rgb_fp16.hpp"
@@ -36,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <clocale>
 
 static int         env_int  (const char *k, int   d) { const char *v=getenv(k); return v?atoi(v):d; }
 static float       env_float(const char *k, float d) { const char *v=getenv(k); return v?atof(v):d; }
@@ -76,6 +81,10 @@ struct State {
     float min_mag        = 1.5f;
     float result_scale   = 8.0f;
     float sharp_strength = 1.5f;
+
+    // Speed conversion (px/frame → km/h)
+    // SCALE = (1 / px_per_m) * 100 * 3.6
+    float scale_kmh = 0.0f;
 
     // Startup gate 1 — absolute bounds
     float min_vx_kmh = 5.0f;
@@ -128,6 +137,10 @@ static bool init_once(State *st, int W, int H)
     if (st->inited)      return true;
     if (st->init_failed) return false;
 
+    // Force C locale for numeric parsing — makes atof() use '.' as decimal
+    // separator regardless of the system locale (e.g. it_IT.UTF-8).
+    std::setlocale(LC_NUMERIC, "C");
+
     st->W = W; st->H = H;
 
     st->roi_x0          = env_float("RAFT_ROI_X0",          st->roi_x0);
@@ -151,8 +164,12 @@ static bool init_once(State *st, int W, int H)
     st->foe_a = env_float("RAFT_FOE_A", 0.0f);
     st->foe_b = env_float("RAFT_FOE_B", 0.0f);
 
+    // Speed scale — read once at init, not per frame
+    const float px_per_m = env_float("RAFT_PX_PER_M", 424.0f);
+    st->scale_kmh = (1.0f / px_per_m) * 100.0f * 3.6f;
+
     const char *engine_path = env_str("RAFT_ENGINE_PATH",
-        "/home/ntc-orin/raft/raft_large_fp16.engine");
+        "/home/jetson-ntc/raft/raft_large_fp16.engine");
 
     const int rx0 = (int)(st->roi_x0 * W), rx1 = (int)(st->roi_x1 * W);
     const int ry0 = (int)(st->roi_y0 * H), ry1 = (int)(st->roi_y1 * H);
@@ -167,14 +184,16 @@ static bool init_once(State *st, int W, int H)
         "[raft_of] startup gate 1 (absolute)   : vx >= %.1f km/h, |vy| <= %.1f km/h\n"
         "[raft_of] startup gate 2 (derivative) : |dvx| <= %.1f km/h/frame, gap <= %d frames\n"
         "[raft_of] startup gate 3 (consecutive): %d valid frames in a row to lock\n"
-        "[raft_of] EMA filter                  : alpha_vx=%.2f  alpha_vy=%.2f\n",
+        "[raft_of] EMA filter                  : alpha_vx=%.2f  alpha_vy=%.2f\n"
+        "[raft_of] Speed scale                 : px_per_m=%.1f → %.6f (km/h per px/frame)\n",
         W, H, engine_path,
         rx0, rx1, ry0, ry1, st->step, nx * ny,
         st->foe_a, st->foe_b,
         st->min_vx_kmh, st->max_vy_kmh,
         st->max_dvx_kmh, st->max_valid_gap,
         st->min_consecutive,
-        st->ema_vx.alpha, st->ema_vy.alpha);
+        st->ema_vx.alpha, st->ema_vy.alpha,
+        px_per_m, st->scale_kmh);
 
     if (cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking) != cudaSuccess) {
         std::fprintf(stderr, "[raft_of] cudaStreamCreate failed\n");
@@ -202,7 +221,7 @@ static bool init_once(State *st, int W, int H)
     cudaMemset(st->d_flow,       0, flow_bytes);
     cudaMemset(st->d_result,     0, sizeof(FlowResult));
 
-    const char *csv_path = env_str("RAFT_CSV_PATH", "/home/ntc-orin/raft/output.csv");
+    const char *csv_path = env_str("RAFT_CSV_PATH", "/home/jetson-ntc/raft/output.csv");
     st->csv_file = std::fopen(csv_path, "w");
     if (!st->csv_file) {
         std::fprintf(stderr, "[raft_of] Cannot open CSV: %s\n", csv_path);
@@ -265,10 +284,8 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
             const float v_foe = res.mean_v - (st->foe_a * res.mean_u + st->foe_b);
 
             // Step 7: convert px/frame → km/h
-            const float px_per_m = env_float("RAFT_PX_PER_M", 424.0f);
-            const float SCALE    = (1.0f / px_per_m) * 100.0f * 3.6f;
-            const float vx_raw   = -res.mean_u * SCALE;
-            const float vy_raw   =  v_foe      * SCALE;
+            const float vx_raw = -res.mean_u * st->scale_kmh;
+            const float vy_raw =  v_foe      * st->scale_kmh;
 
             // Step 8: startup filter
             bool emit = true;
