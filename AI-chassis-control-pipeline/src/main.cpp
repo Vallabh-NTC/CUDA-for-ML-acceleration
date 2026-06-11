@@ -313,6 +313,8 @@ struct SharedState {
     CameraSnapshot cam0;
     CameraSnapshot cam2;
     uint64_t vector_seq = 0;
+    uint64_t cam0_seq = 0;
+    uint64_t cam2_seq = 0;
 };
 
 void camera_worker(
@@ -386,10 +388,13 @@ void camera_worker(
             std::lock_guard<std::mutex> lk(shared.mtx);
             if (sensor_id == 0) {
                 shared.cam0 = std::move(cam);
+                ++shared.cam0_seq;
             } else if (sensor_id == 2) {
                 shared.cam2 = std::move(cam);
+                ++shared.cam2_seq;
             }
         }
+        shared.cv.notify_one();
 
         gst_sample_unref(sample);
     }
@@ -612,6 +617,8 @@ int main(int argc, char** argv)
 
     uint64_t idx = 0;
     uint64_t consumed_vector_seq = 0;
+    uint64_t consumed_cam0_seq = 0;
+    uint64_t consumed_cam2_seq = 0;
 
     while (true) {
         VectorSnapshot vector_snapshot;
@@ -620,11 +627,25 @@ int main(int argc, char** argv)
 
         {
             std::unique_lock<std::mutex> lk(shared.mtx);
-            shared.cv.wait(lk, [&]() { return shared.vector_seq != consumed_vector_seq; });
+            shared.cv.wait(lk, [&]() {
+                return shared.vector_seq != consumed_vector_seq ||
+                       shared.cam0_seq != consumed_cam0_seq ||
+                       shared.cam2_seq != consumed_cam2_seq;
+            });
             consumed_vector_seq = shared.vector_seq;
+            consumed_cam0_seq = shared.cam0_seq;
+            consumed_cam2_seq = shared.cam2_seq;
             vector_snapshot = shared.vector_snapshot;
             cam0 = shared.cam0;
             cam2 = shared.cam2;
+        }
+
+        if (cam0.image_path.empty() && cam2.image_path.empty()) {
+            continue;
+        }
+
+        if (vector_snapshot.ts.tv_sec == 0 && vector_snapshot.ts.tv_nsec == 0) {
+            vector_snapshot.ts = now_realtime();
         }
 
         ++idx;
