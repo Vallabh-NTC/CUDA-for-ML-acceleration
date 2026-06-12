@@ -4,23 +4,46 @@
 //
 // Processing chain:
 //   EGLImage (NVMM) → NV12→float32 → Sharpen → RAFT TRT → flow_reduce
-//   → FOE correction (numerical) → Startup filter → EMA → CSV + stdout
-//   → FOE correction (visual, in-place on d_flow) → overlay
+//   → axis mapping (TILTED mount) → FOE correction → Startup filter → EMA
+//   → CSV + stdout → overlay
 //
-// The FOE correction is applied twice:
-//   1. Numerically on the reduced mean_v → used for vy_kmh and CSV output
-//   2. Visually via foe_correct_flow() on the full flow field → arrows and
-//      resultant vector on the overlay reflect corrected motion
+// ── AXIS MAPPING (tilted mount, 2026-06) ───────────────────────────────────
+//   The camera is no longer parallel to the ground. With this mounting the
+//   vehicle's FORWARD motion appears as VERTICAL image flow (mean_v), and the
+//   lateral / yaw motion appears as HORIZONTAL image flow (mean_u). This is
+//   the opposite of the old parallel mount, where forward motion was in u.
+//
+//     vx (forward) = -mean_v * scale       (was -mean_u)
+//     vy (lateral) =  mean_u * scale        (was  mean_v)
+//
+//   Validated against vehicle telemetry (eth_VDSO_Vx3dKmph):
+//     corr(-mean_v, Vx) = 0.98, error mean -0.07 km/h, std 0.68 km/h (0–14 km/h).
+//
+//   NOTE: vy now derives from mean_u, which also picks up yaw rotation at low
+//   speed — vy / beta still need a yaw-decoupling step before they are trusted.
+//
+// The FOE correction now applies to the LATERAL channel (mean_u), scaled by
+// the forward signal (mean_v):
+//     lat_corrected = mean_u - (foe_a * mean_v + foe_b)
+// With FOE_A=FOE_B=0 (default) it is a no-op. foe_correct_flow() in overlay.cu
+// still corrects the v-channel of the flow field for visualization only; it is
+// also a no-op while FOE is zero. Revisit it when recalibrating FOE on u.
+//
+// Speed scale (px/frame → km/h):
+//     scale = (1 / PX_PER_M) * FPS * 3.6
+//   FPS is now configurable via RAFT_FPS (default 30) — previously hardcoded
+//   to 100 for the old 100-fps camera. PX_PER_M default updated to 55.
 //
 // Startup filter (active until first stable lock):
 //   Gate 1 — absolute bounds (vx >= MIN_VX, |vy| <= MAX_VY)
 //   Gate 2 — gap-aware derivative bound (|dvx| <= MAX_DVX)
 //   Gate 3 — consecutive valid frames (MIN_CONSECUTIVE in a row)
 //   Once locked, all frames are emitted unconditionally.
+//   Set the bounds wide (e.g. MIN_VX very negative) to effectively disable.
 //
 // EMA filter (active after lock, initialized at lock value — no transient):
-//   vx: alpha = RAFT_ALPHA_VX (default 0.4) → ~15ms group delay
-//   vy: alpha = RAFT_ALPHA_VY (default 0.2) → ~40ms group delay
+//   vx: alpha = RAFT_ALPHA_VX (default 0.4)
+//   vy: alpha = RAFT_ALPHA_VY (default 0.2)
 //   Set RAFT_ALPHA_VX=1.0 / RAFT_ALPHA_VY=1.0 to disable.
 //
 // Locale note: setlocale(LC_NUMERIC, "C") is forced at init so that atof()
@@ -70,10 +93,10 @@ struct State {
     int   W = 0, H = 0;
 
     // ROI in normalized coordinates [0,1]
-    float roi_x0 = 0.55f;
-    float roi_x1 = 0.95f;
-    float roi_y0 = 0.45f;
-    float roi_y1 = 0.68f;
+    float roi_x0 = 0.15f;
+    float roi_x1 = 0.85f;
+    float roi_y0 = 0.25f;
+    float roi_y1 = 0.80f;
 
     // Overlay parameters
     int   step           = 16;
@@ -83,7 +106,7 @@ struct State {
     float sharp_strength = 1.5f;
 
     // Speed conversion (px/frame → km/h)
-    // SCALE = (1 / px_per_m) * 100 * 3.6
+    // SCALE = (1 / px_per_m) * fps * 3.6
     float scale_kmh = 0.0f;
 
     // Startup gate 1 — absolute bounds
@@ -119,8 +142,8 @@ struct State {
 
     FILE        *csv_file = nullptr;
 
-    // FOE correction coefficients
-    // mean_v_corrected = mean_v - (foe_a * mean_u + foe_b)
+    // FOE correction coefficients (now applied to the lateral channel, mean_u)
+    // lat_corrected = mean_u - (foe_a * mean_v + foe_b)
     float foe_a = 0.0f;
     float foe_b = 0.0f;
 };
@@ -164,9 +187,11 @@ static bool init_once(State *st, int W, int H)
     st->foe_a = env_float("RAFT_FOE_A", 0.0f);
     st->foe_b = env_float("RAFT_FOE_B", 0.0f);
 
-    // Speed scale — read once at init, not per frame
-    const float px_per_m = env_float("RAFT_PX_PER_M", 424.0f);
-    st->scale_kmh = (1.0f / px_per_m) * 100.0f * 3.6f;
+    // Speed scale — read once at init, not per frame.
+    // FPS is configurable now (was hardcoded 100 for the old camera).
+    const float px_per_m = env_float("RAFT_PX_PER_M", 55.0f);
+    const float fps      = env_float("RAFT_FPS",       30.0f);
+    st->scale_kmh = (1.0f / px_per_m) * fps * 3.6f;
 
     const char *engine_path = env_str("RAFT_ENGINE_PATH",
         "/home/jetson-ntc/raft/raft_large_fp16.engine");
@@ -179,13 +204,14 @@ static bool init_once(State *st, int W, int H)
 
     std::fprintf(stderr,
         "[raft_of] Init W=%d H=%d engine=%s\n"
+        "[raft_of] AXIS MAP: forward = -mean_v, lateral = mean_u (TILTED mount)\n"
         "[raft_of] ROI px=[%d,%d]x[%d,%d]  step=%d  N=%d points\n"
-        "[raft_of] FOE correction               : A=%.4f  B=%.3f (numerical + visual)\n"
+        "[raft_of] FOE correction (on lateral)  : A=%.4f  B=%.3f\n"
         "[raft_of] startup gate 1 (absolute)   : vx >= %.1f km/h, |vy| <= %.1f km/h\n"
         "[raft_of] startup gate 2 (derivative) : |dvx| <= %.1f km/h/frame, gap <= %d frames\n"
         "[raft_of] startup gate 3 (consecutive): %d valid frames in a row to lock\n"
         "[raft_of] EMA filter                  : alpha_vx=%.2f  alpha_vy=%.2f\n"
-        "[raft_of] Speed scale                 : px_per_m=%.1f → %.6f (km/h per px/frame)\n",
+        "[raft_of] Speed scale                 : px_per_m=%.1f fps=%.1f → %.6f (km/h per px/frame)\n",
         W, H, engine_path,
         rx0, rx1, ry0, ry1, st->step, nx * ny,
         st->foe_a, st->foe_b,
@@ -193,7 +219,7 @@ static bool init_once(State *st, int W, int H)
         st->max_dvx_kmh, st->max_valid_gap,
         st->min_consecutive,
         st->ema_vx.alpha, st->ema_vy.alpha,
-        px_per_m, st->scale_kmh);
+        px_per_m, fps, st->scale_kmh);
 
     if (cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking) != cudaSuccess) {
         std::fprintf(stderr, "[raft_of] cudaStreamCreate failed\n");
@@ -279,13 +305,21 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                             cudaMemcpyDeviceToHost, st->stream);
             cudaStreamSynchronize(st->stream);
 
-            // Step 6: FOE correction (numerical)
-            // mean_v_corrected = mean_v - (foe_a * mean_u + foe_b)
-            const float v_foe = res.mean_v - (st->foe_a * res.mean_u + st->foe_b);
+            // Step 6: axis mapping for the TILTED mounting.
+            // Forward motion now appears in the VERTICAL flow (mean_v);
+            // lateral / yaw motion in the HORIZONTAL flow (mean_u).
+            // (With the old mount, parallel to the ground, it was the opposite.)
+            const float fwd_flow = res.mean_v;   // forward  -> vertical flow
+            const float lat_flow = res.mean_u;   // lateral  -> horizontal flow
+
+            // FOE correction now applies to the LATERAL axis (mean_u),
+            // scaled by the forward signal (mean_v):
+            //   lat_corrected = mean_u - (foe_a * mean_v + foe_b)
+            const float lat_foe = lat_flow - (st->foe_a * fwd_flow + st->foe_b);
 
             // Step 7: convert px/frame → km/h
-            const float vx_raw = -res.mean_u * st->scale_kmh;
-            const float vy_raw =  v_foe      * st->scale_kmh;
+            const float vx_raw = -fwd_flow * st->scale_kmh;   // forward (+ = ahead)
+            const float vy_raw =  lat_foe  * st->scale_kmh;   // lateral
 
             // Step 8: startup filter
             bool emit = true;
@@ -338,19 +372,22 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                 std::fflush(stdout);
 
                 if (st->csv_file) {
+                    // Raw flow components logged unmapped (mean_u, mean_v) so
+                    // post-processing has the full signal; vx/vy are mapped+EMA.
                     std::fprintf(st->csv_file, "%u,%.4f,%.4f,%.4f,%.4f\n",
-                        st->frame_id, res.mean_u, v_foe, vx_kmh, vy_kmh);
+                        st->frame_id, res.mean_u, res.mean_v, vx_kmh, vy_kmh);
                     std::fflush(st->csv_file);
                 }
             }
 
-            // Step 9: FOE correction (visual) — in-place on d_flow
-            // Applied AFTER flow_reduce so numerical output is unaffected.
-            // Arrow field and resultant will show corrected motion.
+            // Step 9: FOE correction (visual) — in-place on d_flow.
+            // NOTE: this kernel still corrects the v-channel of the flow field;
+            // it is a no-op while FOE_A==FOE_B==0. When FOE is recalibrated on
+            // the lateral (u) channel, update foe_correct_flow() accordingly.
             foe_correct_flow(st->d_flow, H, W,
                              st->foe_a, st->foe_b, st->stream);
 
-            // Step 10: overlay — arrow field (FOE-corrected)
+            // Step 10: overlay — arrow field
             overlay_draw_flow(
                 egl.d_y, egl.d_uv,
                 egl.pitchY, egl.pitchUV,
@@ -360,12 +397,13 @@ static void gpu_process(EGLImageKHR image, void **userPtr)
                 st->step, st->arrow_scale, st->min_mag,
                 st->stream);
 
-            // Step 11: overlay — resultant vector using v_foe
+            // Step 11: overlay — resultant vector (image-space flow:
+            // horizontal = lateral, vertical = forward)
             overlay_draw_resultant(
                 egl.d_y, egl.d_uv,
                 egl.pitchY, egl.pitchUV,
                 W, H,
-                res.mean_u, v_foe,
+                lat_foe, fwd_flow,
                 st->roi_x0, st->roi_x1,
                 st->roi_y0, st->roi_y1,
                 st->result_scale, st->stream);
