@@ -24,8 +24,7 @@ AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/vn5650_smotion/R
 # Pyenv (windows server)
 AI-chassis-control-pipeline/windows_udp_server/.venvE3
 AI-chassis-control-pipeline/windows_udp_server/__pycache__
-# E3 arxml
+# E3 arxml / smotion dbc files
 AI-chassis-control-pipeline/windows_udp_server/config/e3/E3_1_2_Premium_HCP1.arxml
-AI-chassis-control-pipeline/windows_udp_server/config/e3/E3_1_2_Premium_MFK_5_NIP_V12.06.91.F.arxml
+AI-chassis-control-pipeline/windows_udp_server/config/e3/E3_1_2_Premium_V12.04.26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod.arxml
 AI-chassis-control-pipeline/windows_udp_server/config/smotion/SMOTION.dbc
-AI-chassis-control-pipeline/windows_udp_server/config/e3/canape/vn5650_smotion/Recorder_2026-05-05_13-03-25.mf4

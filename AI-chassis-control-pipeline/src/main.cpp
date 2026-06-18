@@ -19,6 +19,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cstring>
+#include <cstdlib>
 #include <cstdint>
 #include <ctime>
 #include <cmath>
@@ -66,6 +67,12 @@ struct VectorSnapshot {
     double VDSO_VWhlSpdReRi = 0.0;
     double VDC_Intv = 0.0;
     double VDSO_AgVehSideSlip = 0.0;
+
+    double POS_GNSS_Breite_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS = 0.0;
+    double POS_GNSS_Laenge_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS = 0.0;
+    double POS_GNSS_Ortung_Ausrichtung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS = 0.0;
+    double POS_GNSS_Sichtbare_Satelliten_XIX_POS_GNSS_07_Sat_konf_XIX_VLAN_FAS = 0.0;
+    double POS_GNSS_Ortung_Hoehe_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS = 0.0;
 };
 
 struct VectorSignalBinding {
@@ -74,7 +81,7 @@ struct VectorSignalBinding {
     double VectorSnapshot::*member;
 };
 
-static const std::array<VectorSignalBinding, 24> kVectorSignalBindings = {{
+static const std::array<VectorSignalBinding, 29> kVectorSignalBindings = {{
     {"eth_VDSO_Vx3dKmph", "VDSO_Vx3dKmph", &VectorSnapshot::VDSO_Vx3dKmph},
     {"eth_IMU_ALat", "IMU_ALat", &VectorSnapshot::IMU_ALat},
     {"eth_IMU_ALgt", "IMU_ALgt", &VectorSnapshot::IMU_ALgt},
@@ -99,6 +106,11 @@ static const std::array<VectorSignalBinding, 24> kVectorSignalBindings = {{
     {"eth_VDSO_VWhlSpdReRi", "VDSO_VWhlSpdReRi", &VectorSnapshot::VDSO_VWhlSpdReRi},
     {"eth_VDC_Intv", "VDC_Intv", &VectorSnapshot::VDC_Intv},
     {"eth_VDSO_AgVehSideSlip", "VDSO_AgVehSideSlip", &VectorSnapshot::VDSO_AgVehSideSlip},
+    {"eth_POS_GNSS_Breite_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", "POS_GNSS_Breite_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", &VectorSnapshot::POS_GNSS_Breite_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS},
+    {"eth_POS_GNSS_Laenge_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", "POS_GNSS_Laenge_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", &VectorSnapshot::POS_GNSS_Laenge_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS},
+    {"eth_POS_GNSS_Ortung_Ausrichtung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", "POS_GNSS_Ortung_Ausrichtung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", &VectorSnapshot::POS_GNSS_Ortung_Ausrichtung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS},
+    {"eth_POS_GNSS_Sichtbare_Satelliten_XIX_POS_GNSS_07_Sat_konf_XIX_VLAN_FAS", "POS_GNSS_Sichtbare_Satelliten_XIX_POS_GNSS_07_Sat_konf_XIX_VLAN_FAS", &VectorSnapshot::POS_GNSS_Sichtbare_Satelliten_XIX_POS_GNSS_07_Sat_konf_XIX_VLAN_FAS},
+    {"eth_POS_GNSS_Ortung_Hoehe_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", "POS_GNSS_Ortung_Hoehe_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS", &VectorSnapshot::POS_GNSS_Ortung_Hoehe_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS},
 }};
 
 static bool set_vector_signal_value(VectorSnapshot& snapshot, const std::string& key, double value)
@@ -193,15 +205,18 @@ static bool check_bus_nonblocking(GstElement* pipeline)
 
 struct Opts {
     uint16_t eth_port = 5005; // UDP port for JSON datagrams from windows_udp_server/main.py
+    std::string log_path;
 };
 
 static void usage(const char* argv0)
 {
     std::cerr
         << "Usage:\n"
-    << "  " << argv0 << " [--eth-port 5005]\n\n"
+    << "  " << argv0 << " [--eth-port 5005] [--log_path ~/Desktop]\n\n"
         << "Examples:\n"
-    << "  " << argv0 << " --eth-port 5005\n";
+    << "  " << argv0 << " --eth-port 5005\n"
+    << "  " << argv0 << " --log_path ~/Desktop\n"
+    << "  " << argv0 << " --log_path=~/Desktop\n";
 }
 
 static bool parse_args(int argc, char** argv, Opts& o)
@@ -217,9 +232,28 @@ static bool parse_args(int argc, char** argv, Opts& o)
             return argv[++i];
         };
 
-        if (a == "--eth-port") {
-            const char* v = need("--eth-port"); if (!v) return false;
+        if (a == "--eth-port" || a.rfind("--eth-port=", 0) == 0) {
+            const char* v = nullptr;
+            std::string v_inline;
+            if (a.rfind("--eth-port=", 0) == 0) {
+                v_inline = a.substr(std::strlen("--eth-port="));
+                v = v_inline.c_str();
+            } else {
+                v = need("--eth-port");
+            }
+            if (!v) return false;
             o.eth_port = static_cast<uint16_t>(std::atoi(v));
+        } else if (a == "--log_path" || a.rfind("--log_path=", 0) == 0) {
+            const char* v = nullptr;
+            std::string v_inline;
+            if (a.rfind("--log_path=", 0) == 0) {
+                v_inline = a.substr(std::strlen("--log_path="));
+                v = v_inline.c_str();
+            } else {
+                v = need("--log_path");
+            }
+            if (!v) return false;
+            o.log_path = v;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return false;
@@ -253,11 +287,54 @@ static inline timespec now_realtime()
     return ts;
 }
 
-static std::filesystem::path create_run_log_dir()
+static std::filesystem::path expand_tilde_path(const std::string& input_path)
+{
+    namespace fs = std::filesystem;
+    if (input_path.empty() || input_path[0] != '~') {
+        return fs::path(input_path);
+    }
+
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) home = std::getenv("USERPROFILE");
+
+    std::string home_fallback;
+    if ((!home || !*home)) {
+        const char* drive = std::getenv("HOMEDRIVE");
+        const char* path = std::getenv("HOMEPATH");
+        if (drive && path) {
+            home_fallback = std::string(drive) + path;
+            home = home_fallback.c_str();
+        }
+    }
+
+    if (!home || !*home) {
+        return fs::path(input_path);
+    }
+
+    if (input_path.size() == 1) {
+        return fs::path(home);
+    }
+
+    const char next = input_path[1];
+    if (next != '/' && next != '\\') {
+        // ~user style is not supported; keep the original path.
+        return fs::path(input_path);
+    }
+
+    fs::path expanded(home);
+    if (input_path.size() > 2) {
+        expanded /= input_path.substr(2);
+    }
+    return expanded;
+}
+
+static std::filesystem::path create_run_log_dir(const std::filesystem::path& log_root_path)
 {
     namespace fs = std::filesystem;
 
-    const fs::path base_log_dir("log");
+    const fs::path base_log_dir = log_root_path.empty()
+        ? fs::path("log")
+        : (log_root_path / "log");
     fs::create_directories(base_log_dir);
 
     int next_log_index = 1;
@@ -551,8 +628,16 @@ static std::string csv_escape(const std::string& in)
 
 int main(int argc, char** argv)
 {
+    // -------- Parse args --------
+    Opts opts{};
+    if (!parse_args(argc, argv, opts)) return 1;
+
     // -------- Output folders --------
-    static std::filesystem::path run_log_dir = create_run_log_dir();
+    const std::filesystem::path log_root_path = opts.log_path.empty()
+        ? std::filesystem::path()
+        : expand_tilde_path(opts.log_path);
+    static std::filesystem::path run_log_dir;
+    run_log_dir = create_run_log_dir(log_root_path);
     const std::filesystem::path images_dir = run_log_dir / "images";
     const std::filesystem::path telemetry_csv_path = run_log_dir / "telemetry.csv";
     std::cerr << "Run log directory: " << run_log_dir.string() << "\n";
@@ -562,10 +647,6 @@ int main(int argc, char** argv)
         std::cout << "\nLog folder: " << run_log_dir.string() << std::endl;
         std::exit(0);
     });
-
-    // -------- Parse args --------
-    Opts opts{};
-    if (!parse_args(argc, argv, opts)) return 1;
 
     // -------- CSV log --------
     std::ofstream csv(telemetry_csv_path.string());

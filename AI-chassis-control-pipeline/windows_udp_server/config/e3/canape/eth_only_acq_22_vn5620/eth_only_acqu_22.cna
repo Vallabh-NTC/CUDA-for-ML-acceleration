@@ -1,3 +1,20 @@
+[FILE_INFO]
+Identification=CANape-Configuration-File
+FileName=eth_only_acqu_22.cna
+FileNameAbsolute=C:\Users\Public\Documents\Vector CANape 22\Projects\eth_only_acq_22\eth_only_acqu_22.cna
+WorkingDirectory=C:\Users\Public\Documents\Vector CANape 22\Projects\eth_only_acq_22
+ProjectId=07ea-0006-0009-000d-0033-0020-0000
+FileVersion=2200
+PrgVersion=Version 22.0.41.3 
+PrgDate=03.06.2025
+Description=
+CreationTime=14:00
+CreationDate=06/09/2026 ; Month/Day/Year
+ModificationTime=11:20
+ModificationDate=06/18/2026 ; Month/Day/Year
+Protected=0
+CurrentWindowsACP=1252
+
 [ANALYSISPROFILE_MDF_LIST]
 Count=1
 
@@ -89,47 +106,15 @@ IsFallback=0
 Count=1
 
 [FILE_COMMENT_TEMPLATE]
-Count=0
-
-[FILE_INFO]
-Identification=CANape-Configuration-File
-FileName=eth_only_acqu_22.cna
-FileNameAbsolute=C:\Users\Public\Documents\Vector CANape 22\Projects\eth_only_acq_22\eth_only_acqu_22.cna
-WorkingDirectory=C:\Users\Public\Documents\Vector CANape 22\Projects\eth_only_acq_22
-ProjectId=07ea-0006-0009-000d-0033-0020-0000
-FileVersion=2200
-PrgVersion=Version 22.0.41.3 
-PrgDate=03.06.2025
-Description=
-CreationTime=14:00
-CreationDate=06/09/2026 ; Month/Day/Year
-ModificationTime=14:00
-ModificationDate=06/09/2026 ; Month/Day/Year
-Protected=0
-CurrentWindowsACP=1252
-
-[FUNCTION_OBJECT_1]
-Comment=Comments entered by the user during measurement
-Unit=
-DataType=3
-Precision=-1
-ObjectType=5
-Number=0
-NumberOfInputSignals=0
-Formula=9
-Version=100
-StimMode=0
-Module=Functions
-Name=Comment
-Disabled=0
-Mode=10
-Rate=100
-ArchivBy_1=Recorder
-IsFallback=1
-DisplayCount=0
+1="Name",""
+2="Division",""
+3="Project",""
+4="Subject",""
+5="Comment",""
+Count=5
 
 [FUNCTION_OBJECT_LIST]
-count=1
+count=0
 
 [FUNCTIONS]
 COUNT=0
@@ -151,7 +136,7 @@ SubConfigsCount=0
 Count=0
 
 [MEASUREMENT_LIST]
-Count=24
+Count=31
 OfflineFileCount=0
 MeaCfgLabellistName=
 
@@ -185,7 +170,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_10_DISPLAY_1]
 Window=2
-Index=13
+Index=18
 Color=204
 ApplyColorToBackground=0
 ColorFunction=0
@@ -245,7 +230,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_11_DISPLAY_1]
 Window=2
-Index=12
+Index=17
 Color=28784
 ApplyColorToBackground=0
 ColorFunction=0
@@ -305,7 +290,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_12_DISPLAY_1]
 Window=2
-Index=11
+Index=16
 Color=16755200
 ApplyColorToBackground=0
 ColorFunction=0
@@ -365,7 +350,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_13_DISPLAY_1]
 Window=2
-Index=10
+Index=15
 Color=16711850
 ApplyColorToBackground=0
 ColorFunction=0
@@ -425,7 +410,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_14_DISPLAY_1]
 Window=2
-Index=9
+Index=14
 Color=21930
 ApplyColorToBackground=0
 ColorFunction=0
@@ -485,7 +470,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_15_DISPLAY_1]
 Window=2
-Index=8
+Index=13
 Color=11162965
 ApplyColorToBackground=0
 ColorFunction=0
@@ -545,7 +530,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_16_DISPLAY_1]
 Window=2
-Index=7
+Index=12
 Color=11206655
 ApplyColorToBackground=0
 ColorFunction=0
@@ -605,7 +590,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_17_DISPLAY_1]
 Window=2
-Index=6
+Index=11
 Color=65450
 ApplyColorToBackground=0
 ColorFunction=0
@@ -665,7 +650,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_18_DISPLAY_1]
 Window=2
-Index=5
+Index=10
 Color=8421631
 ApplyColorToBackground=0
 ColorFunction=0
@@ -725,7 +710,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_19_DISPLAY_1]
 Window=2
-Index=4
+Index=9
 Color=43690
 ApplyColorToBackground=0
 ColorFunction=0
@@ -771,7 +756,7 @@ GUID=DISPLAY_d975a599-1e40-43e6-9abb-735fcc2f5184
 
 [MEASUREMENT_OBJECT_1_DISPLAY_1]
 Window=2
-Index=23
+Index=28
 Color=65280
 ApplyColorToBackground=0
 ColorFunction=0
@@ -845,7 +830,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_20_DISPLAY_1]
 Window=2
-Index=3
+Index=8
 Color=11184640
 ApplyColorToBackground=0
 ColorFunction=0
@@ -905,7 +890,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_21_DISPLAY_1]
 Window=2
-Index=2
+Index=7
 Color=16755455
 ApplyColorToBackground=0
 ColorFunction=0
@@ -965,7 +950,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_22_DISPLAY_1]
 Window=2
-Index=1
+Index=6
 Color=11184895
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1025,7 +1010,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_23_DISPLAY_1]
 Window=2
-Index=0
+Index=5
 Color=16755370
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1085,7 +1070,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_24_DISPLAY_1]
 Window=2
-Index=19
+Index=24
 Color=11206570
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1109,7 +1094,7 @@ LineWidth=1
 Precision=-2
 Digits=6
 Enabled=1
-StoredFocused=1
+StoredFocused=0
 SublMask=1
 MeaSublMask=3
 LockScaling=0
@@ -1129,9 +1114,217 @@ YAxis_ID=0
 AxisTemplate=
 GUID=DISPLAY_4d0e579f-16bc-495d-a556-c47c804b8b61
 
+[MEASUREMENT_OBJECT_25]
+Module=E3_1_2_Premium_HCP1
+Name=$HCP1_SimulatedPeerNodes_sif_24727_egoLayerElement0$$egoLayerElement0$$vehicleCoordinate$egoLayerElement0.vehicleCoordinate.latitude
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=0
+
+[MEASUREMENT_OBJECT_26]
+Module=E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+Name=$POS_GNSS_05_Position_XIX_VLAN_FAS$POS_GNSS_Breite_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=1
+
+[MEASUREMENT_OBJECT_26_DISPLAY_1]
+Window=2
+Index=4
+Color=255
+ApplyColorToBackground=0
+ColorFunction=0
+ColorFunctionScope=1
+LineTyp=2
+YMinHome=-90
+YMaxHome=90
+YMin=-90
+YMax=90
+XOffsetNS=0
+XOffset=0
+ValueFormat=3
+BitMask=1
+ShowYAxis=1
+Width=10
+LineStyle=1
+MarkerType=1
+SRMainValue=0
+InvalidValueDrawMode=3
+LineWidth=1
+Precision=-2
+Digits=6
+Enabled=1
+StoredFocused=0
+SublMask=1
+MeaSublMask=3
+LockScaling=0
+RightAxis=0
+MapMode=2
+OverlayGridColor=0
+ShadingMode=3
+EditOffset=1
+EditFactor=2
+WAxisLabel=
+XAxisLabel=
+YAxisLabel=
+AxisCaption=
+Row=0
+Col=0
+YAxis_ID=0
+AxisTemplate=
+GUID=DISPLAY_032faa87-ebd2-4c33-b227-c14ab4535e59
+
+[MEASUREMENT_OBJECT_27]
+Module=E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+Name=$POS_GNSS_05_Position_XIX_VLAN_FAS$POS_GNSS_Laenge_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=1
+
+[MEASUREMENT_OBJECT_27_DISPLAY_1]
+Window=2
+Index=3
+Color=65535
+ApplyColorToBackground=0
+ColorFunction=0
+ColorFunctionScope=1
+LineTyp=2
+YMinHome=-180
+YMaxHome=180
+YMin=-180
+YMax=180
+XOffsetNS=0
+XOffset=0
+ValueFormat=3
+BitMask=1
+ShowYAxis=1
+Width=10
+LineStyle=1
+MarkerType=1
+SRMainValue=0
+InvalidValueDrawMode=3
+LineWidth=1
+Precision=-2
+Digits=6
+Enabled=1
+StoredFocused=0
+SublMask=1
+MeaSublMask=3
+LockScaling=0
+RightAxis=0
+MapMode=2
+OverlayGridColor=0
+ShadingMode=3
+EditOffset=1
+EditFactor=2
+WAxisLabel=
+XAxisLabel=
+YAxisLabel=
+AxisCaption=
+Row=0
+Col=0
+YAxis_ID=0
+AxisTemplate=
+GUID=DISPLAY_de13f5b2-405e-4d73-960b-1f84e8f14bc9
+
+[MEASUREMENT_OBJECT_28]
+Module=E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+Name=$MFK_5_SimulatedPeerNodes_POS_GNSS_05_Position_XIX_VLAN_FAS$POS_GNSS_Laenge_Ortung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=0
+
+[MEASUREMENT_OBJECT_29]
+Module=E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+Name=$POS_GNSS_05_Position_XIX_VLAN_FAS$POS_GNSS_Ortung_Ausrichtung_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=1
+
+[MEASUREMENT_OBJECT_29_DISPLAY_1]
+Window=2
+Index=2
+Color=16711935
+ApplyColorToBackground=0
+ColorFunction=0
+ColorFunctionScope=1
+LineTyp=2
+YMinHome=0
+YMaxHome=359.9
+YMin=0
+YMax=359.9
+XOffsetNS=0
+XOffset=0
+ValueFormat=3
+BitMask=1
+ShowYAxis=1
+Width=10
+LineStyle=1
+MarkerType=1
+SRMainValue=0
+InvalidValueDrawMode=3
+LineWidth=1
+Precision=-2
+Digits=6
+Enabled=1
+StoredFocused=0
+SublMask=1
+MeaSublMask=3
+LockScaling=0
+RightAxis=0
+MapMode=2
+OverlayGridColor=0
+ShadingMode=3
+EditOffset=1
+EditFactor=2
+WAxisLabel=
+XAxisLabel=
+YAxisLabel=
+AxisCaption=
+Row=0
+Col=0
+YAxis_ID=0
+AxisTemplate=
+GUID=DISPLAY_a4cff6c3-9a13-4f5f-b661-9d9f48b5502a
+
 [MEASUREMENT_OBJECT_2_DISPLAY_1]
 Window=2
-Index=22
+Index=27
 Color=255
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1189,9 +1382,129 @@ IsFallback=0
 HasManagedDisplay=0
 DisplayCount=1
 
+[MEASUREMENT_OBJECT_30]
+Module=E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+Name=$POS_GNSS_07_Sat_konf_XIX_VLAN_FAS$POS_GNSS_Sichtbare_Satelliten_XIX_POS_GNSS_07_Sat_konf_XIX_VLAN_FAS
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=1
+
+[MEASUREMENT_OBJECT_30_DISPLAY_1]
+Window=2
+Index=1
+Color=33023
+ApplyColorToBackground=0
+ColorFunction=0
+ColorFunctionScope=1
+LineTyp=2
+YMinHome=1
+YMaxHome=126
+YMin=1
+YMax=126
+XOffsetNS=0
+XOffset=0
+ValueFormat=3
+BitMask=127
+ShowYAxis=1
+Width=10
+LineStyle=1
+MarkerType=1
+SRMainValue=0
+InvalidValueDrawMode=3
+LineWidth=1
+Precision=-2
+Digits=6
+Enabled=1
+StoredFocused=0
+SublMask=1
+MeaSublMask=3
+LockScaling=0
+RightAxis=0
+MapMode=2
+OverlayGridColor=0
+ShadingMode=3
+EditOffset=1
+EditFactor=2
+WAxisLabel=
+XAxisLabel=
+YAxisLabel=
+AxisCaption=
+Row=0
+Col=0
+YAxis_ID=0
+AxisTemplate=
+GUID=DISPLAY_405df9e8-d183-49b0-a9cd-15a54e08f6f8
+
+[MEASUREMENT_OBJECT_31]
+Module=E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+Name=$POS_GNSS_05_Position_XIX_VLAN_FAS$POS_GNSS_Ortung_Hoehe_XIX_POS_GNSS_05_Position_XIX_VLAN_FAS
+Disabled=0
+Mode=10
+Rate=0
+Row=0
+Column=0
+MeaReferenced=1
+ArchivBy_1=Recorder
+IsFallback=0
+HasManagedDisplay=0
+DisplayCount=1
+
+[MEASUREMENT_OBJECT_31_DISPLAY_1]
+Window=2
+Index=0
+Color=16744576
+ApplyColorToBackground=0
+ColorFunction=0
+ColorFunctionScope=1
+LineTyp=2
+YMinHome=-500
+YMaxHome=7689
+YMin=-500
+YMax=7689
+XOffsetNS=0
+XOffset=0
+ValueFormat=3
+BitMask=1
+ShowYAxis=1
+Width=10
+LineStyle=1
+MarkerType=1
+SRMainValue=0
+InvalidValueDrawMode=3
+LineWidth=1
+Precision=-2
+Digits=6
+Enabled=1
+StoredFocused=1
+SublMask=1
+MeaSublMask=3
+LockScaling=0
+RightAxis=0
+MapMode=2
+OverlayGridColor=0
+ShadingMode=3
+EditOffset=1
+EditFactor=2
+WAxisLabel=
+XAxisLabel=
+YAxisLabel=
+AxisCaption=
+Row=0
+Col=0
+YAxis_ID=0
+AxisTemplate=
+GUID=DISPLAY_7f3afe74-419d-4481-8e7f-ad0b4d778219
+
 [MEASUREMENT_OBJECT_3_DISPLAY_1]
 Window=2
-Index=21
+Index=26
 Color=65535
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1251,7 +1564,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_4_DISPLAY_1]
 Window=2
-Index=20
+Index=25
 Color=16776960
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1311,7 +1624,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_5_DISPLAY_1]
 Window=2
-Index=18
+Index=23
 Color=16711935
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1371,7 +1684,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_6_DISPLAY_1]
 Window=2
-Index=17
+Index=22
 Color=33023
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1431,7 +1744,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_7_DISPLAY_1]
 Window=2
-Index=16
+Index=21
 Color=16744576
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1491,7 +1804,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_8_DISPLAY_1]
 Window=2
-Index=15
+Index=20
 Color=16777215
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1551,7 +1864,7 @@ DisplayCount=1
 
 [MEASUREMENT_OBJECT_9_DISPLAY_1]
 Window=2
-Index=14
+Index=19
 Color=43520
 ApplyColorToBackground=0
 ColorFunction=0
@@ -1667,10 +1980,15 @@ WindowSymbols=1
 GlobalCursor=0
 GlobalCursorTime=0
 GlobalCursorTimeNs=0
-MainWindowPos=2, 2280, 164, 1200, 800 ;cmd, x, y, w, h
+MainWindowPos=2, 289, 88, 1200, 800 ;cmd, x, y, w, h
 
 [PAR_COMMENT]
-Count=0
+1="Name",""
+2="Division",""
+3="Project",""
+4="Subject",""
+5="Comment",""
+Count=5
 
 [POST_ANALYSIS_SCRIPT]
 ScriptName=
@@ -1789,7 +2107,12 @@ MaxLimitTotalAttachSize=1000000
 AttachmentPathCount=0
 
 [RECORDER_1_FILE_COMMENT]
-Count=0
+1="Name",""
+2="Division",""
+3="Project",""
+4="Subject",""
+5="Comment",""
+Count=5
 
 [RECORDER_LIST]
 RecorderCount=1
@@ -1804,34 +2127,35 @@ Count=0
 Count=0
 
 [SIGNSELWND]
-FocusID=2008
-ActiveTab=1
+FocusID=2004
+ActiveTab=0
 FilterNodeID=All
-SearchHistory_0=LWI_AgStgWhl
-SearchHistory_1=VDSO_AgVehSideSlip
-SearchHistory_2=VDC_Intv
-SearchHistory_3=VDSO_VWhlSpdReRi
-SearchHistory_4=VDSO_VWhlSpdRe
-SearchHistory_5=VDSO_VWhlSpdReLi
-SearchHistory_6=VDSO_VWhlSpdReLe
-SearchHistory_7=VDSO_VWhlSpdFrRi
-SearchHistory_8=VDSO_VWhlSpdFrLe
-SearchHistory_9=DPM_StDispDrvPosn
-SearchHistory_10=DBR_IdcDrvBrk
-SearchHistory_11=BLC_BrkLghtReq
-SearchHistory_12=VMM_BrkPed_ItDmdNorm
-SearchHistory_13=DBR_FBrkPedDrv
-SearchHistory_14=DBR_LPosnBrkPedDrv
-SearchHistory_15=DBR_LPosnBrkPedDrv	
-SearchHistory_16=DBR_PrctLPosnBrkPedDrv
-SearchHistory_17=API_StDrvPed
-SearchHistory_18=API_PrctDrvPed
-SearchHistory_19=OTP_Aussen_Temp_ungef
+SearchHistory_0=POS_GNSS_Ortung_Hoehe
+SearchHistory_1=POS_GNSS_Sichtbare_Satelliten
+SearchHistory_2=POS_GNSS_Ortung_Ausrichtung
+SearchHistory_3=POS_GNSS_Laenge_Ortung
+SearchHistory_4=POS_GNSS_Breite_Ortung
+SearchHistory_5=Ortung
+SearchHistory_6=gnss
+SearchHistory_7=Latitude
+SearchHistory_8=LWI_AgStgWhl
+SearchHistory_9=VDSO_AgVehSideSlip
+SearchHistory_10=VDC_Intv
+SearchHistory_11=VDSO_VWhlSpdReRi
+SearchHistory_12=VDSO_VWhlSpdRe
+SearchHistory_13=VDSO_VWhlSpdReLi
+SearchHistory_14=VDSO_VWhlSpdReLe
+SearchHistory_15=VDSO_VWhlSpdFrRi
+SearchHistory_16=VDSO_VWhlSpdFrLe
+SearchHistory_17=DPM_StDispDrvPosn
+SearchHistory_18=DBR_IdcDrvBrk
+SearchHistory_19=BLC_BrkLghtReq
 TreeExpand_0=@All
 TreeExpand_1=All\Devices
 TreeExpand_2=All\Devices\E3_1_2_Premium_HCP1
-TreeExpand_3=$All\Devices
-TreeExpand_4=#All\Devices
+TreeExpand_3=All\Devices\E3_1_2_Premium_V12_04_26F_P72_AR430_20210320_MFK_5_BP_E2E_Mod
+TreeExpand_4=$All\Devices
+TreeExpand_5=#All\Devices
 TextSearchCaseSensitive=0
 TextSearchUseMode=1
 TextSearchSearchFullText=1
@@ -1858,18 +2182,18 @@ ShowSignalComments=1
 DisplayMask=1 ; pages 1
 
 [WINDOW_2]
-XLen=3600000
+XLen=1234
 XMin=0
 XMinNs=0
-XMax=3600000
-XMaxNs=3600000000000
+XMax=2441088
+XMaxNs=2441088107888
 Grid=1
 Mark=1
 YValue=1
 ShowLegend=2
 ShowLegendHeader=1
-LegendPixWidth=269
-LegendPixWidth_dpi96=269
+LegendPixWidth=507
+LegendPixWidth_dpi96=507
 LegendPixHeight=105
 LegendPixHeight_dpi96=105
 LegendPos=2
@@ -1925,8 +2249,8 @@ DisplayMask=1 ; pages 1
 [WINDOW_2_LEG_COLUMNS]
 ScreenDPIinSection=96
 COUNT=1
-COL_0=31, 269
-COL_0_dpi96=31, 269
+COL_0=31, 507
+COL_0_dpi96=31, 507
 
 [WINDOWS]
 Count=2
