@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <array>
 #include <vector>
+#include <optional>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -39,6 +40,8 @@
 #include <csignal>
 
 #include "UdpReceiver.hpp"
+#include "AdmaDecoder.hpp"
+#include "AdmaUdpReceiver.hpp"
 
 struct VectorSnapshot {
     timespec ts{};
@@ -125,7 +128,12 @@ static bool set_vector_signal_value(VectorSnapshot& snapshot, const std::string&
 }
 
 static inline void print_line(
-    double eth_steering_angle,
+    int adma_kf_status,
+    int adma_kf_lat_stimulated,
+    int adma_kf_long_stimulated,
+    int adma_kf_steady_state,
+    double eth_LWI_AgStgWhl,
+    double eth_VDSO_Vx3dKmph,
     const timespec& ts)
 {
     std::tm tm_local{};
@@ -136,10 +144,15 @@ static inline void print_line(
     long ms = ts.tv_nsec / 1000000;
 
     std::cout << std::fixed << std::setprecision(3)
-              << "[" << tb << "." << std::setw(3) << std::setfill('0') << ms
-              << std::setfill(' ') << "] "
-              << "\n | LWI_AgStgWhl=" << eth_steering_angle
-              << "\n";
+              << "timestamp: " << tb << "." << std::setw(3) << std::setfill('0') << ms
+              << std::setfill(' ') << "\n"
+              << "adma_kf_status = " << adma_kf_status << "\n"
+              << "adma_kf_lat_stimulated = " << adma_kf_lat_stimulated << "\n"
+              << "adma_kf_long_stimulated = " << adma_kf_long_stimulated << "\n"
+              << "adma_kf_steady_state = " << adma_kf_steady_state << "\n"
+              << "vector_snapshot.LWI_AgStgWhl = " << eth_LWI_AgStgWhl << "\n"
+              << "vector_snapshot.VDSO_Vx3dKmph = " << eth_VDSO_Vx3dKmph << "\n"
+              << "----------------------------------------\n";
 }
 
 static bool save_jpeg_from_sample(GstSample* sample, const char* filepath)
@@ -376,6 +389,117 @@ static std::filesystem::path create_run_log_dir(const std::filesystem::path& log
     return run_dir;
 }
 
+struct AdmaSnapshot {
+    timespec ts{};
+
+    double adma_ins_roll = 0.0;
+    double adma_ins_pitch = 0.0;
+    double adma_ins_yaw = 0.0;
+
+    double adma_ins_vel_hor_x = 0.0, adma_ins_vel_hor_y = 0.0, adma_ins_vel_hor_z = 0.0;
+    double adma_ins_vel_frame_x = 0.0, adma_ins_vel_frame_y = 0.0, adma_ins_vel_frame_z = 0.0;
+    double adma_ins_vel_hor_poi1_x = 0.0, adma_ins_vel_hor_poi1_y = 0.0, adma_ins_vel_hor_poi1_z = 0.0;
+    double adma_ins_vel_hor_poi2_x = 0.0, adma_ins_vel_hor_poi2_y = 0.0, adma_ins_vel_hor_poi2_z = 0.0;
+    double adma_ins_vel_hor_poi3_x = 0.0, adma_ins_vel_hor_poi3_y = 0.0, adma_ins_vel_hor_poi3_z = 0.0;
+    double adma_gnss_vel_frame_x = 0.0, adma_gnss_vel_frame_y = 0.0, adma_gnss_vel_frame_z = 0.0;
+
+    double adma_acc_body_x = 0.0, adma_acc_body_y = 0.0, adma_acc_body_z = 0.0;
+    double adma_acc_horizontal_x = 0.0, adma_acc_horizontal_y = 0.0, adma_acc_horizontal_z = 0.0;
+    double adma_acc_body_poi1_x = 0.0, adma_acc_body_poi1_y = 0.0, adma_acc_body_poi1_z = 0.0;
+    double adma_acc_body_poi2_x = 0.0, adma_acc_body_poi2_y = 0.0, adma_acc_body_poi2_z = 0.0;
+    double adma_acc_body_poi3_x = 0.0, adma_acc_body_poi3_y = 0.0, adma_acc_body_poi3_z = 0.0;
+    double adma_acc_horizontal_poi1_x = 0.0, adma_acc_horizontal_poi1_y = 0.0, adma_acc_horizontal_poi1_z = 0.0;
+    double adma_acc_horizontal_poi2_x = 0.0, adma_acc_horizontal_poi2_y = 0.0, adma_acc_horizontal_poi2_z = 0.0;
+    double adma_acc_horizontal_poi3_x = 0.0, adma_acc_horizontal_poi3_y = 0.0, adma_acc_horizontal_poi3_z = 0.0;
+
+    double adma_rates_body_x = 0.0, adma_rates_body_y = 0.0, adma_rates_body_z = 0.0;
+    double adma_rates_horizontal_x = 0.0, adma_rates_horizontal_y = 0.0, adma_rates_horizontal_z = 0.0;
+
+    double adma_misc_side_slip_angle = 0.0;
+    double adma_misc_distance_traveled = 0.0;
+    double adma_misc_poi1_side_slip_angle = 0.0;
+    double adma_misc_poi1_distance_traveled = 0.0;
+    double adma_misc_poi2_side_slip_angle = 0.0;
+    double adma_misc_poi2_distance_traveled = 0.0;
+    double adma_misc_poi3_side_slip_angle = 0.0;
+    double adma_misc_poi3_distance_traveled = 0.0;
+
+    double adma_ins_pos_lat = 0.0, adma_ins_pos_lon = 0.0, adma_ins_height = 0.0;
+    double adma_ins_pos_poi1_lat = 0.0, adma_ins_pos_poi1_lon = 0.0, adma_ins_height_poi1 = 0.0;
+    double adma_ins_pos_poi2_lat = 0.0, adma_ins_pos_poi2_lon = 0.0, adma_ins_height_poi2 = 0.0;
+    double adma_ins_pos_poi3_lat = 0.0, adma_ins_pos_poi3_lon = 0.0, adma_ins_height_poi3 = 0.0;
+
+    int adma_gnss_sats_used = -1;
+    int adma_gnss_sats_visible = -1;
+    int adma_kf_status = -1;
+    int adma_kf_lat_stimulated = -1;
+    int adma_kf_long_stimulated = -1;
+    int adma_kf_steady_state = -1;
+};
+
+// CSV column names for the ADMA signals. Keep in sync with write_adma_csv_values().
+static constexpr const char* kAdmaCsvHeader =
+    "adma_ins_vel_hor_x,adma_ins_vel_hor_y,adma_ins_vel_hor_z,"
+    "adma_ins_vel_frame_x,adma_ins_vel_frame_y,adma_ins_vel_frame_z,"
+    "adma_ins_vel_hor_poi1_x,adma_ins_vel_hor_poi1_y,adma_ins_vel_hor_poi1_z,"
+    "adma_ins_vel_hor_poi2_x,adma_ins_vel_hor_poi2_y,adma_ins_vel_hor_poi2_z,"
+    "adma_ins_vel_hor_poi3_x,adma_ins_vel_hor_poi3_y,adma_ins_vel_hor_poi3_z,"
+    "adma_gnss_vel_frame_x,adma_gnss_vel_frame_y,adma_gnss_vel_frame_z,"
+    "adma_acc_body_x,adma_acc_body_y,adma_acc_body_z,"
+    "adma_acc_horizontal_x,adma_acc_horizontal_y,adma_acc_horizontal_z,"
+    "adma_acc_body_poi1_x,adma_acc_body_poi1_y,adma_acc_body_poi1_z,"
+    "adma_acc_body_poi2_x,adma_acc_body_poi2_y,adma_acc_body_poi2_z,"
+    "adma_acc_body_poi3_x,adma_acc_body_poi3_y,adma_acc_body_poi3_z,"
+    "adma_acc_horizontal_poi1_x,adma_acc_horizontal_poi1_y,adma_acc_horizontal_poi1_z,"
+    "adma_acc_horizontal_poi2_x,adma_acc_horizontal_poi2_y,adma_acc_horizontal_poi2_z,"
+    "adma_acc_horizontal_poi3_x,adma_acc_horizontal_poi3_y,adma_acc_horizontal_poi3_z,"
+    "adma_ins_roll,adma_ins_pitch,adma_ins_yaw,"
+    "adma_rates_body_x,adma_rates_body_y,adma_rates_body_z,"
+    "adma_rates_horizontal_x,adma_rates_horizontal_y,adma_rates_horizontal_z,"
+    "adma_misc_side_slip_angle,adma_misc_distance_traveled,"
+    "adma_misc_poi1_side_slip_angle,adma_misc_poi1_distance_traveled,"
+    "adma_misc_poi2_side_slip_angle,adma_misc_poi2_distance_traveled,"
+    "adma_misc_poi3_side_slip_angle,adma_misc_poi3_distance_traveled,"
+    "adma_ins_pos_lat,adma_ins_pos_lon,adma_ins_height,"
+    "adma_ins_pos_poi1_lat,adma_ins_pos_poi1_lon,adma_ins_height_poi1,"
+    "adma_ins_pos_poi2_lat,adma_ins_pos_poi2_lon,adma_ins_height_poi2,"
+    "adma_ins_pos_poi3_lat,adma_ins_pos_poi3_lon,adma_ins_height_poi3,"
+    "adma_gnss_sats_used,adma_gnss_sats_visible,"
+    "adma_kf_status,adma_kf_lat_stimulated,adma_kf_long_stimulated,adma_kf_steady_state";
+
+// Writes the ADMA signal values in the same order as kAdmaCsvHeader.
+static void write_adma_csv_values(std::ostream& csv, const AdmaSnapshot& adma)
+{
+    csv << adma.adma_ins_vel_hor_x << "," << adma.adma_ins_vel_hor_y << "," << adma.adma_ins_vel_hor_z << ","
+        << adma.adma_ins_vel_frame_x << "," << adma.adma_ins_vel_frame_y << "," << adma.adma_ins_vel_frame_z << ","
+        << adma.adma_ins_vel_hor_poi1_x << "," << adma.adma_ins_vel_hor_poi1_y << "," << adma.adma_ins_vel_hor_poi1_z << ","
+        << adma.adma_ins_vel_hor_poi2_x << "," << adma.adma_ins_vel_hor_poi2_y << "," << adma.adma_ins_vel_hor_poi2_z << ","
+        << adma.adma_ins_vel_hor_poi3_x << "," << adma.adma_ins_vel_hor_poi3_y << "," << adma.adma_ins_vel_hor_poi3_z << ","
+        << adma.adma_gnss_vel_frame_x << "," << adma.adma_gnss_vel_frame_y << "," << adma.adma_gnss_vel_frame_z << ","
+        << adma.adma_acc_body_x << "," << adma.adma_acc_body_y << "," << adma.adma_acc_body_z << ","
+        << adma.adma_acc_horizontal_x << "," << adma.adma_acc_horizontal_y << "," << adma.adma_acc_horizontal_z << ","
+        << adma.adma_acc_body_poi1_x << "," << adma.adma_acc_body_poi1_y << "," << adma.adma_acc_body_poi1_z << ","
+        << adma.adma_acc_body_poi2_x << "," << adma.adma_acc_body_poi2_y << "," << adma.adma_acc_body_poi2_z << ","
+        << adma.adma_acc_body_poi3_x << "," << adma.adma_acc_body_poi3_y << "," << adma.adma_acc_body_poi3_z << ","
+        << adma.adma_acc_horizontal_poi1_x << "," << adma.adma_acc_horizontal_poi1_y << "," << adma.adma_acc_horizontal_poi1_z << ","
+        << adma.adma_acc_horizontal_poi2_x << "," << adma.adma_acc_horizontal_poi2_y << "," << adma.adma_acc_horizontal_poi2_z << ","
+        << adma.adma_acc_horizontal_poi3_x << "," << adma.adma_acc_horizontal_poi3_y << "," << adma.adma_acc_horizontal_poi3_z << ","
+        << adma.adma_ins_roll << "," << adma.adma_ins_pitch << "," << adma.adma_ins_yaw << ","
+        << adma.adma_rates_body_x << "," << adma.adma_rates_body_y << "," << adma.adma_rates_body_z << ","
+        << adma.adma_rates_horizontal_x << "," << adma.adma_rates_horizontal_y << "," << adma.adma_rates_horizontal_z << ","
+        << adma.adma_misc_side_slip_angle << "," << adma.adma_misc_distance_traveled << ","
+        << adma.adma_misc_poi1_side_slip_angle << "," << adma.adma_misc_poi1_distance_traveled << ","
+        << adma.adma_misc_poi2_side_slip_angle << "," << adma.adma_misc_poi2_distance_traveled << ","
+        << adma.adma_misc_poi3_side_slip_angle << "," << adma.adma_misc_poi3_distance_traveled << ","
+        << adma.adma_ins_pos_lat << "," << adma.adma_ins_pos_lon << "," << adma.adma_ins_height << ","
+        << adma.adma_ins_pos_poi1_lat << "," << adma.adma_ins_pos_poi1_lon << "," << adma.adma_ins_height_poi1 << ","
+        << adma.adma_ins_pos_poi2_lat << "," << adma.adma_ins_pos_poi2_lon << "," << adma.adma_ins_height_poi2 << ","
+        << adma.adma_ins_pos_poi3_lat << "," << adma.adma_ins_pos_poi3_lon << "," << adma.adma_ins_height_poi3 << ","
+        << adma.adma_gnss_sats_used << "," << adma.adma_gnss_sats_visible << ","
+        << adma.adma_kf_status << "," << adma.adma_kf_lat_stimulated << ","
+        << adma.adma_kf_long_stimulated << "," << adma.adma_kf_steady_state;
+}
+
 struct CameraSnapshot {
     timespec ts{};
     std::string image_path;
@@ -386,7 +510,7 @@ struct SharedState {
     std::mutex mtx;
     std::condition_variable cv;
     VectorSnapshot vector_snapshot;
-    // AdmaSnapshot adma; // ADMA temporarily disabled
+    AdmaSnapshot adma;
     CameraSnapshot cam0;
     CameraSnapshot cam2;
     uint64_t vector_seq = 0;
@@ -659,6 +783,7 @@ int main(int argc, char** argv)
         for (const auto& binding : kVectorSignalBindings) {
             csv << "," << binding.json_key;
         }
+        csv << "," << kAdmaCsvHeader;
         csv << ",cam0_image,cam2_image\n";
         csv.flush();
     };
@@ -692,6 +817,126 @@ int main(int argc, char** argv)
         }
     });
 
+    // -------- ADMA (UDP) thread --------
+    std::thread adma_thread([&shared]() {
+        adma::AdmaPacketDecoder adma_decoder(adma::ProtocolVersion::V334);
+        adma::AdmaUdpReceiver adma_receiver(
+            "192.168.1.5",
+            static_cast<uint16_t>(1211),
+            std::optional<std::string>{"192.168.1.50"});
+
+        while (true) {
+            try {
+                const auto adma_payload = adma_receiver.receive();
+                const auto decoded = adma_decoder.decode(adma_payload);
+                if (!decoded.v334.has_value()) continue;
+
+                const auto& adma_packet = decoded.v334.value();
+                AdmaSnapshot snap;
+                snap.ts = now_realtime();
+
+                snap.adma_ins_roll = static_cast<double>(adma_packet.insroll) * 0.01;
+                snap.adma_ins_pitch = static_cast<double>(adma_packet.inspitch) * 0.01;
+                snap.adma_ins_yaw = static_cast<double>(adma_packet.insyaw) * 0.01;
+
+                snap.adma_ins_vel_hor_x = static_cast<double>(adma_packet.insVelHor.x) * 0.005;
+                snap.adma_ins_vel_hor_y = static_cast<double>(adma_packet.insVelHor.y) * 0.005;
+                snap.adma_ins_vel_hor_z = static_cast<double>(adma_packet.insVelHor.z) * 0.005;
+
+                snap.adma_ins_vel_frame_x = static_cast<double>(adma_packet.insVelFrame.x) * 0.005;
+                snap.adma_ins_vel_frame_y = static_cast<double>(adma_packet.insVelFrame.y) * 0.005;
+                snap.adma_ins_vel_frame_z = static_cast<double>(adma_packet.insVelFrame.z) * 0.005;
+
+                snap.adma_ins_vel_hor_poi1_x = static_cast<double>(adma_packet.insVelHorPOI[0].x) * 0.005;
+                snap.adma_ins_vel_hor_poi1_y = static_cast<double>(adma_packet.insVelHorPOI[0].y) * 0.005;
+                snap.adma_ins_vel_hor_poi1_z = static_cast<double>(adma_packet.insVelHorPOI[0].z) * 0.005;
+                snap.adma_ins_vel_hor_poi2_x = static_cast<double>(adma_packet.insVelHorPOI[1].x) * 0.005;
+                snap.adma_ins_vel_hor_poi2_y = static_cast<double>(adma_packet.insVelHorPOI[1].y) * 0.005;
+                snap.adma_ins_vel_hor_poi2_z = static_cast<double>(adma_packet.insVelHorPOI[1].z) * 0.005;
+                snap.adma_ins_vel_hor_poi3_x = static_cast<double>(adma_packet.insVelHorPOI[2].x) * 0.005;
+                snap.adma_ins_vel_hor_poi3_y = static_cast<double>(adma_packet.insVelHorPOI[2].y) * 0.005;
+                snap.adma_ins_vel_hor_poi3_z = static_cast<double>(adma_packet.insVelHorPOI[2].z) * 0.005;
+
+                snap.adma_gnss_vel_frame_x = static_cast<double>(adma_packet.gnssvelframex) * 0.005;
+                snap.adma_gnss_vel_frame_y = static_cast<double>(adma_packet.gnssvelframey) * 0.005;
+                snap.adma_gnss_vel_frame_z = static_cast<double>(adma_packet.gnssvelframez) * 0.005;
+
+                snap.adma_acc_body_x = static_cast<double>(adma_packet.accBody.x) * 0.0004;
+                snap.adma_acc_body_y = static_cast<double>(adma_packet.accBody.y) * 0.0004;
+                snap.adma_acc_body_z = static_cast<double>(adma_packet.accBody.z) * 0.0004;
+
+                snap.adma_acc_horizontal_x = static_cast<double>(adma_packet.accHorizontal.x) * 0.0004;
+                snap.adma_acc_horizontal_y = static_cast<double>(adma_packet.accHorizontal.y) * 0.0004;
+                snap.adma_acc_horizontal_z = static_cast<double>(adma_packet.accHorizontal.z) * 0.0004;
+
+                snap.adma_acc_body_poi1_x = static_cast<double>(adma_packet.accBodyPOI[0].x) * 0.0004;
+                snap.adma_acc_body_poi1_y = static_cast<double>(adma_packet.accBodyPOI[0].y) * 0.0004;
+                snap.adma_acc_body_poi1_z = static_cast<double>(adma_packet.accBodyPOI[0].z) * 0.0004;
+                snap.adma_acc_body_poi2_x = static_cast<double>(adma_packet.accBodyPOI[1].x) * 0.0004;
+                snap.adma_acc_body_poi2_y = static_cast<double>(adma_packet.accBodyPOI[1].y) * 0.0004;
+                snap.adma_acc_body_poi2_z = static_cast<double>(adma_packet.accBodyPOI[1].z) * 0.0004;
+                snap.adma_acc_body_poi3_x = static_cast<double>(adma_packet.accBodyPOI[2].x) * 0.0004;
+                snap.adma_acc_body_poi3_y = static_cast<double>(adma_packet.accBodyPOI[2].y) * 0.0004;
+                snap.adma_acc_body_poi3_z = static_cast<double>(adma_packet.accBodyPOI[2].z) * 0.0004;
+
+                snap.adma_acc_horizontal_poi1_x = static_cast<double>(adma_packet.accHorizontalPOI[0].x) * 0.0004;
+                snap.adma_acc_horizontal_poi1_y = static_cast<double>(adma_packet.accHorizontalPOI[0].y) * 0.0004;
+                snap.adma_acc_horizontal_poi1_z = static_cast<double>(adma_packet.accHorizontalPOI[0].z) * 0.0004;
+                snap.adma_acc_horizontal_poi2_x = static_cast<double>(adma_packet.accHorizontalPOI[1].x) * 0.0004;
+                snap.adma_acc_horizontal_poi2_y = static_cast<double>(adma_packet.accHorizontalPOI[1].y) * 0.0004;
+                snap.adma_acc_horizontal_poi2_z = static_cast<double>(adma_packet.accHorizontalPOI[1].z) * 0.0004;
+                snap.adma_acc_horizontal_poi3_x = static_cast<double>(adma_packet.accHorizontalPOI[2].x) * 0.0004;
+                snap.adma_acc_horizontal_poi3_y = static_cast<double>(adma_packet.accHorizontalPOI[2].y) * 0.0004;
+                snap.adma_acc_horizontal_poi3_z = static_cast<double>(adma_packet.accHorizontalPOI[2].z) * 0.0004;
+
+                snap.adma_rates_body_x = static_cast<double>(adma_packet.ratesBody.x);
+                snap.adma_rates_body_y = static_cast<double>(adma_packet.ratesBody.y);
+                snap.adma_rates_body_z = static_cast<double>(adma_packet.ratesBody.z);
+
+                snap.adma_rates_horizontal_x = static_cast<double>(adma_packet.ratesHorizontal.x);
+                snap.adma_rates_horizontal_y = static_cast<double>(adma_packet.ratesHorizontal.y);
+                snap.adma_rates_horizontal_z = static_cast<double>(adma_packet.ratesHorizontal.z);
+
+                snap.adma_misc_side_slip_angle = static_cast<double>(adma_packet.misc.sideSlipAngle);
+                snap.adma_misc_distance_traveled = static_cast<double>(adma_packet.misc.distanceTraveled);
+                snap.adma_misc_poi1_side_slip_angle = static_cast<double>(adma_packet.miscPOI[0].sideSlipAngle);
+                snap.adma_misc_poi1_distance_traveled = static_cast<double>(adma_packet.miscPOI[0].distanceTraveled);
+                snap.adma_misc_poi2_side_slip_angle = static_cast<double>(adma_packet.miscPOI[1].sideSlipAngle);
+                snap.adma_misc_poi2_distance_traveled = static_cast<double>(adma_packet.miscPOI[1].distanceTraveled);
+                snap.adma_misc_poi3_side_slip_angle = static_cast<double>(adma_packet.miscPOI[2].sideSlipAngle);
+                snap.adma_misc_poi3_distance_traveled = static_cast<double>(adma_packet.miscPOI[2].distanceTraveled);
+
+                snap.adma_ins_pos_lat = static_cast<double>(adma_packet.insPos.pos_abs.latitude);
+                snap.adma_ins_pos_lon = static_cast<double>(adma_packet.insPos.pos_abs.longitude);
+                snap.adma_ins_height = static_cast<double>(adma_packet.insHeight);
+
+                snap.adma_ins_pos_poi1_lat = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.latitude);
+                snap.adma_ins_pos_poi1_lon = static_cast<double>(adma_packet.insPosPOI[0].pos_abs.longitude);
+                snap.adma_ins_height_poi1 = static_cast<double>(adma_packet.insHeightPOI[0]);
+                snap.adma_ins_pos_poi2_lat = static_cast<double>(adma_packet.insPosPOI[1].pos_abs.latitude);
+                snap.adma_ins_pos_poi2_lon = static_cast<double>(adma_packet.insPosPOI[1].pos_abs.longitude);
+                snap.adma_ins_height_poi2 = static_cast<double>(adma_packet.insHeightPOI[1]);
+                snap.adma_ins_pos_poi3_lat = static_cast<double>(adma_packet.insPosPOI[2].pos_abs.latitude);
+                snap.adma_ins_pos_poi3_lon = static_cast<double>(adma_packet.insPosPOI[2].pos_abs.longitude);
+                snap.adma_ins_height_poi3 = static_cast<double>(adma_packet.insHeightPOI[2]);
+
+                snap.adma_gnss_sats_used = static_cast<int>(adma_packet.gnsssatsused);
+                snap.adma_gnss_sats_visible = static_cast<int>(adma_packet.gnsssatsvisible);
+                snap.adma_kf_status = static_cast<int>(adma_packet.kfStatus);
+                snap.adma_kf_lat_stimulated = static_cast<int>(adma_packet.kflatstimulated);
+                snap.adma_kf_long_stimulated = static_cast<int>(adma_packet.kflongstimulated);
+                snap.adma_kf_steady_state = static_cast<int>(adma_packet.kfsteadystate);
+
+                {
+                    std::lock_guard<std::mutex> lk(shared.mtx);
+                    shared.adma = snap;
+                }
+            } catch (const std::exception& ex) {
+                std::cerr << "WARN: ADMA receive/decode failed: " << ex.what() << "\n";
+            }
+        }
+    });
+
     // -------- Camera threads --------
     std::thread camera0_thread(camera_worker, std::ref(shared), 0, std::cref(images_dir));
     std::thread camera2_thread(camera_worker, std::ref(shared), 2, std::cref(images_dir));
@@ -703,6 +948,7 @@ int main(int argc, char** argv)
 
     while (true) {
         VectorSnapshot vector_snapshot;
+        AdmaSnapshot adma_snapshot;
         CameraSnapshot cam0;
         CameraSnapshot cam2;
 
@@ -717,6 +963,7 @@ int main(int argc, char** argv)
             consumed_cam0_seq = shared.cam0_seq;
             consumed_cam2_seq = shared.cam2_seq;
             vector_snapshot = shared.vector_snapshot;
+            adma_snapshot = shared.adma;
             cam0 = shared.cam0;
             cam2 = shared.cam2;
         }
@@ -731,13 +978,21 @@ int main(int argc, char** argv)
 
         ++idx;
 
-        print_line(vector_snapshot.LWI_AgStgWhl, vector_snapshot.ts);
+        print_line(adma_snapshot.adma_kf_status,
+                   adma_snapshot.adma_kf_lat_stimulated,
+                   adma_snapshot.adma_kf_long_stimulated,
+                   adma_snapshot.adma_kf_steady_state,
+                   vector_snapshot.LWI_AgStgWhl,
+                   vector_snapshot.VDSO_Vx3dKmph,
+                   vector_snapshot.ts);
 
         csv << idx << ","
             << vector_snapshot.ts.tv_sec << "," << vector_snapshot.ts.tv_nsec;
         for (const auto& binding : kVectorSignalBindings) {
             csv << "," << vector_snapshot.*(binding.member);
         }
+        csv << ",";
+        write_adma_csv_values(csv, adma_snapshot);
         csv << "," << csv_escape(cam0.image_path)
             << "," << csv_escape(cam2.image_path)
             << "\n";
@@ -745,6 +1000,7 @@ int main(int argc, char** argv)
     }
 
     vector_thread.join();
+    adma_thread.join();
     camera0_thread.join();
     camera2_thread.join();
     return 0;

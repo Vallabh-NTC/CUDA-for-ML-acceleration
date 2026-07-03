@@ -26,3 +26,39 @@ If Orin :
 `cmake -S . -B build -DPROJECT=AI-chassis-control-pipeline -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/Toolchain_aarch64_l4t.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=87`
 
 `cmake --build build -j"$(nproc)" --verbose`
+
+---
+
+## AI Chassis Control Pipeline (udp_decoder)
+
+### Description
+UDP/JSON decoder that integrates:
+- Ethernet signals (CANape → Windows UDP Server → `udp_decoder`)
+- ADMA data (INS/GNSS from iMEMS via UDP)
+- Dual-camera capture (GStreamer)
+- CSV logging synchronized with timestamps
+
+### Network Configuration
+
+- **Jetson IP**: `192.168.1.20`
+- **ADMA IP (expected source)**: `192.168.1.55`
+- **ETH/JSON Port**: `5005` (listening from Windows UDP Server)
+- **ADMA Port**: `1021` (listening from iMEMS)
+
+### Startup
+
+```bash
+./build/AI-chassis-control-pipeline/udp_decoder --eth-port 5005 --log_path ~/data
+```
+
+### Main Options
+
+- `--eth-port PORT`: UDP listening port for Ethernet signals (default: 5005)
+- `--log_path PATH`: directory to save images and CSV (default: ./log)
+
+### Output
+
+For each synchronized camera frame:
+- CSV row with timestamp, ETH signals, ADMA data, image paths
+- `images/cam0/` and `images/cam2/` with numbered JPEGs
+- Run directory: `log/YYYYMMDD_HHMM_log_N/`

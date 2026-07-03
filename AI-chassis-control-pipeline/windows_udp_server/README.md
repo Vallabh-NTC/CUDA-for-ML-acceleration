@@ -57,7 +57,7 @@ Acquisizione con file segnali di default:
 python .\main.py
 ```
 
-Acquisizione + invio UDP:
+Acquisizione + invio UDP alla Jetson (porta di default: 5005):
 
 ```powershell
 python .\main.py --udp-host 192.168.1.20 --udp-port 5005
@@ -68,6 +68,8 @@ Esempio payload UDP:
 ```json
 {"t": 1234.5678, "DPM_StDispDrvPosn_XIX_HCP1_15_XIX_VLAN_FAS": 2.0, "LWI_AgStgWhl": 0.12, "AccY_body": -0.05, "AccZ_body": 9.81}
 ```
+
+**Nota**: I dati JSON vengono inviati a `192.168.1.20:5005` (Jetson) ed elaborati dal decoder UDP in `udp_decoder`.
 
 ## Opzioni principali
 
